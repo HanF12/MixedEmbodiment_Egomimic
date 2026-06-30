@@ -1,0 +1,106 @@
+import cv2
+import argparse
+import os
+import numpy as np
+import time
+from datetime import datetime
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Record from a webcam and log timestamps, with optional per-frame FPS printing and camera selection."
+    )
+    parser.add_argument(
+        "--fps", "-f",
+        action="store_true",
+        help="If set, print the approximate FPS for each frame."
+    )
+    parser.add_argument(
+        "--camera", "-c",
+        type=int,
+        default=8,
+        help="Index of the webcam device to use (default: 0)."
+    )
+    return parser.parse_args()
+
+def main(args):
+    # Open the selected camera
+    cap = cv2.VideoCapture(args.camera)
+    if not cap.isOpened():
+        print(f"Error: Unable to open camera device {args.camera}.")
+        exit()
+
+    # Get camera properties: resolution and FPS
+    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 50  # fallback if camera doesn't report FPS
+
+    print(f"Camera {args.camera} opened: {width}×{height} @ {fps:.2f} FPS (reported)")
+
+    # Prepare output directories
+    base_out_dir = "bird-data"
+    mp4_dir = os.path.join(base_out_dir, "mp4")
+    npy_dir = os.path.join(base_out_dir, "npy")
+    os.makedirs(mp4_dir, exist_ok=True)
+    os.makedirs(npy_dir, exist_ok=True)
+
+    # Generate a timestamped ID for filenames
+    id_str = datetime.now().strftime("%Y%m%d%H%M%S")
+
+    # Prepare video writer (MP4 with mp4v)
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video_filename = os.path.join(mp4_dir, f"video_recording_bird#{id_str}.mp4")
+    out = cv2.VideoWriter(video_filename, fourcc, fps, (width, height))
+
+    np_filename = os.path.join(npy_dir, f"video_recording_bird#{id_str}.npy")
+
+    if not out.isOpened():
+        print(f"Error: Could not open VideoWriter for '{video_filename}'.")
+        print("Check that OpenCV is built with the necessary codec support.")
+        cap.release()
+        exit()
+
+    frame_number = 0
+    frame_array = []
+    prev_time = time.time()
+
+    print(f"Recording from camera {args.camera}. Press 'q' to stop.")
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Error: Failed to capture frame.")
+                break
+
+            # Write frame to video file
+            out.write(frame)
+            cv2.imshow(f"Webcam Recording - Camera {args.camera}", frame)
+            frame_array.append(time.time())
+
+            # If --fps was set, compute and print per-frame FPS
+            if args.fps:
+                current_time = time.time()
+                dt = current_time - prev_time
+                if dt > 0:
+                    instantaneous_fps = 1.0 / dt
+                    print(f"Approximate FPS: {instantaneous_fps:.2f}")
+                prev_time = current_time
+
+            frame_number += 1
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    finally:
+        cap.release()
+        out.release()
+        cv2.destroyAllWindows()
+        np.asarray(frame_array, dtype=np.float64)
+        np.save(np_filename, frame_array)
+
+    print(f"Recording stopped. Video saved as '{video_filename}', timestamps saved as '{np_filename}'")
+
+if __name__ == "__main__":
+    args = parse_args()
+    main(args)

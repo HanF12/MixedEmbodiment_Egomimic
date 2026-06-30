@@ -1,0 +1,38 @@
+name: emimic
+channels:
+  - pytorch
+  - nvidia
+dependencies:
+  - python=3.10
+  - pip=23
+  - pytorch=2.3.1
+  - torchvision=0.18.1
+  - pytorch-cuda=12.1
+  - cuda-toolkit=12.1
+  - pyyaml
+  - pexpect
+  - matplotlib
+  - packaging
+  - h5py
+  - ipython
+  - pip:
+    - wandb
+    - hydra-core
+    - hydra-submitit-launcher
+    - black
+    - gpustat
+    - pynvml
+    - termcolor
+    - pyquaternion
+    - rospkg
+    - einops
+    - av
+    - opencv-python==4.7.0.72
+    - dm-control==1.0.8
+    - mujoco==2.3.1
+    - mujoco-py==2.1.2.14
+    - git+https://github.com/simarkareer/submitit
+    - arm_pytorch_utilities
+    - pytorch-kinematics
+    - pytorch-lightning
+    - positional-encodings[pytorch]

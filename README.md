@@ -1,1 +1,0 @@
-# MixedEmbodiment_Egomimic
