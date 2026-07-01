@@ -5,6 +5,8 @@
 # Recorded data (generated locally)
 aloha-data/
 bird-data/
+joint-data/
+hand-pose-data/
 m-synced-csvs/
 ros_data/
 

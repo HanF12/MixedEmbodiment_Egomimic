@@ -2,8 +2,15 @@ import cv2
 import argparse
 import os
 import numpy as np
+import signal
 import time
 from datetime import datetime
+
+stop_recording = False
+
+def request_stop(signum, frame):
+    global stop_recording
+    stop_recording = True
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -65,9 +72,12 @@ def main(args):
     frame_array = []
     prev_time = time.time()
 
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+
     print(f"Recording from camera {args.camera}. Press 'q' to stop.")
     try:
-        while True:
+        while not stop_recording:
             ret, frame = cap.read()
             if not ret:
                 print("Error: Failed to capture frame.")
@@ -96,8 +106,7 @@ def main(args):
         cap.release()
         out.release()
         cv2.destroyAllWindows()
-        np.asarray(frame_array, dtype=np.float64)
-        np.save(np_filename, frame_array)
+        np.save(np_filename, np.asarray(frame_array, dtype=np.float64))
 
     print(f"Recording stopped. Video saved as '{video_filename}', timestamps saved as '{np_filename}'")
 

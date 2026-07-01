@@ -202,6 +202,10 @@ last_sampled_time = 0.0 # To keep track of the last time a message was sampled
 id_str = datetime.now().strftime("%Y%m%d%H%M%S")
 hdf5_file_path = os.path.join(os.path.expanduser("~"), "ros_data", f"host_left_joint_states_{id_str}.hdf5")
 
+base_out_dir = "joint-data"
+npy_dir = os.path.join(base_out_dir, "npy")
+os.makedirs(npy_dir, exist_ok=True)
+
 # Flag to indicate if joint names have been stored
 joint_names_stored = False
 num_joints = 0 # To store the number of joints once known
@@ -318,8 +322,8 @@ def close_hdf5_file():
         except Exception as e:
             rospy.logerr(f"Error closing HDF5 file: {e}")
         finally:
-            np.save(f'joint_timestamp_{id_str}', time_arr)
-            np.save(f'joint_position_{id_str}', position_arr)
+            np.save(os.path.join(npy_dir, f'joint_timestamp_{id_str}'), time_arr)
+            np.save(os.path.join(npy_dir, f'joint_position_{id_str}'), position_arr)
             hdf5_file = None # Ensure the handle is None after trying to close
 
 

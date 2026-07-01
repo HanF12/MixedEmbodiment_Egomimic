@@ -2,9 +2,16 @@ import cv2
 import pyrealsense2 as rs
 import numpy as np
 import os
+import signal
 import time
 import argparse
 from datetime import datetime
+
+stop_recording = False
+
+def request_stop(signum, frame):
+    global stop_recording
+    stop_recording = True
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -150,13 +157,16 @@ def main(args):
         frame_arrays[serial_number] = []
         print(f"Recording video from Intel RealSense camera {serial_number} ({info['arm_type']}) to {output_paths[serial_number]['mp4_path']}.")
 
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+
     print("Press 'q' to stop recording for both cameras.")
 
     start_time = time.time()
     prev_times = {sn: time.time() for sn in serial_numbers}
 
     try:
-        while True:
+        while not stop_recording:
             # Get frames for both cameras
             frames_map = {}
             for serial_number, info in camera_info.items():
