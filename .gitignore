@@ -7,6 +7,8 @@ aloha-data/
 bird-data/
 joint-data/
 hand-pose-data/
+bird-realsense-data/
+recording/.recording/
 m-synced-csvs/
 ros_data/
 

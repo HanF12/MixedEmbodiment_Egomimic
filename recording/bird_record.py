@@ -27,6 +27,12 @@ def parse_args():
         default=8,
         help="Index of the webcam device to use (default: 0)."
     )
+    parser.add_argument(
+        "--datetime-id",
+        type=str,
+        default=None,
+        help="Shared timestamp id for output filenames (default: now).",
+    )
     return parser.parse_args()
 
 def main(args):
@@ -53,7 +59,7 @@ def main(args):
     os.makedirs(npy_dir, exist_ok=True)
 
     # Generate a timestamped ID for filenames
-    id_str = datetime.now().strftime("%Y%m%d%H%M%S")
+    id_str = args.datetime_id or datetime.now().strftime("%Y%m%d%H%M%S")
 
     # Prepare video writer (MP4 with mp4v)
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')

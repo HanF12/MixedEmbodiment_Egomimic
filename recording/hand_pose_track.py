@@ -21,11 +21,11 @@ MODEL_URL = (
 )
 MODEL_PATH = MODEL_DIR / "hand_landmarker.task"
 
-# Same mapping used by realsense_double_record.py (edit here or via keys during preview).
+# Physical setup (cameras swapped): 317222=left arm, 332522=bird/center, 317422=right arm
 CAMERA_MAP = {
+    "317222072157": "left",
     "317422075805": "right",
-    "332522076706": "left",
-    "f1421276": "center",
+    "332522076706": "center",
 }
 
 ROLE_KEYS = {

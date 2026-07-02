@@ -7,6 +7,7 @@ from sensor_msgs.msg import JointState
 import h5py # Import the h5py library for HDF5 file operations
 import numpy as np # Import numpy for array handling
 import os # Import os for path manipulation
+import argparse
 import cv2
 import threading
 import time
@@ -195,16 +196,21 @@ sampling_frequency = 30.0 # Desired sampling frequency in Hz
 sampling_interval = 1.0 / sampling_frequency # Time interval between samples in seconds
 last_sampled_time = 0.0 # To keep track of the last time a message was sampled
 
-# File path for the HDF5 file
-# You can change this path and filename
-# Using a timestamp in the filename is a good practice to avoid overwriting
-# hdf5_file_path = os.path.join(os.path.expanduser("~"), "ros_data", f"slave_left_joint_states_{rospy.Time.now().secs}.hdf5")
-id_str = datetime.now().strftime("%Y%m%d%H%M%S")
-hdf5_file_path = os.path.join(os.path.expanduser("~"), "ros_data", f"host_left_joint_states_{id_str}.hdf5")
+# File path for the HDF5 file — set via configure_recording() before rospy starts
+id_str = None
+hdf5_file_path = None
 
 base_out_dir = "joint-data"
 npy_dir = os.path.join(base_out_dir, "npy")
 os.makedirs(npy_dir, exist_ok=True)
+
+
+def configure_recording(datetime_id: str) -> None:
+    global id_str, hdf5_file_path
+    id_str = datetime_id
+    hdf5_file_path = os.path.join(
+        os.path.expanduser("~"), "ros_data", f"host_left_joint_states_{id_str}.hdf5"
+    )
 
 # Flag to indicate if joint names have been stored
 joint_names_stored = False
@@ -229,8 +235,7 @@ def slave_left_joint_states_callback(msg):
         last_sampled_time = current_time # Update the last sampled time
 
         # Ensure the HDF5 file and datasets are open
-        if hdf5_file is None:
-            rospy.logerr("HDF5 file is not open. Cannot save data.")
+        if hdf5_file is None or positions_dset is None:
             return
 
         # Ensure consistent data length
@@ -314,17 +319,21 @@ def close_hdf5_file():
     Closes the HDF5 file if it is open.
     This function is called when the node is shutting down.
     """
-    global hdf5_file, time_arr, position_arr
+    global hdf5_file, time_arr, position_arr, positions_dset, velocities_dset, timestamps_dset
     if hdf5_file is not None:
         try:
             hdf5_file.close()
             rospy.loginfo(f"HDF5 file closed: {hdf5_file_path}")
         except Exception as e:
             rospy.logerr(f"Error closing HDF5 file: {e}")
-        finally:
-            np.save(os.path.join(npy_dir, f'joint_timestamp_{id_str}'), time_arr)
-            np.save(os.path.join(npy_dir, f'joint_position_{id_str}'), position_arr)
-            hdf5_file = None # Ensure the handle is None after trying to close
+        hdf5_file = None
+        positions_dset = None
+        velocities_dset = None
+        timestamps_dset = None
+
+    if time_arr:
+        np.save(os.path.join(npy_dir, f'joint_timestamp_{id_str}'), time_arr)
+        np.save(os.path.join(npy_dir, f'joint_position_{id_str}'), position_arr)
 
 
 # --- Main Listener Function ---
@@ -367,16 +376,27 @@ def joint_state_listener():
 
 
 # --- Script Entry Point ---
+def parse_args():
+    parser = argparse.ArgumentParser(description="Record host left joint states to HDF5.")
+    parser.add_argument(
+        "--datetime-id",
+        type=str,
+        default=None,
+        help="Shared timestamp id for output filenames (default: now).",
+    )
+    return parser.parse_args()
+
+
 if __name__ == '__main__':
-    # This block is executed when the script is run directly.
+    args = parse_args()
+    datetime_id = args.datetime_id or datetime.now().strftime("%Y%m%d%H%M%S")
+    configure_recording(datetime_id)
+
     try:
-        # Call the main listener function
         joint_state_listener()
     except rospy.ROSInterruptException:
-        # Catch an exception that is raised when the node receives a shutdown signal (like Ctrl+C).
         rospy.loginfo("ROS Interrupt Exception caught. Node shutting down.")
     except Exception as e:
-        # Catch any other unexpected exceptions.
         rospy.logerr(f"An unexpected error occurred: {e}")
 
     rospy.loginfo("Script finished.")
