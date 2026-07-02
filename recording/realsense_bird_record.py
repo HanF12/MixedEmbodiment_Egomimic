@@ -31,11 +31,12 @@ from hand_pose_track import (
     start_pipeline,
 )
 from realsense_utils import poll_for_frames, warmup_pipeline
+from recording_paths import under_recording
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 BIRD_ROLE = "center"
-BASE_OUT_DIR = "bird-realsense-data"
-HAND_POSE_DIR = "hand-pose-data"
+BASE_OUT_DIR = under_recording("bird-realsense-data")
+HAND_POSE_DIR = under_recording("hand-pose-data")
 
 stop_recording = False
 
@@ -89,7 +90,20 @@ def parse_args():
         action="store_true",
         help="Disable preview window.",
     )
+    parser.add_argument(
+        "--track-hand",
+        choices=("left", "right", "both"),
+        default="both",
+        help="Which hand(s) to keep in pose output (default: both).",
+    )
     return parser.parse_args()
+
+
+def filter_detections_by_hand(detections, track_hand: str):
+    if track_hand == "both":
+        return detections
+    want = "Left" if track_hand == "left" else "Right"
+    return [d for d in detections if d.get("handedness") == want]
 
 
 def _serial_matches(requested: str, device_serial: str) -> bool:
@@ -141,6 +155,8 @@ def main(args):
     session_id = args.datetime_id or datetime.now().strftime("%Y%m%d%H%M%S")
     hand_pose_enabled = not args.no_hand_pose
     show_preview = args.display and not args.no_display
+    track_hand = args.track_hand
+    num_hands = 1 if track_hand in ("left", "right") else args.num_hands
 
     mp4_dir = Path(BASE_OUT_DIR) / "mp4"
     npy_dir = Path(BASE_OUT_DIR) / "npy"
@@ -157,7 +173,7 @@ def main(args):
 
     pipeline = None
     tracker = None
-    recorder = HandPoseRecorder(max_hands=args.num_hands) if hand_pose_enabled else None
+    recorder = HandPoseRecorder(max_hands=num_hands) if hand_pose_enabled else None
     video_writer = None
     timestamps = []
 
@@ -187,7 +203,7 @@ def main(args):
 
         intrinsics = get_color_intrinsics(profile) if hand_pose_enabled else None
         if hand_pose_enabled:
-            tracker = HandPoseTracker(num_hands=args.num_hands)
+            tracker = HandPoseTracker(num_hands=num_hands)
 
         while not stop_recording:
             frames = poll_for_frames(pipeline, timeout_ms=200, should_stop=should_stop)
@@ -207,6 +223,7 @@ def main(args):
             if hand_pose_enabled and tracker is not None and recorder is not None:
                 depth_frame = frames.get_depth_frame()
                 detections, annotated = tracker.process(frame, depth_frame, intrinsics)
+                detections = filter_detections_by_hand(detections, track_hand)
                 recorder.add_frame(timestamps[-1], detections)
                 if show_preview:
                     cv2.imshow(f"Bird RealSense {serial}", annotated)

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from hand_pose_track import CAMERA_MAP
 from realsense_utils import poll_for_frames, serial_for_role, warmup_pipeline
+from recording_paths import under_recording
 
 stop_recording = False
 
@@ -40,6 +41,12 @@ def parse_args():
         default=None,
         help="Shared timestamp id for output filenames (default: now).",
     )
+    parser.add_argument(
+        "--arms",
+        choices=("left", "right", "both"),
+        default="both",
+        help="Which wrist RealSense cameras to record (default: both).",
+    )
     return parser.parse_args()
 
 
@@ -66,6 +73,8 @@ def main(args):
         print(f"  {serial}  ->  {role}")
 
     arm_roles = ("left", "right")
+    if args.arms in arm_roles:
+        arm_roles = (args.arms,)
     camera_info = {}
 
     for role in arm_roles:
@@ -133,7 +142,7 @@ def main(args):
                 pass
         exit()
 
-    base_output_dir = "aloha-data"
+    base_output_dir = under_recording("aloha-data")
     output_paths = {}
     for serial_number, info in camera_info.items():
         arm_type = info["arm_type"]

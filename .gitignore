@@ -8,6 +8,7 @@ bird-data/
 joint-data/
 hand-pose-data/
 bird-realsense-data/
+recording/sessions/
 recording/.recording/
 m-synced-csvs/
 ros_data/

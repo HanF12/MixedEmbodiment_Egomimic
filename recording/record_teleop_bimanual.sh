@@ -1,17 +1,8 @@
 #!/bin/bash
-# Foot-pedal orchestrated recording: one pedal press starts a demo, the next stops it.
-# Ctrl+C quits. Pass extra args to record_pedal.py, e.g.:
-#   ./record_all.sh --pedal-key space --bird-camera 6
-#
-# This is an alias for bimanual teleop (mode 1). See also:
-#   record_teleop_bimanual.sh
-#   record_left_robot_right_hand.sh
-#   record_right_robot_left_hand.sh
-#   record_human_hands.sh
+# Mode 1: pure bimanual teleop — left/right wrist RealSense, bird RealSense, both joint streams.
+# Output: recording/sessions/teleop_bimanual/
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-
-# Use the active environment's Python (e.g. conda activate gaze-aloha)
 PYTHON="${PYTHON:-python3}"
 
 if ! "${PYTHON}" -c "import evdev" 2>/dev/null; then

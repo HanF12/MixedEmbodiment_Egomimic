@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 from foot_pedal import cancel_pedal_wait, list_input_devices, resolve_pedal_device, wait_for_pedal
@@ -28,6 +29,59 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 active_procs: list[subprocess.Popen] = []
 shutting_down = False
+
+
+@dataclass(frozen=True)
+class RecordingMode:
+    session_dir: str
+    joint_arms: str | None  # left | right | both | None
+    wrist_arms: str | None  # left | right | both | None
+    webcam_bird: bool
+    bird_realsense: bool
+    hand_pose: bool
+    track_hand: str  # left | right | both
+
+
+RECORDING_MODES: dict[str, RecordingMode] = {
+    "teleop_bimanual": RecordingMode(
+        session_dir="teleop_bimanual",
+        joint_arms="both",
+        wrist_arms="both",
+        webcam_bird=False,
+        bird_realsense=True,
+        hand_pose=False,
+        track_hand="both",
+    ),
+    # Left robot arm + right human hand (left wrist cam, bird RS, right hand pose, left joints).
+    "left_robot_right_hand": RecordingMode(
+        session_dir="left_robot_right_hand",
+        joint_arms="left",
+        wrist_arms="left",
+        webcam_bird=False,
+        bird_realsense=True,
+        hand_pose=True,
+        track_hand="right",
+    ),
+    # Right robot arm + left human hand (opposite of above).
+    "right_robot_left_hand": RecordingMode(
+        session_dir="right_robot_left_hand",
+        joint_arms="right",
+        wrist_arms="right",
+        webcam_bird=False,
+        bird_realsense=True,
+        hand_pose=True,
+        track_hand="left",
+    ),
+    "human_hands_bimanual": RecordingMode(
+        session_dir="human_hands_bimanual",
+        joint_arms=None,
+        wrist_arms=None,
+        webcam_bird=False,
+        bird_realsense=True,
+        hand_pose=True,
+        track_hand="both",
+    ),
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -78,21 +132,45 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="List evdev input devices and exit",
     )
+    parser.add_argument(
+        "--mode",
+        choices=sorted(RECORDING_MODES),
+        default="teleop_bimanual",
+        help=(
+            "Recording preset (default: teleop_bimanual). "
+            "Sets output folder under recording/sessions/<mode>/ and which streams run."
+        ),
+    )
     return parser.parse_args()
 
 
-def _spawn(cmd: list[str]) -> subprocess.Popen:
+def resolve_mode(args: argparse.Namespace) -> RecordingMode:
+    mode = RECORDING_MODES[args.mode]
+    hand_pose = mode.hand_pose and not args.no_hand_pose
+    return replace(mode, hand_pose=hand_pose)
+
+
+def _spawn(cmd: list[str], env: dict[str, str] | None = None) -> subprocess.Popen:
+    proc_env = os.environ.copy()
+    if env:
+        proc_env.update(env)
     return subprocess.Popen(
         cmd,
         cwd=SCRIPT_DIR,
+        env=proc_env,
         preexec_fn=os.setsid,
     )
+
+
+def session_data_root(mode: RecordingMode) -> str:
+    return os.path.join("sessions", mode.session_dir)
 
 
 def build_bird_rs_cmd(
     datetime_id: str,
     bird_realsense_serial: str | None,
     hand_pose: bool,
+    track_hand: str,
     display: bool,
     stream_fps: int,
 ) -> list[str]:
@@ -104,6 +182,8 @@ def build_bird_rs_cmd(
         datetime_id,
         "--fps",
         str(stream_fps),
+        "--track-hand",
+        track_hand,
     ]
     if bird_realsense_serial:
         cmd.extend(["--serial", bird_realsense_serial])
@@ -144,15 +224,47 @@ def resolve_bird_realsense_serial(explicit: str | None) -> str | None:
     return find_serial_for_role(CAMERA_MAP, "center")
 
 
-def verify_demo_outputs(datetime_id: str) -> None:
+def verify_demo_outputs(datetime_id: str, mode: RecordingMode) -> None:
     """Print whether each stream produced a non-empty file for this demo id."""
-    bird_rs_glob = list(Path("bird-realsense-data/mp4").glob(f"*{datetime_id}.mp4"))
-    bird_rs_path = bird_rs_glob[0] if bird_rs_glob else None
-    checks = [
-        ("LEFT arm", Path("aloha-data/left/mp4") / f"video_recording_realsense_left#{datetime_id}.mp4"),
-        ("RIGHT arm", Path("aloha-data/right/mp4") / f"video_recording_realsense_right#{datetime_id}.mp4"),
-        ("Webcam bird", Path("bird-data/mp4") / f"video_recording_bird#{datetime_id}.mp4"),
-    ]
+    root = session_data_root(mode)
+    checks: list[tuple[str, Path | None]] = []
+
+    if mode.wrist_arms in ("left", "both"):
+        checks.append(
+            (
+                "LEFT wrist",
+                Path(root) / "aloha-data/left/mp4" / f"video_recording_realsense_left#{datetime_id}.mp4",
+            )
+        )
+    if mode.wrist_arms in ("right", "both"):
+        checks.append(
+            (
+                "RIGHT wrist",
+                Path(root) / "aloha-data/right/mp4" / f"video_recording_realsense_right#{datetime_id}.mp4",
+            )
+        )
+    if mode.webcam_bird:
+        checks.append(
+            (
+                "Webcam bird",
+                Path(root) / "bird-data/mp4" / f"video_recording_bird#{datetime_id}.mp4",
+            )
+        )
+    if mode.joint_arms in ("left", "both"):
+        checks.append(
+            (
+                "LEFT joints",
+                Path(root) / "joint-data/npy" / f"joint_position_{datetime_id}.npy",
+            )
+        )
+    if mode.joint_arms in ("right", "both"):
+        checks.append(
+            (
+                "RIGHT joints",
+                Path(root) / "joint-data/npy" / f"joint_position_right_{datetime_id}.npy",
+            )
+        )
+
     print("Demo output check:", flush=True)
     for label, path in checks:
         if path is None or not path.exists():
@@ -163,51 +275,85 @@ def verify_demo_outputs(datetime_id: str) -> None:
             print(f"  EMPTY    {label}: {path} ({size} bytes)", flush=True)
         else:
             print(f"  OK       {label}: {path} ({size} bytes)", flush=True)
-    if bird_rs_path is None:
-        print(f"  MISSING  Bird RealSense: bird-realsense-data/mp4/*#{datetime_id}.mp4", flush=True)
-    else:
-        size = bird_rs_path.stat().st_size
-        tag = "OK" if size >= 1000 else "EMPTY"
-        print(f"  {tag:<8} Bird RealSense: {bird_rs_path} ({size} bytes)", flush=True)
+
+    if mode.bird_realsense:
+        bird_rs_glob = list(Path(root, "bird-realsense-data/mp4").glob(f"*{datetime_id}.mp4"))
+        bird_rs_path = bird_rs_glob[0] if bird_rs_glob else None
+        if bird_rs_path is None:
+            print(f"  MISSING  Bird RealSense: {root}/bird-realsense-data/mp4/*#{datetime_id}.mp4", flush=True)
+        else:
+            size = bird_rs_path.stat().st_size
+            tag = "OK" if size >= 1000 else "EMPTY"
+            print(f"  {tag:<8} Bird RealSense: {bird_rs_path} ({size} bytes)", flush=True)
+
+    if mode.hand_pose:
+        hand_glob = list(Path(root, "hand-pose-data").glob(f"hand_pose_*#{datetime_id}.npz"))
+        hand_path = hand_glob[0] if hand_glob else None
+        if hand_path is None:
+            print(f"  MISSING  Hand pose: {root}/hand-pose-data/hand_pose_*#{datetime_id}.npz", flush=True)
+        else:
+            size = hand_path.stat().st_size
+            tag = "OK" if size >= 1000 else "EMPTY"
+            print(f"  {tag:<8} Hand pose: {hand_path} ({size} bytes)", flush=True)
 
 
 def start_recorders(
     datetime_id: str,
+    mode: RecordingMode,
     bird_camera: int,
     stream_fps: int,
 ) -> list[subprocess.Popen]:
     python = sys.executable
     common = ["--datetime-id", datetime_id]
+    data_env = {"RECORDING_DATA_ROOT": session_data_root(mode)}
 
     procs: list[subprocess.Popen] = []
 
-    # ROS + webcam first (no RealSense USB contention)
-    procs.append(_spawn([python, os.path.join(SCRIPT_DIR, "store_joint.py"), *common]))
-    procs.append(
-        _spawn(
-            [
-                python,
-                os.path.join(SCRIPT_DIR, "bird_record.py"),
-                "-c",
-                str(bird_camera),
-                *common,
-            ]
+    if mode.joint_arms:
+        procs.append(
+            _spawn(
+                [
+                    python,
+                    os.path.join(SCRIPT_DIR, "store_joint.py"),
+                    *common,
+                    "--arms",
+                    mode.joint_arms,
+                ],
+                env=data_env,
+            )
         )
-    )
-    time.sleep(0.5)
 
-    # Arm RealSense only — bird RealSense starts after arms signal ready
-    procs.append(
-        _spawn(
-            [
-                python,
-                os.path.join(SCRIPT_DIR, "realsense_double_record.py"),
-                *common,
-                "--color-fps",
-                str(stream_fps),
-            ]
+    if mode.webcam_bird:
+        procs.append(
+            _spawn(
+                [
+                    python,
+                    os.path.join(SCRIPT_DIR, "bird_record.py"),
+                    "-c",
+                    str(bird_camera),
+                    *common,
+                ],
+                env=data_env,
+            )
         )
-    )
+
+    if mode.wrist_arms:
+        if procs:
+            time.sleep(0.5)
+        procs.append(
+            _spawn(
+                [
+                    python,
+                    os.path.join(SCRIPT_DIR, "realsense_double_record.py"),
+                    *common,
+                    "--arms",
+                    mode.wrist_arms,
+                    "--color-fps",
+                    str(stream_fps),
+                ],
+                env=data_env,
+            )
+        )
     return procs
 
 
@@ -264,12 +410,22 @@ def wait_pedal_or_quit(pedal_key: str, pedal_device: str) -> bool:
         return False
 
 
+def required_wrist_role(mode: RecordingMode) -> str | None:
+    if mode.wrist_arms in ("left", "right"):
+        return mode.wrist_arms
+    if mode.wrist_arms == "both":
+        return "left"
+    return None
+
+
 def main() -> int:
     args = parse_args()
 
     if args.list_pedal_devices:
         list_input_devices()
         return 0
+
+    mode = resolve_mode(args)
 
     signal.signal(signal.SIGINT, handle_sigint)
     signal.signal(signal.SIGTERM, handle_sigint)
@@ -281,7 +437,8 @@ def main() -> int:
         print(f"Pedal: {pedal_path}  (key={args.pedal_key!r})")
 
     print("=" * 60)
-    print("Foot-pedal recording")
+    print(f"Foot-pedal recording  [mode={mode.session_dir}]")
+    print(f"  Output root: {session_data_root(mode)}/")
     print("  Pedal press  -> start demo")
     print("  Pedal press  -> stop demo and save")
     print("  Ctrl+C       -> quit")
@@ -296,7 +453,8 @@ def main() -> int:
         if not wait_pedal_or_quit(args.pedal_key, args.pedal_device):
             break
 
-        datetime_id = datetime.now().strftime("%Y%m%d%H%M%S")
+        raw_id = datetime.now().strftime("%Y%m%d%H%M%S")
+        datetime_id = f"{mode.session_dir}_{raw_id}"
         print(f"\n>>> Demo {demo_num} START  (id={datetime_id})", flush=True)
 
         left_serial = find_serial_for_role(CAMERA_MAP, "left")
@@ -309,32 +467,55 @@ def main() -> int:
             f"bird={bird_expected}",
             flush=True,
         )
-        if not left_serial:
+
+        required_role = required_wrist_role(mode)
+        if required_role == "left" and not left_serial:
             print(
-                f"ERROR: Left arm camera ({left_expected}) not visible — skipping this demo. "
+                f"ERROR: Left wrist camera ({left_expected}) not visible — skipping this demo. "
                 "Reseat USB and press pedal again.",
                 flush=True,
             )
             demo_num += 1
             continue
+        if required_role == "right":
+            right_serial = find_serial_for_role(CAMERA_MAP, "right")
+            if not right_serial:
+                right_expected = serial_for_role(CAMERA_MAP, "right") or "right"
+                print(
+                    f"ERROR: Right wrist camera ({right_expected}) not visible — skipping this demo. "
+                    "Reseat USB and press pedal again.",
+                    flush=True,
+                )
+                demo_num += 1
+                continue
 
         active_procs = start_recorders(
             datetime_id,
+            mode,
             args.bird_camera,
             args.stream_fps,
         )
 
-        print("Waiting for arm RealSense cameras...", flush=True)
-        arm_proc = active_procs[2] if len(active_procs) > 2 else None
-        if wait_arms_ready(datetime_id, arm_proc=arm_proc) and not shutting_down:
-            # Re-check bird camera after arm pipelines are up (USB enumeration can change)
+        arm_proc = None
+        if mode.wrist_arms:
+            print("Waiting for wrist RealSense camera(s)...", flush=True)
+            arm_proc = active_procs[-1]
+            wait_arms_ready(datetime_id, arm_proc=arm_proc)
+
+        if not shutting_down and mode.bird_realsense:
             bird_serial_now = resolve_bird_realsense_serial(args.bird_realsense_serial)
             if bird_serial_now:
                 bird_cmd = build_bird_rs_cmd(
-                    datetime_id, bird_serial_now, not args.no_hand_pose,
-                    not args.no_display, args.stream_fps,
+                    datetime_id,
+                    bird_serial_now,
+                    mode.hand_pose,
+                    mode.track_hand,
+                    not args.no_display,
+                    args.stream_fps,
                 )
-                active_procs.append(_spawn(bird_cmd))
+                active_procs.append(
+                    _spawn(bird_cmd, env={"RECORDING_DATA_ROOT": session_data_root(mode)})
+                )
                 print(f"Bird RealSense started ({bird_serial_now}).", flush=True)
             else:
                 connected = list_connected_serials()
@@ -344,7 +525,6 @@ def main() -> int:
                     flush=True,
                 )
                 print(f"  Connected RealSense: {connected or '(none)'}", flush=True)
-                print("  Left/right arms + webcam bird-data/ still record.", flush=True)
 
         if shutting_down:
             break
@@ -364,7 +544,7 @@ def main() -> int:
 
         stop_recorders(active_procs)
         active_procs = []
-        verify_demo_outputs(datetime_id)
+        verify_demo_outputs(datetime_id, mode)
         print(f">>> Demo {demo_num} saved  (id={datetime_id})\n", flush=True)
         demo_num += 1
 

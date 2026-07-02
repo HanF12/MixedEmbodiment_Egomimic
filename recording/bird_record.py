@@ -6,6 +6,8 @@ import signal
 import time
 from datetime import datetime
 
+from recording_paths import under_recording
+
 stop_recording = False
 
 def request_stop(signum, frame):
@@ -52,7 +54,7 @@ def main(args):
     print(f"Camera {args.camera} opened: {width}×{height} @ {fps:.2f} FPS (reported)")
 
     # Prepare output directories
-    base_out_dir = "bird-data"
+    base_out_dir = under_recording("bird-data")
     mp4_dir = os.path.join(base_out_dir, "mp4")
     npy_dir = os.path.join(base_out_dir, "npy")
     os.makedirs(mp4_dir, exist_ok=True)
