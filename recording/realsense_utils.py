@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 
 import pyrealsense2 as rs
@@ -57,3 +58,147 @@ def warmup_pipeline(pipeline, frames_needed: int = 5, timeout_ms: int = 200, sho
         if frames is not None:
             got += 1
     return got > 0
+
+
+def drain_pipeline(
+    pipeline,
+    max_ms: float = 400,
+    idle_ms: float = 60,
+    should_stop=None,
+) -> int:
+    """
+    Discard queued frames after the go signal (clears countdown/pre-roll buffer).
+
+    Stops when no frames arrive for idle_ms, or after max_ms.
+    """
+    discarded = 0
+    idle_start = None
+    deadline = time.monotonic() + max_ms / 1000.0
+    while time.monotonic() < deadline:
+        if should_stop is not None and should_stop():
+            break
+        frames = pipeline.poll_for_frames()
+        if frames:
+            discarded += 1
+            idle_start = None
+            continue
+        if idle_start is None:
+            idle_start = time.monotonic()
+        elif time.monotonic() - idle_start >= idle_ms / 1000.0:
+            break
+        time.sleep(0.001)
+    return discarded
+
+
+def start_pipelines_parallel(entries, should_stop=None) -> dict:
+    """
+    Start multiple RealSense pipelines at the same instant (thread barrier).
+
+    entries: iterable of (key, pipeline, config)
+    Returns {key: profile} for each successfully started pipeline.
+    """
+    entries = list(entries)
+    if not entries:
+        return {}
+
+    barrier = threading.Barrier(len(entries))
+    profiles: dict = {}
+    errors: dict = {}
+    lock = threading.Lock()
+
+    def _start_one(key, pipeline, config) -> None:
+        try:
+            barrier.wait()
+            profile = pipeline.start(config)
+            enable_global_time(profile.get_device())
+            warmup_pipeline(pipeline, should_stop=should_stop)
+            with lock:
+                profiles[key] = profile
+        except Exception as exc:
+            with lock:
+                errors[key] = exc
+
+    threads = [
+        threading.Thread(target=_start_one, args=(key, pipeline, config), daemon=True)
+        for key, pipeline, config in entries
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    if errors:
+        for _, pipeline, _ in entries:
+            try:
+                pipeline.stop()
+            except Exception:
+                pass
+        detail = ", ".join(f"{key}: {exc}" for key, exc in errors.items())
+        raise RuntimeError(f"Failed to start RealSense pipeline(s): {detail}")
+    return profiles
+
+
+def drain_pipelines(pipelines, label: str = "", should_stop=None) -> int:
+    if not pipelines:
+        return 0
+    if len(pipelines) == 1:
+        total = drain_pipeline(pipelines[0], should_stop=should_stop)
+    else:
+        totals: list[int] = []
+
+        def _drain_one(pipe) -> None:
+            totals.append(drain_pipeline(pipe, should_stop=should_stop))
+
+        threads = [
+            threading.Thread(target=_drain_one, args=(pipe,), daemon=True)
+            for pipe in pipelines
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        total = sum(totals)
+
+    if label:
+        print(f"[{label}] Drained {total} stale frame(s) from pipeline buffer(s).", flush=True)
+    return total
+
+
+def enable_global_time(device) -> None:
+    """Enable RealSense global timestamps when supported (cross-camera hardware clock)."""
+    try:
+        for sensor in device.sensors:
+            if sensor.supports(rs.option.global_time_enabled):
+                sensor.set_option(rs.option.global_time_enabled, 1.0)
+    except Exception:
+        pass
+
+
+def poll_aligned_frame_sets(pipelines: dict, timeout_ms: int = 100, should_stop=None) -> dict | None:
+    """
+    Block until every pipeline has a color frame, or return None on timeout.
+
+    pipelines: {role: rs.pipeline}
+    Returns {role: frameset} stamped together, or None if incomplete.
+    """
+    if not pipelines:
+        return None
+
+    pending = dict(pipelines)
+    got: dict = {}
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while pending and time.monotonic() < deadline:
+        if should_stop is not None and should_stop():
+            return None
+        for role in list(pending):
+            frames = pending[role].poll_for_frames()
+            if not frames:
+                continue
+            color_frame = frames.get_color_frame()
+            if color_frame:
+                got[role] = frames
+                del pending[role]
+        if not pending:
+            return got
+        time.sleep(0.001)
+    return None

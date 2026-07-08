@@ -30,8 +30,9 @@ from hand_pose_track import (
     get_color_intrinsics,
     start_pipeline,
 )
-from realsense_utils import poll_for_frames, warmup_pipeline
+from realsense_utils import drain_pipeline, poll_for_frames, warmup_pipeline
 from recording_paths import under_recording
+from recording_sync import bird_ready_path, read_recording_start, wait_for_recording_go
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 BIRD_ROLE = "center"
@@ -95,6 +96,11 @@ def parse_args():
         choices=("left", "right", "both"),
         default="both",
         help="Which hand(s) to keep in pose output (default: both).",
+    )
+    parser.add_argument(
+        "--wait-for-go",
+        action="store_true",
+        help="Wait for record_pedal.py sync signal before saving frames.",
     )
     return parser.parse_args()
 
@@ -205,8 +211,25 @@ def main(args):
         if hand_pose_enabled:
             tracker = HandPoseTracker(num_hands=num_hands)
 
+        ready_path = bird_ready_path(session_id)
+        ready_path.parent.mkdir(parents=True, exist_ok=True)
+        ready_path.touch()
+        print(f"Bird RealSense ready (signal: {ready_path})", flush=True)
+
+        if args.wait_for_go and not wait_for_recording_go(
+            session_id, label="bird", should_stop=should_stop
+        ):
+            return
+
+        recording_t0 = read_recording_start(session_id)
+        drained = drain_pipeline(pipeline, should_stop=should_stop)
+        print(f"[bird] Drained {drained} stale frame(s) from pipeline buffer.", flush=True)
+        if recording_t0 is not None:
+            print(f"[bird] Shared recording t0={recording_t0:.3f}", flush=True)
+
         while not stop_recording:
-            frames = poll_for_frames(pipeline, timeout_ms=200, should_stop=should_stop)
+            capture_t = time.time()
+            frames = poll_for_frames(pipeline, timeout_ms=100, should_stop=should_stop)
             if frames is None:
                 continue
 
@@ -218,7 +241,7 @@ def main(args):
 
             frame = np.asanyarray(color_frame.get_data())
             video_writer.write(frame)
-            timestamps.append(time.time())
+            timestamps.append(capture_t)
 
             if hand_pose_enabled and tracker is not None and recorder is not None:
                 depth_frame = frames.get_depth_frame()

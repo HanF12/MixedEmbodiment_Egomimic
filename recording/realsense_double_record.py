@@ -10,8 +10,14 @@ from datetime import datetime
 from pathlib import Path
 
 from hand_pose_track import CAMERA_MAP
-from realsense_utils import poll_for_frames, serial_for_role, warmup_pipeline
+from realsense_utils import (
+    drain_pipelines,
+    poll_for_frames,
+    serial_for_role,
+    start_pipelines_parallel,
+)
 from recording_paths import under_recording
+from recording_sync import arms_ready_path, read_recording_start, wait_for_recording_go
 
 stop_recording = False
 
@@ -46,6 +52,11 @@ def parse_args():
         choices=("left", "right", "both"),
         default="both",
         help="Which wrist RealSense cameras to record (default: both).",
+    )
+    parser.add_argument(
+        "--wait-for-go",
+        action="store_true",
+        help="Wait for record_pedal.py sync signal before saving frames.",
     )
     return parser.parse_args()
 
@@ -98,19 +109,18 @@ def main(args):
         }
 
     if not camera_info:
-        print("Error: No left/right arm RealSense cameras found.")
+        print(f"Error: no RealSense camera found for --arms {args.arms!r}.")
         sys.exit(1)
 
-    left_serial = next((s for s, i in camera_info.items() if i["arm_type"] == "left"), None)
-    if left_serial is None:
-        expected = serial_for_role(CAMERA_MAP, "left") or "left"
-        print(f"ERROR: Left arm RealSense ({expected}) is not connected / not visible on USB.")
-        print("  Reseat the left camera USB cable. Left video will NOT save without it.")
-        connected = [d.get_info(rs.camera_info.serial_number) for d in devices]
-        print(f"  Currently visible RealSense serials: {connected or '(none)'}")
-        sys.exit(1)
+    for role in arm_roles:
+        if not any(info["arm_type"] == role for info in camera_info.values()):
+            expected = serial_for_role(CAMERA_MAP, role) or role
+            print(f"ERROR: {role.capitalize()} arm RealSense ({expected}) is not connected / not visible on USB.")
+            connected = [d.get_info(rs.camera_info.serial_number) for d in devices]
+            print(f"  Currently visible RealSense serials: {connected or '(none)'}")
+            sys.exit(1)
 
-    if len(camera_info) < 2:
+    if args.arms == "both" and len(camera_info) < 2:
         print(f"Warning: only {len(camera_info)} arm camera(s) found; continuing with available arm(s).")
 
     serial_numbers = [serial for serial, info in camera_info.items() if info["arm_type"] == "left"]
@@ -119,22 +129,25 @@ def main(args):
     current_datetime_id = args.datetime_id or datetime.now().strftime("%Y%m%d%H%M%S")
 
     try:
-        for i, (serial_number, info) in enumerate(
-            sorted(camera_info.items(), key=lambda item: 0 if item[1]["arm_type"] == "left" else 1)
-        ):
-            if i > 0:
-                time.sleep(1.0)
-            profile = info["pipeline"].start(info["config"])
+        start_entries = [
+            (serial_number, info["pipeline"], info["config"])
+            for serial_number, info in sorted(
+                camera_info.items(),
+                key=lambda item: 0 if item[1]["arm_type"] == "left" else 1,
+            )
+        ]
+        profiles = start_pipelines_parallel(start_entries, should_stop=should_stop)
+        for serial_number, profile in profiles.items():
+            info = camera_info[serial_number]
             info["profile"] = profile
             color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
             print(
                 f"Camera {serial_number} ({info['arm_type']}) Color Stream: "
                 f"Resolution {color_profile.width()}x{color_profile.height()}, FPS: {color_profile.fps()}"
             )
-            warmup_pipeline(info["pipeline"], should_stop=should_stop)
     except RuntimeError as e:
         print(f"Error starting RealSense pipeline: {e}")
-        print("Please ensure both cameras are connected and not in use by another application.")
+        print("Please ensure the requested camera(s) are connected and not in use by another application.")
         for info in camera_info.values():
             try:
                 info["pipeline"].stop()
@@ -203,17 +216,33 @@ def main(args):
 
     ready_dir = Path(".recording")
     ready_dir.mkdir(exist_ok=True)
-    ready_path = ready_dir / f"arms_ready_{current_datetime_id}"
+    ready_path = arms_ready_path(current_datetime_id)
     ready_path.touch()
     print(f"Arm cameras ready (signal: {ready_path})", flush=True)
-    print("Press 'q' to stop recording for both cameras.")
+
+    if args.wait_for_go and not wait_for_recording_go(
+        current_datetime_id, label="wrist", should_stop=should_stop
+    ):
+        return
+
+    recording_t0 = read_recording_start(current_datetime_id)
+    drain_pipelines(
+        [camera_info[sn]["pipeline"] for sn in serial_numbers],
+        label="wrist",
+        should_stop=should_stop,
+    )
+
+    print("Press 'q' to stop recording.", flush=True)
 
     start_time = time.time()
+    if recording_t0 is not None:
+        print(f"Shared recording t0={recording_t0:.3f} (local now={start_time:.3f})", flush=True)
     prev_times = {sn: time.time() for sn in serial_numbers}
 
     try:
         while not stop_recording:
             got_frame = False
+            capture_t = time.time()
             for serial_number in serial_numbers:
                 info = camera_info[serial_number]
                 frames = poll_for_frames(info["pipeline"], timeout_ms=100, should_stop=should_stop)
@@ -231,7 +260,7 @@ def main(args):
                     f'RealSense Video Recording - {info["arm_type"].capitalize()} Arm ({serial_number})',
                     color_image,
                 )
-                frame_arrays[serial_number].append(time.time())
+                frame_arrays[serial_number].append(capture_t)
 
                 if args.fps:
                     current_time = time.time()
@@ -265,11 +294,11 @@ def main(args):
             n_frames = len(frame_array)
             arm = camera_info[serial_number]["arm_type"]
             print(f"Saved {n_frames} frames from {arm} arm ({serial_number})", flush=True)
-            if arm == "left" and n_frames == 0:
-                left_expected = serial_for_role(CAMERA_MAP, "left") or "left"
+            if n_frames == 0:
+                expected = serial_for_role(CAMERA_MAP, arm) or arm
                 print(
-                    f"ERROR: Left arm camera recorded ZERO frames — video file will be empty. "
-                    f"Check USB for serial {left_expected}.",
+                    f"ERROR: {arm.capitalize()} arm camera recorded ZERO frames — video file will be empty. "
+                    f"Check USB for serial {expected}.",
                     flush=True,
                 )
 

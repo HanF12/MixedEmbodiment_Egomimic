@@ -24,8 +24,15 @@ from foot_pedal import cancel_pedal_wait, list_input_devices, resolve_pedal_devi
 from hand_pose_track import CAMERA_MAP
 from pathlib import Path
 from realsense_utils import find_serial_for_role, list_connected_serials, serial_for_role
+from recording_sync import (
+    arms_ready_path,
+    bird_ready_path,
+    cleanup_sync_signals,
+    signal_recording_go,
+)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_BOOT_SECONDS = 3.0
 
 active_procs: list[subprocess.Popen] = []
 shutting_down = False
@@ -141,6 +148,15 @@ def parse_args() -> argparse.Namespace:
             "Sets output folder under recording/sessions/<mode>/ and which streams run."
         ),
     )
+    parser.add_argument(
+        "--boot-seconds",
+        type=float,
+        default=DEFAULT_BOOT_SECONDS,
+        help=(
+            "Seconds to wait after all recorders are ready before starting capture together "
+            f"(default: {DEFAULT_BOOT_SECONDS:g})."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -191,31 +207,84 @@ def build_bird_rs_cmd(
         cmd.append("--no-hand-pose")
     if not display:
         cmd.append("--no-display")
+    cmd.append("--wait-for-go")
     return cmd
 
 
-def wait_arms_ready(
-    datetime_id: str,
-    arm_proc: subprocess.Popen | None = None,
+def wait_signal(
+    label: str,
+    path: Path,
+    proc: subprocess.Popen | None = None,
     timeout: float = 45.0,
 ) -> bool:
-    ready_path = os.path.join(SCRIPT_DIR, ".recording", f"arms_ready_{datetime_id}")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if shutting_down:
             return False
-        if arm_proc is not None and arm_proc.poll() is not None:
-            print("ERROR: arm RealSense recorder exited before becoming ready.", flush=True)
+        if proc is not None and proc.poll() is not None:
+            print(f"ERROR: {label} recorder exited before becoming ready.", flush=True)
             return False
-        if os.path.exists(ready_path):
+        if path.exists():
             return True
         time.sleep(0.1)
-    print(
-        f"WARNING: arm RealSense not ready after {timeout:.0f}s; "
-        "starting bird RealSense anyway.",
-        flush=True,
-    )
+    print(f"WARNING: {label} not ready after {timeout:.0f}s.", flush=True)
     return False
+
+
+def wait_streams_ready(
+    datetime_id: str,
+    *,
+    need_arms: bool,
+    need_bird: bool,
+    arm_proc: subprocess.Popen | None = None,
+    bird_proc: subprocess.Popen | None = None,
+    timeout: float = 45.0,
+) -> bool:
+    """Wait until all required camera recorders have opened their pipelines."""
+    pending: list[tuple[str, Path, subprocess.Popen | None]] = []
+    if need_arms:
+        pending.append(("Wrist RealSense", arms_ready_path(datetime_id), arm_proc))
+    if need_bird:
+        pending.append(("Bird RealSense", bird_ready_path(datetime_id), bird_proc))
+    if not pending:
+        return True
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if shutting_down:
+            return False
+        still_waiting: list[tuple[str, Path, subprocess.Popen | None]] = []
+        for label, path, proc in pending:
+            if proc is not None and proc.poll() is not None:
+                print(f"ERROR: {label} recorder exited before becoming ready.", flush=True)
+                return False
+            if path.exists():
+                print(f"{label} ready.", flush=True)
+            else:
+                still_waiting.append((label, path, proc))
+        if not still_waiting:
+            return True
+        pending = still_waiting
+        time.sleep(0.1)
+
+    for label, _, _ in pending:
+        print(f"WARNING: {label} not ready after {timeout:.0f}s.", flush=True)
+    return False
+
+
+def countdown_and_go(datetime_id: str, boot_seconds: float) -> bool:
+    if boot_seconds > 0:
+        print(f"All streams ready — starting in {boot_seconds:g}s...", flush=True)
+        deadline = time.monotonic() + boot_seconds
+        while time.monotonic() < deadline:
+            if shutting_down:
+                return False
+            remaining = deadline - time.monotonic()
+            print(f"  {remaining:.0f}s", flush=True)
+            time.sleep(min(1.0, remaining))
+    t0 = signal_recording_go(datetime_id)
+    print(f"  >>> RECORDING (all streams synced, t0={t0:.3f})", flush=True)
+    return True
 
 
 def resolve_bird_realsense_serial(explicit: str | None) -> str | None:
@@ -254,14 +323,14 @@ def verify_demo_outputs(datetime_id: str, mode: RecordingMode) -> None:
         checks.append(
             (
                 "LEFT joints",
-                Path(root) / "joint-data/npy" / f"joint_position_{datetime_id}.npy",
+                Path(root) / "joint-data/left/position" / f"joint_position_{datetime_id}.npy",
             )
         )
     if mode.joint_arms in ("right", "both"):
         checks.append(
             (
                 "RIGHT joints",
-                Path(root) / "joint-data/npy" / f"joint_position_right_{datetime_id}.npy",
+                Path(root) / "joint-data/right/position" / f"joint_position_{datetime_id}.npy",
             )
         )
 
@@ -297,17 +366,55 @@ def verify_demo_outputs(datetime_id: str, mode: RecordingMode) -> None:
             print(f"  {tag:<8} Hand pose: {hand_path} ({size} bytes)", flush=True)
 
 
+def build_triple_rs_cmd(
+    datetime_id: str,
+    wrist_arms: str,
+    bird_realsense_serial: str | None,
+    hand_pose: bool,
+    track_hand: str,
+    display: bool,
+    stream_fps: int,
+) -> list[str]:
+    python = sys.executable
+    cmd = [
+        python,
+        os.path.join(SCRIPT_DIR, "realsense_triple_record.py"),
+        "--datetime-id",
+        datetime_id,
+        "--arms",
+        wrist_arms,
+        "--color-fps",
+        str(stream_fps),
+        "--track-hand",
+        track_hand,
+        "--wait-for-go",
+    ]
+    if bird_realsense_serial:
+        cmd.extend(["--serial", bird_realsense_serial])
+    if not hand_pose:
+        cmd.append("--no-hand-pose")
+    if not display:
+        cmd.append("--no-display")
+    return cmd
+
+
 def start_recorders(
     datetime_id: str,
     mode: RecordingMode,
     bird_camera: int,
     stream_fps: int,
-) -> list[subprocess.Popen]:
+    bird_realsense_serial: str | None = None,
+    bird_display: bool = True,
+) -> tuple[list[subprocess.Popen], subprocess.Popen | None, subprocess.Popen | None]:
+    """Spawn all recorder processes at once (no staggered delays)."""
     python = sys.executable
-    common = ["--datetime-id", datetime_id]
+    common = ["--datetime-id", datetime_id, "--wait-for-go"]
     data_env = {"RECORDING_DATA_ROOT": session_data_root(mode)}
 
     procs: list[subprocess.Popen] = []
+    arm_proc: subprocess.Popen | None = None
+    bird_proc: subprocess.Popen | None = None
+    use_triple = bool(mode.wrist_arms and mode.bird_realsense and bird_realsense_serial)
 
     if mode.joint_arms:
         procs.append(
@@ -337,11 +444,25 @@ def start_recorders(
             )
         )
 
-    if mode.wrist_arms:
-        if procs:
-            time.sleep(0.5)
-        procs.append(
-            _spawn(
+    if use_triple:
+        triple_proc = _spawn(
+            build_triple_rs_cmd(
+                datetime_id,
+                mode.wrist_arms,
+                bird_realsense_serial,
+                mode.hand_pose,
+                mode.track_hand,
+                bird_display,
+                stream_fps,
+            ),
+            env=data_env,
+        )
+        procs.append(triple_proc)
+        arm_proc = triple_proc
+        bird_proc = triple_proc
+    else:
+        if mode.wrist_arms:
+            arm_proc = _spawn(
                 [
                     python,
                     os.path.join(SCRIPT_DIR, "realsense_double_record.py"),
@@ -353,8 +474,23 @@ def start_recorders(
                 ],
                 env=data_env,
             )
-        )
-    return procs
+            procs.append(arm_proc)
+
+        if mode.bird_realsense and bird_realsense_serial:
+            bird_proc = _spawn(
+                build_bird_rs_cmd(
+                    datetime_id,
+                    bird_realsense_serial,
+                    mode.hand_pose,
+                    mode.track_hand,
+                    bird_display,
+                    stream_fps,
+                ),
+                env=data_env,
+            )
+            procs.append(bird_proc)
+
+    return procs, arm_proc, bird_proc
 
 
 def stop_recorders(procs: list[subprocess.Popen], timeout: float = 30.0) -> None:
@@ -439,7 +575,8 @@ def main() -> int:
     print("=" * 60)
     print(f"Foot-pedal recording  [mode={mode.session_dir}]")
     print(f"  Output root: {session_data_root(mode)}/")
-    print("  Pedal press  -> start demo")
+    print(f"  Sync boot:   {args.boot_seconds:g}s after all streams ready")
+    print("  Pedal press  -> boot streams, sync, then record")
     print("  Pedal press  -> stop demo and save")
     print("  Ctrl+C       -> quit")
     print("=" * 60)
@@ -489,52 +626,57 @@ def main() -> int:
                 demo_num += 1
                 continue
 
-        active_procs = start_recorders(
+        bird_serial_now = resolve_bird_realsense_serial(args.bird_realsense_serial) if mode.bird_realsense else None
+        if mode.bird_realsense and not bird_serial_now:
+            print(
+                f"WARNING: bird RealSense (center role, serial {bird_expected}) not connected — "
+                "skipping bird-realsense-data/.",
+                flush=True,
+            )
+            print(f"  Connected RealSense: {connected or '(none)'}", flush=True)
+
+        active_procs, arm_proc, bird_proc = start_recorders(
             datetime_id,
             mode,
             args.bird_camera,
             args.stream_fps,
+            bird_realsense_serial=bird_serial_now,
+            bird_display=not args.no_display,
         )
 
-        arm_proc = None
-        if mode.wrist_arms:
-            print("Waiting for wrist RealSense camera(s)...", flush=True)
-            arm_proc = active_procs[-1]
-            wait_arms_ready(datetime_id, arm_proc=arm_proc)
-
-        if not shutting_down and mode.bird_realsense:
-            bird_serial_now = resolve_bird_realsense_serial(args.bird_realsense_serial)
-            if bird_serial_now:
-                bird_cmd = build_bird_rs_cmd(
-                    datetime_id,
-                    bird_serial_now,
-                    mode.hand_pose,
-                    mode.track_hand,
-                    not args.no_display,
-                    args.stream_fps,
-                )
-                active_procs.append(
-                    _spawn(bird_cmd, env={"RECORDING_DATA_ROOT": session_data_root(mode)})
-                )
-                print(f"Bird RealSense started ({bird_serial_now}).", flush=True)
-            else:
-                connected = list_connected_serials()
-                print(
-                    f"WARNING: bird RealSense (center role, serial {bird_expected}) not connected — "
-                    "skipping bird-realsense-data/.",
-                    flush=True,
-                )
-                print(f"  Connected RealSense: {connected or '(none)'}", flush=True)
+        need_arms = bool(mode.wrist_arms)
+        need_bird = bool(mode.bird_realsense and bird_serial_now)
+        if need_arms or need_bird:
+            print("Waiting for camera recorder(s) to boot...", flush=True)
+            if not wait_streams_ready(
+                datetime_id,
+                need_arms=need_arms,
+                need_bird=need_bird,
+                arm_proc=arm_proc,
+                bird_proc=bird_proc,
+            ):
+                stop_recorders(active_procs)
+                cleanup_sync_signals(datetime_id)
+                active_procs = []
+                demo_num += 1
+                continue
 
         if shutting_down:
             break
 
         alive = [p for p in active_procs if p.poll() is None]
         if not alive:
-            print("Warning: all recorders exited immediately.", flush=True)
+            print("Warning: all recorders exited during boot.", flush=True)
+            cleanup_sync_signals(datetime_id)
             active_procs = []
             demo_num += 1
             continue
+
+        if not countdown_and_go(datetime_id, args.boot_seconds):
+            stop_recorders(active_procs)
+            cleanup_sync_signals(datetime_id)
+            active_procs = []
+            break
 
         print(f"    Recording... press pedal to STOP.", flush=True)
         if not wait_pedal_or_quit(args.pedal_key, args.pedal_device):
@@ -543,6 +685,7 @@ def main() -> int:
             break
 
         stop_recorders(active_procs)
+        cleanup_sync_signals(datetime_id)
         active_procs = []
         verify_demo_outputs(datetime_id, mode)
         print(f">>> Demo {demo_num} saved  (id={datetime_id})\n", flush=True)

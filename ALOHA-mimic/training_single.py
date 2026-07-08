@@ -40,32 +40,44 @@ args = parser.parse_args()
 # LOAD DATA USING DATALOADER
 # ===========================================================================
 data_root = os.path.abspath(args.data_root)
-bird_vids = os.path.join(data_root, 'bird-data/mp4')
-bird_time = os.path.join(data_root, 'bird-data/npy')
+bird_vids = os.path.join(data_root, 'bird-realsense-data/mp4')
+bird_time = os.path.join(data_root, 'bird-realsense-data/npy')
 left_arm_vids = os.path.join(data_root, 'aloha-data/left/mp4')
 left_arm_time = os.path.join(data_root, 'aloha-data/left/npy')
 right_arm_vids = os.path.join(data_root, 'aloha-data/right/mp4')
 right_arm_time = os.path.join(data_root, 'aloha-data/right/npy')
-joint_pos = os.path.join(data_root, 'joint-data/pos')
-joint_time = os.path.join(data_root, 'joint-data/time')
+joint_pos = os.path.join(data_root, 'joint-data/right/position')
+joint_time = os.path.join(data_root, 'joint-data/right/time')
 synced_csvs = os.path.abspath(args.sync_dir)
 
-sorted_files = {
-    'bird_time':      sorted_files_in(bird_time, '.npy'),
-    'left_arm_time':  sorted_files_in(left_arm_time, '.npy'),
-    'right_arm_time': sorted_files_in(right_arm_time, '.npy'),
-    'joint_time':     sorted_files_in(joint_time, '.npy'),
+bird_time_files = sorted_files_in(bird_time, '.npy')
+left_arm_time_files = sorted_files_in(left_arm_time, '.npy')
+right_arm_time_files = sorted_files_in(right_arm_time, '.npy')
+joint_time_files = sorted_files_in(joint_time, '.npy')
+
+# Match demos by shared id (from bird-realsense timestamp filename).
+joint_time_by_id = {
+    demo_id_from_joint_npy(p, "joint_timestamp_"): p for p in joint_time_files
 }
+left_arm_time_by_id = {demo_id_from_hash_filename(p): p for p in left_arm_time_files}
+right_arm_time_by_id = {demo_id_from_hash_filename(p): p for p in right_arm_time_files}
 
 # create synchronized csv files
 os.makedirs(synced_csvs, exist_ok=True)
 
-for i in range(len(sorted_files['bird_time'])):
-    id_number = sorted_files['bird_time'][i].split('/')[-1].split('.')[0]
-    joint_ts = np.load(sorted_files['joint_time'][i])
-    left_arm_ts = np.load(sorted_files['left_arm_time'][i])
-    right_arm_ts = np.load(sorted_files['right_arm_time'][i])
-    bird_ts = np.load(sorted_files['bird_time'][i])
+for bird_ts_path in bird_time_files:
+    id_number = demo_id_from_hash_filename(bird_ts_path)
+    if id_number not in joint_time_by_id:
+        print(f"WARNING: skipping {id_number} — no right joint timestamps")
+        continue
+    if id_number not in left_arm_time_by_id or id_number not in right_arm_time_by_id:
+        print(f"WARNING: skipping {id_number} — missing wrist camera timestamps")
+        continue
+
+    joint_ts = np.load(joint_time_by_id[id_number])
+    left_arm_ts = np.load(left_arm_time_by_id[id_number])
+    right_arm_ts = np.load(right_arm_time_by_id[id_number])
+    bird_ts = np.load(bird_ts_path)
     synchronize(
         joint_ts,
         left_arm_ts,
@@ -113,9 +125,18 @@ print(f"Normalization statistics saved to {save_path}")
 
 # total number of samples
 n = len(dataset)
-# compute lengths
-train_len = int(0.95 * n) # (basically) no val split
-test_len  = n - train_len
+if n == 0:
+    raise RuntimeError("Dataset is empty — check sync CSVs have rows and data files exist.")
+if Train_Epoch <= 0:
+    raise RuntimeError(f"--epochs must be > 0 (got {Train_Epoch}).")
+
+# compute lengths — always keep at least one training sample when n >= 1
+train_len = max(1, int(0.95 * n)) if n > 1 else n
+test_len = n - train_len
+if test_len == 0 and n > 1:
+    train_len = n - 1
+    test_len = 1
+print(f"Dataset: {n} samples ({train_len} train, {test_len} val)")
 train_dataset, test_dataset = random_split(
     dataset,
     [train_len, test_len],
@@ -134,7 +155,7 @@ class Args:
         self.num_queries = dataset.num_queries
         self.camera_names = ["cam0", "cam1", "cam2"]  # Assuming 3 cameras
         self.hidden_dim = 512 # 512 originally
-        self.dropout = 0.2
+        self.dropout = 0.1
         self.nheads = 8 # 8 originally
         self.dim_feedforward = 3200 # 3200 originally
         self.enc_layers = 4 # 4 originally
@@ -179,6 +200,7 @@ try:
         # ---------------- TRAIN ----------------
         model.train()
         running_loss = 0.0
+        train_batches = 0
 
         loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{Train_Epoch}", unit="batch")
         for batch_idx, data in enumerate(loop):
@@ -207,14 +229,20 @@ try:
             scaler.update()
 
             running_loss += rec_loss.item()
-            loop.set_postfix(avg_loss=running_loss / (batch_idx + 1))
+            train_batches += 1
+            loop.set_postfix(avg_loss=running_loss / train_batches)
 
-        avg_train = running_loss / len(train_loader)
+        if train_batches == 0:
+            raise RuntimeError(
+                "Training loop completed zero batches — check batch size vs dataset size."
+            )
+        avg_train = running_loss / train_batches
         loss_history.append(avg_train)
 
         # ---------------- VALIDATION ----------------
         model.eval()
         val_running = 0.0
+        val_batches = 0
         with torch.no_grad():
             for qpos, image, actions, is_pad in val_loader:
                 qpos = qpos.to(device)
@@ -233,8 +261,9 @@ try:
                     vloss = rec_val
 
                 val_running += vloss.item()
+                val_batches += 1
 
-        avg_val = val_running / len(val_loader)
+        avg_val = val_running / val_batches if val_batches else float("nan")
         val_loss_history.append(avg_val)
 
         print(f"→ Epoch {epoch+1} train: {avg_train:.4f} │ val: {avg_val:.4f}")
@@ -242,7 +271,11 @@ try:
         # save every 10 epochs, regardless of val score
         if epoch % 3000 == 0 and epoch > 9000:
             torch.save(model.state_dict(), f"weights/Vinilla_ACT_{epoch}.pth")
-        
+
+except Exception as exc:
+    print(f"Training stopped early: {type(exc).__name__}: {exc}", flush=True)
+    raise
+
 finally:
     # save model
     os.makedirs("weights", exist_ok=True)
@@ -262,7 +295,11 @@ finally:
     ax.set_title("Final Loss Curves")
     ax.legend()
     fig.tight_layout()
-    print("loss history:", loss_history[-200])
+    if loss_history:
+        tail = loss_history[-200:] if len(loss_history) >= 200 else loss_history
+        print("loss history (last", len(tail), "epochs):", tail)
+    else:
+        print("loss history: (empty — training may have exited before any epoch completed)")
     try:
         fig.savefig("final_loss_curve_lr_813.png")
         print('Chart saved successfully')

@@ -7,6 +7,7 @@ import time
 from datetime import datetime
 
 from recording_paths import under_recording
+from recording_sync import read_recording_start, wait_for_recording_go
 
 stop_recording = False
 
@@ -35,7 +36,28 @@ def parse_args():
         default=None,
         help="Shared timestamp id for output filenames (default: now).",
     )
+    parser.add_argument(
+        "--wait-for-go",
+        action="store_true",
+        help="Wait for record_pedal.py sync signal before saving frames.",
+    )
     return parser.parse_args()
+
+def drain_webcam(cap, max_ms: float = 400, idle_ms: float = 60) -> int:
+    discarded = 0
+    idle_start = None
+    deadline = time.monotonic() + max_ms / 1000.0
+    while time.monotonic() < deadline:
+        if cap.grab():
+            discarded += 1
+            idle_start = None
+            continue
+        if idle_start is None:
+            idle_start = time.monotonic()
+        elif time.monotonic() - idle_start >= idle_ms / 1000.0:
+            break
+        time.sleep(0.001)
+    return discarded
 
 def main(args):
     # Open the selected camera
@@ -83,9 +105,21 @@ def main(args):
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
 
+    if args.wait_for_go and not wait_for_recording_go(id_str, label="webcam bird"):
+        cap.release()
+        out.release()
+        return
+
+    recording_t0 = read_recording_start(id_str)
+    drained = drain_webcam(cap)
+    print(f"[webcam bird] Drained {drained} stale frame(s) from camera buffer.", flush=True)
+    if recording_t0 is not None:
+        print(f"[webcam bird] Shared recording t0={recording_t0:.3f}", flush=True)
+
     print(f"Recording from camera {args.camera}. Press 'q' to stop.")
     try:
         while not stop_recording:
+            capture_t = time.time()
             ret, frame = cap.read()
             if not ret:
                 print("Error: Failed to capture frame.")
@@ -94,7 +128,7 @@ def main(args):
             # Write frame to video file
             out.write(frame)
             cv2.imshow(f"Webcam Recording - Camera {args.camera}", frame)
-            frame_array.append(time.time())
+            frame_array.append(capture_t)
 
             # If --fps was set, compute and print per-frame FPS
             if args.fps:

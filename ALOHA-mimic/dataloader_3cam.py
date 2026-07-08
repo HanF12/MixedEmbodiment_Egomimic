@@ -59,26 +59,57 @@ class PreloadedMultiVideoJointDatasetNEW(Dataset):
         self.sync_csv_path       = os.path.join(os.getcwd(), sync_csv_dir)
 
         # 1) List all files up front
-        bird_vids_all       = sorted([os.path.join(self.bird_vids_path, f) for f in os.listdir(self.bird_vids_path) if f.lower().endswith(".mp4")])
-        left_arm_vids_all   = sorted([os.path.join(self.left_arm_vids_path, f) for f in os.listdir(self.left_arm_vids_path) if f.lower().endswith(".mp4")])
-        right_arm_vids_all  = sorted([os.path.join(self.right_arm_vids_path, f) for f in os.listdir(self.right_arm_vids_path) if f.lower().endswith(".mp4")])
-        joint_npy_all       = sorted([os.path.join(self.joint_data_path, f) for f in os.listdir(self.joint_data_path) if f.lower().endswith(".npy")])
-        sync_csv_all        = sorted([os.path.join(self.sync_csv_path, f) for f in os.listdir(self.sync_csv_path) if f.lower().endswith(".csv")])
+        bird_vids_all = sorted(
+            [
+                os.path.join(self.bird_vids_path, f)
+                for f in os.listdir(self.bird_vids_path)
+                if f.lower().endswith(".mp4")
+            ]
+        )
+        left_arm_vids_all = sorted(
+            [
+                os.path.join(self.left_arm_vids_path, f)
+                for f in os.listdir(self.left_arm_vids_path)
+                if f.lower().endswith(".mp4")
+            ]
+        )
+        right_arm_vids_all = sorted(
+            [
+                os.path.join(self.right_arm_vids_path, f)
+                for f in os.listdir(self.right_arm_vids_path)
+                if f.lower().endswith(".mp4")
+            ]
+        )
+        joint_npy_all = sorted(
+            [
+                os.path.join(self.joint_data_path, f)
+                for f in os.listdir(self.joint_data_path)
+                if f.lower().endswith(".npy")
+            ]
+        )
+        sync_csv_all = sorted(
+            [
+                os.path.join(self.sync_csv_path, f)
+                for f in os.listdir(self.sync_csv_path)
+                if f.lower().endswith(".csv")
+            ]
+        )
+
+        bird_vids_by_id = index_paths_by_demo_id(bird_vids_all, demo_id_from_hash_filename)
+        left_arm_vids_by_id = index_paths_by_demo_id(left_arm_vids_all, demo_id_from_hash_filename)
+        right_arm_vids_by_id = index_paths_by_demo_id(right_arm_vids_all, demo_id_from_hash_filename)
+        joint_npy_by_id = index_paths_by_demo_id(joint_npy_all, demo_id_from_joint_npy)
         if max_demos is not None and max_demos > 0:
             print(f"INFO: Using only the first {max_demos} demonstrations.")
-            bird_vids_all      = bird_vids_all[:max_demos]
-            left_arm_vids_all  = left_arm_vids_all[:max_demos]
-            right_arm_vids_all = right_arm_vids_all[:max_demos]
-            joint_npy_all      = joint_npy_all[:max_demos]
-            sync_csv_all       = sync_csv_all[:max_demos]
-            
+            sync_csv_all = sync_csv_all[:max_demos]
+
         if not sync_csv_all:
             raise FileNotFoundError(f"No .csv files found in {self.sync_csv_path}")
         if not joint_npy_all:
             raise FileNotFoundError(f"No .npy files found in {self.joint_data_path}")
-        
+
         # Store the number of original demonstrations to use in __len__ and __getitem__
-        self.num_demos = len(sync_csv_all)
+        self.num_demos = 0
 
         # Prepare accumulators
         self.bird_frames_list      = []
@@ -90,15 +121,52 @@ class PreloadedMultiVideoJointDatasetNEW(Dataset):
 
         print("Loading and synchronizing all recordings...")
 
-        # 2) Since all files share the same base ordering, iterate by index instead of matching rec_id
-        for idx in range(self.num_demos):
-            bird_vid_path      = bird_vids_all[idx]
-            left_arm_vid_path  = left_arm_vids_all[idx]
-            right_arm_vid_path  = right_arm_vids_all[idx]
-            joint_npy_path     = joint_npy_all[idx]
-            csv_path           = sync_csv_all[idx]
-
+        # 2) Match each sync CSV to the corresponding demo files by shared id
+        for csv_path in sync_csv_all:
             rec_id = os.path.splitext(os.path.basename(csv_path))[0]
+            missing = []
+            if rec_id not in bird_vids_by_id:
+                missing.append("bird video")
+            if rec_id not in left_arm_vids_by_id:
+                missing.append("left wrist video")
+            if rec_id not in right_arm_vids_by_id:
+                missing.append("right wrist video")
+            if rec_id not in joint_npy_by_id:
+                missing.append("joint position")
+            if missing:
+                print(f"WARNING: skipping {rec_id} — missing {', '.join(missing)}")
+                continue
+
+            bird_vid_path = bird_vids_by_id[rec_id]
+            left_arm_vid_path = left_arm_vids_by_id[rec_id]
+            right_arm_vid_path = right_arm_vids_by_id[rec_id]
+            joint_npy_path = joint_npy_by_id[rec_id]
+
+            # Read sync CSV first — skip before loading videos if nothing to train on
+            df_sync = pd.read_csv(csv_path)
+            if df_sync.empty:
+                print(f"WARNING: skipping {rec_id} — sync CSV has 0 rows (streams never aligned)")
+                continue
+
+            mask = (
+                (df_sync["bird_index"] >= self.temp_cut)
+                & (df_sync["left_index"] >= self.temp_cut)
+                & (df_sync["right_index"] >= self.temp_cut)
+                & (df_sync["joint_index"] >= self.temp_cut)
+            )
+            df_sync = df_sync[mask].reset_index(drop=True)
+            for col in ["bird_index", "left_index", "right_index", "joint_index"]:
+                df_sync[col] -= self.temp_cut
+
+            required_cols = {"joint_index", "left_index", "right_index", "bird_index"}
+            if not required_cols.issubset(df_sync.columns):
+                raise KeyError(f"Sync CSV '{csv_path}' missing columns: {required_cols - set(df_sync.columns)}")
+
+            N_i = len(df_sync)
+            if N_i == 0:
+                print(f"WARNING: skipping {rec_id} — no synced samples after temp_cut={self.temp_cut}")
+                continue
+
             print(f"Processing Recording. Ensure the following files are synced:")
             print(f"      Bird video:      {os.path.basename(bird_vid_path)}")
             print(f"      Left-arm video:  {os.path.basename(left_arm_vid_path)}")
@@ -125,30 +193,12 @@ class PreloadedMultiVideoJointDatasetNEW(Dataset):
             # 4.1) forcefully cut x joint data from beginning of joint data
             raw_joint_list = raw_joint_list[self.temp_cut:]
 
-            # 5) Read sync CSV and extract indices
-            df_sync = pd.read_csv(csv_path)
-            
-            # ─── Drop all rows that refer to frames we cut away ───
-            mask = (
-                (df_sync['bird_index']  >= self.temp_cut) &
-                (df_sync['left_index']  >= self.temp_cut) &
-                (df_sync['right_index'] >= self.temp_cut) &
-                (df_sync['joint_index'] >= self.temp_cut)
-            )
-            df_sync = df_sync[mask].reset_index(drop=True)
-            
-            # ─── Now rebase to zero and extract ───
-            for col in ["bird_index", "left_index", "right_index", "joint_index"]:
-                df_sync[col] -= self.temp_cut
-            
-            required_cols = {"joint_index", "left_index", "right_index","bird_index"}
-            if not required_cols.issubset(df_sync.columns):
-                raise KeyError(f"Sync CSV '{csv_path}' missing columns: {required_cols - set(df_sync.columns)}")
+            bird_idxs = df_sync["bird_index"].to_numpy(dtype=np.int64)
+            left_arm_idxs = df_sync["left_index"].to_numpy(dtype=np.int64)
+            right_index = df_sync["right_index"].to_numpy(dtype=np.int64)
+            joint_idxs = df_sync["joint_index"].to_numpy(dtype=np.int64)
 
-            bird_idxs, left_arm_idxs, right_index, joint_idxs = df_sync["bird_index"].to_numpy(dtype=np.int64), df_sync["left_index"].to_numpy(dtype=np.int64), df_sync["right_index"].to_numpy(dtype=np.int64),df_sync["joint_index"].to_numpy(dtype=np.int64)
-            N_i = len(df_sync)
-            
-            self.demo_lengths.append(N_i) # store length of each demo for an episodic loader
+            self.demo_lengths.append(N_i)  # store length of each demo for an episodic loader
 
             # 7) Append the synchronized samples from this recording to global lists
             for j in range(N_i):
@@ -158,10 +208,13 @@ class PreloadedMultiVideoJointDatasetNEW(Dataset):
                 self.joint_data.append(raw_joint_list[joint_idxs[j]])
                 
             total_samples += N_i
+            self.num_demos += 1
             print(f"    → Added {N_i} synced samples (total so far: {total_samples})\n")
 
         self.num_samples = total_samples
-                
+        if self.num_demos == 0:
+            raise FileNotFoundError("No complete demonstrations found after matching sync CSVs to data files.")
+
         # normalize joints
         all_joints = torch.stack(self.joint_data, dim=0)
         self.joint_mean = all_joints.mean(dim=0)
@@ -180,6 +233,8 @@ class PreloadedMultiVideoJointDatasetNEW(Dataset):
         ep = original_episode_idx
         ep_start = sum(self.demo_lengths[:ep])
         ep_len = self.demo_lengths[ep]
+        if ep_len <= 0:
+            raise RuntimeError(f"Episode {ep} has no synced samples — remove empty sync CSVs and retry.")
         # Sample a random start time within this episode
         start_ts_in_ep = np.random.randint(0, ep_len)
         sample_idx = ep_start + start_ts_in_ep # This is the global index for the start frame
@@ -265,7 +320,27 @@ class PreloadedMultiVideoJointDatasetNEW(Dataset):
             print(f"  • {label} '{os.path.basename(vp)}' → read {read_count}/{total} frames")
 
         return all_frames
-    
+
+
+def demo_id_from_hash_filename(path: str) -> str:
+    """Extract demo id from names like video_*#<demo_id>.mp4/.npy."""
+    name = os.path.basename(path)
+    if "#" not in name:
+        raise ValueError(f"Expected '#' in filename: {name}")
+    return name.split("#", 1)[1].rsplit(".", 1)[0]
+
+
+def demo_id_from_joint_npy(path: str, prefix: str = "joint_position_") -> str:
+    name = os.path.basename(path)
+    if not name.startswith(prefix):
+        raise ValueError(f"Unexpected joint file name: {name}")
+    return name[len(prefix) :].rsplit(".", 1)[0]
+
+
+def index_paths_by_demo_id(paths, id_fn):
+    return {id_fn(p): p for p in paths}
+
+
 def sorted_files_in(dir_path, extension):
     full_dir = os.path.join(os.getcwd(), dir_path)
     if not os.path.isdir(full_dir):
