@@ -119,13 +119,12 @@ def main(args):
     print(f"Recording from camera {args.camera}. Press 'q' to stop.")
     try:
         while not stop_recording:
-            capture_t = time.time()
             ret, frame = cap.read()
             if not ret:
                 print("Error: Failed to capture frame.")
                 break
 
-            # Write frame to video file
+            capture_t = time.time()
             out.write(frame)
             cv2.imshow(f"Webcam Recording - Camera {args.camera}", frame)
             frame_array.append(capture_t)

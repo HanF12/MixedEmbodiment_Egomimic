@@ -25,10 +25,10 @@ from hand_pose_track import CAMERA_MAP
 from pathlib import Path
 from realsense_utils import find_serial_for_role, list_connected_serials, serial_for_role
 from recording_sync import (
-    arms_ready_path,
     bird_ready_path,
     cleanup_sync_signals,
     signal_recording_go,
+    wrist_ready_path,
 )
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -234,16 +234,25 @@ def wait_signal(
 def wait_streams_ready(
     datetime_id: str,
     *,
-    need_arms: bool,
+    wrist_arms: str | None,
     need_bird: bool,
-    arm_proc: subprocess.Popen | None = None,
+    wrist_procs: dict[str, subprocess.Popen],
     bird_proc: subprocess.Popen | None = None,
     timeout: float = 45.0,
 ) -> bool:
     """Wait until all required camera recorders have opened their pipelines."""
     pending: list[tuple[str, Path, subprocess.Popen | None]] = []
-    if need_arms:
-        pending.append(("Wrist RealSense", arms_ready_path(datetime_id), arm_proc))
+    if wrist_arms == "both":
+        pending.append(("Left wrist", wrist_ready_path(datetime_id, "left"), wrist_procs.get("left")))
+        pending.append(("Right wrist", wrist_ready_path(datetime_id, "right"), wrist_procs.get("right")))
+    elif wrist_arms in ("left", "right"):
+        pending.append(
+            (
+                f"{wrist_arms.capitalize()} wrist",
+                wrist_ready_path(datetime_id, wrist_arms),
+                wrist_procs.get(wrist_arms),
+            )
+        )
     if need_bird:
         pending.append(("Bird RealSense", bird_ready_path(datetime_id), bird_proc))
     if not pending:
@@ -366,38 +375,6 @@ def verify_demo_outputs(datetime_id: str, mode: RecordingMode) -> None:
             print(f"  {tag:<8} Hand pose: {hand_path} ({size} bytes)", flush=True)
 
 
-def build_triple_rs_cmd(
-    datetime_id: str,
-    wrist_arms: str,
-    bird_realsense_serial: str | None,
-    hand_pose: bool,
-    track_hand: str,
-    display: bool,
-    stream_fps: int,
-) -> list[str]:
-    python = sys.executable
-    cmd = [
-        python,
-        os.path.join(SCRIPT_DIR, "realsense_triple_record.py"),
-        "--datetime-id",
-        datetime_id,
-        "--arms",
-        wrist_arms,
-        "--color-fps",
-        str(stream_fps),
-        "--track-hand",
-        track_hand,
-        "--wait-for-go",
-    ]
-    if bird_realsense_serial:
-        cmd.extend(["--serial", bird_realsense_serial])
-    if not hand_pose:
-        cmd.append("--no-hand-pose")
-    if not display:
-        cmd.append("--no-display")
-    return cmd
-
-
 def start_recorders(
     datetime_id: str,
     mode: RecordingMode,
@@ -405,16 +382,15 @@ def start_recorders(
     stream_fps: int,
     bird_realsense_serial: str | None = None,
     bird_display: bool = True,
-) -> tuple[list[subprocess.Popen], subprocess.Popen | None, subprocess.Popen | None]:
-    """Spawn all recorder processes at once (no staggered delays)."""
+) -> tuple[list[subprocess.Popen], dict[str, subprocess.Popen], subprocess.Popen | None]:
+    """Spawn one process per stream (joints, each wrist camera, bird)."""
     python = sys.executable
     common = ["--datetime-id", datetime_id, "--wait-for-go"]
     data_env = {"RECORDING_DATA_ROOT": session_data_root(mode)}
 
     procs: list[subprocess.Popen] = []
-    arm_proc: subprocess.Popen | None = None
+    wrist_procs: dict[str, subprocess.Popen] = {}
     bird_proc: subprocess.Popen | None = None
-    use_triple = bool(mode.wrist_arms and mode.bird_realsense and bird_realsense_serial)
 
     if mode.joint_arms:
         procs.append(
@@ -444,11 +420,28 @@ def start_recorders(
             )
         )
 
-    if use_triple:
-        triple_proc = _spawn(
-            build_triple_rs_cmd(
+    if mode.wrist_arms:
+        arms_to_spawn = ["left", "right"] if mode.wrist_arms == "both" else [mode.wrist_arms]
+        for arm in arms_to_spawn:
+            proc = _spawn(
+                [
+                    python,
+                    os.path.join(SCRIPT_DIR, "realsense_double_record.py"),
+                    *common,
+                    "--arms",
+                    arm,
+                    "--color-fps",
+                    str(stream_fps),
+                ],
+                env=data_env,
+            )
+            procs.append(proc)
+            wrist_procs[arm] = proc
+
+    if mode.bird_realsense and bird_realsense_serial:
+        bird_proc = _spawn(
+            build_bird_rs_cmd(
                 datetime_id,
-                mode.wrist_arms,
                 bird_realsense_serial,
                 mode.hand_pose,
                 mode.track_hand,
@@ -457,40 +450,9 @@ def start_recorders(
             ),
             env=data_env,
         )
-        procs.append(triple_proc)
-        arm_proc = triple_proc
-        bird_proc = triple_proc
-    else:
-        if mode.wrist_arms:
-            arm_proc = _spawn(
-                [
-                    python,
-                    os.path.join(SCRIPT_DIR, "realsense_double_record.py"),
-                    *common,
-                    "--arms",
-                    mode.wrist_arms,
-                    "--color-fps",
-                    str(stream_fps),
-                ],
-                env=data_env,
-            )
-            procs.append(arm_proc)
+        procs.append(bird_proc)
 
-        if mode.bird_realsense and bird_realsense_serial:
-            bird_proc = _spawn(
-                build_bird_rs_cmd(
-                    datetime_id,
-                    bird_realsense_serial,
-                    mode.hand_pose,
-                    mode.track_hand,
-                    bird_display,
-                    stream_fps,
-                ),
-                env=data_env,
-            )
-            procs.append(bird_proc)
-
-    return procs, arm_proc, bird_proc
+    return procs, wrist_procs, bird_proc
 
 
 def stop_recorders(procs: list[subprocess.Popen], timeout: float = 30.0) -> None:
@@ -546,12 +508,12 @@ def wait_pedal_or_quit(pedal_key: str, pedal_device: str) -> bool:
         return False
 
 
-def required_wrist_role(mode: RecordingMode) -> str | None:
-    if mode.wrist_arms in ("left", "right"):
-        return mode.wrist_arms
+def required_wrist_roles(mode: RecordingMode) -> list[str]:
     if mode.wrist_arms == "both":
-        return "left"
-    return None
+        return ["left", "right"]
+    if mode.wrist_arms in ("left", "right"):
+        return [mode.wrist_arms]
+    return []
 
 
 def main() -> int:
@@ -605,26 +567,22 @@ def main() -> int:
             flush=True,
         )
 
-        required_role = required_wrist_role(mode)
-        if required_role == "left" and not left_serial:
+        right_serial = find_serial_for_role(CAMERA_MAP, "right")
+        right_expected = serial_for_role(CAMERA_MAP, "right") or "right"
+        missing_wrists = []
+        for role in required_wrist_roles(mode):
+            if role == "left" and not left_serial:
+                missing_wrists.append(f"left ({left_expected})")
+            if role == "right" and not right_serial:
+                missing_wrists.append(f"right ({right_expected})")
+        if missing_wrists:
             print(
-                f"ERROR: Left wrist camera ({left_expected}) not visible — skipping this demo. "
+                f"ERROR: Wrist camera(s) not visible — {', '.join(missing_wrists)} — skipping this demo. "
                 "Reseat USB and press pedal again.",
                 flush=True,
             )
             demo_num += 1
             continue
-        if required_role == "right":
-            right_serial = find_serial_for_role(CAMERA_MAP, "right")
-            if not right_serial:
-                right_expected = serial_for_role(CAMERA_MAP, "right") or "right"
-                print(
-                    f"ERROR: Right wrist camera ({right_expected}) not visible — skipping this demo. "
-                    "Reseat USB and press pedal again.",
-                    flush=True,
-                )
-                demo_num += 1
-                continue
 
         bird_serial_now = resolve_bird_realsense_serial(args.bird_realsense_serial) if mode.bird_realsense else None
         if mode.bird_realsense and not bird_serial_now:
@@ -635,7 +593,7 @@ def main() -> int:
             )
             print(f"  Connected RealSense: {connected or '(none)'}", flush=True)
 
-        active_procs, arm_proc, bird_proc = start_recorders(
+        active_procs, wrist_procs, bird_proc = start_recorders(
             datetime_id,
             mode,
             args.bird_camera,
@@ -644,15 +602,14 @@ def main() -> int:
             bird_display=not args.no_display,
         )
 
-        need_arms = bool(mode.wrist_arms)
         need_bird = bool(mode.bird_realsense and bird_serial_now)
-        if need_arms or need_bird:
+        if mode.wrist_arms or need_bird:
             print("Waiting for camera recorder(s) to boot...", flush=True)
             if not wait_streams_ready(
                 datetime_id,
-                need_arms=need_arms,
+                wrist_arms=mode.wrist_arms,
                 need_bird=need_bird,
-                arm_proc=arm_proc,
+                wrist_procs=wrist_procs,
                 bird_proc=bird_proc,
             ):
                 stop_recorders(active_procs)

@@ -153,7 +153,7 @@ def arm_data_to_npy(csv_path: str, output_npy: str = None):
         print(f"Saved {timestamps.shape[0]} timestamps to '{output_npy}'")
     return timestamps
 
-def synchronize(joint_ts:np.array, realsense_ts_l:np.array,realsense_ts_r:np.array, bird_ts: np.array, out_csv: str, max_skew_s: float = 0.02, debug: bool = False):
+def synchronize(joint_ts:np.array, realsense_ts_l:np.array,realsense_ts_r:np.array, bird_ts: np.array, out_csv: str, max_skew_s: float = 0.035, debug: bool = False):
     """
     Synchronise three timestamp arrays and write a CSV.
 
@@ -162,7 +162,7 @@ def synchronize(joint_ts:np.array, realsense_ts_l:np.array,realsense_ts_r:np.arr
         realsense_ts : realsense timestamp numpy array
         bird_ts : bird view timestamp numpy array
         out_csv : output csv name
-        max_skew_s : maximum time different allowed (0.02 is recommended for 30-60hz systems)
+        max_skew_s : maximum time different allowed (0.035s for 15fps cameras + 30Hz joints)
         debug : bool
             If True, include raw timestamps and per-row skew in the CSV.
             If False (default), output only the index columns.

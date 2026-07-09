@@ -228,7 +228,6 @@ def main(args):
             print(f"[bird] Shared recording t0={recording_t0:.3f}", flush=True)
 
         while not stop_recording:
-            capture_t = time.time()
             frames = poll_for_frames(pipeline, timeout_ms=100, should_stop=should_stop)
             if frames is None:
                 continue
@@ -239,9 +238,10 @@ def main(args):
             if not color_frame:
                 continue
 
+            frame_t = time.time()
             frame = np.asanyarray(color_frame.get_data())
             video_writer.write(frame)
-            timestamps.append(capture_t)
+            timestamps.append(frame_t)
 
             if hand_pose_enabled and tracker is not None and recorder is not None:
                 depth_frame = frames.get_depth_frame()

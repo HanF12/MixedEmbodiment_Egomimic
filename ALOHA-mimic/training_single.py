@@ -84,7 +84,7 @@ for bird_ts_path in bird_time_files:
         right_arm_ts,
         bird_ts,
         os.path.join(synced_csvs, f"{id_number}.csv"),
-        max_skew_s=0.02,
+        max_skew_s=0.035,
         debug=False,
     )
 
