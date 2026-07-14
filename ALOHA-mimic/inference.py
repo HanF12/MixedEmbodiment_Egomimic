@@ -141,8 +141,18 @@ parser.add_argument("--aggregation_horizon", type=int, default=None, help="Chunk
 parser.add_argument("--joint_topic", type=str, default=None)
 parser.add_argument("--topic_arm", type=str, default=None)
 parser.add_argument("--topic_gripper", type=str, default=None)
-parser.add_argument("--gripper_scale", type=float, default=30.2)
-parser.add_argument("--gripper_max", type=float, default=60.0)
+parser.add_argument(
+    "--gripper_scale",
+    type=float,
+    default=30.2,
+    help="Scale the model's gripper output before publishing (match your controller units).",
+)
+parser.add_argument(
+    "--gripper_max",
+    type=float,
+    default=60.0,
+    help="Clamp published gripper target to this max (use <0 to disable).",
+)
 parser.add_argument(
     "--max_joint_speed",
     type=float,
@@ -189,6 +199,7 @@ cli = parser.parse_args(rospy.myargv(argv=sys.argv)[1:])
 
 if cli.joint_topic is None:
     cli.joint_topic = "/joint_states_slave_right" if cli.arm_side == "right" else "/joint_states_slave_left"
+
 if cli.topic_arm is None:
     cli.topic_arm = f"/arm_joint_target_position_slave_{cli.arm_side}"
 if cli.topic_gripper is None:
@@ -199,7 +210,7 @@ CHUNKING = bool(cli.chunking) # Change to true to do the real ACT.
 
 K_PREDICTION_HORIZON = int(cli.num_queries)
 K_AGGREGATION_HORIZON = int(cli.aggregation_horizon) if cli.aggregation_horizon is not None else int(cli.num_queries)
-m = 0.4 # Decay factor for chunking
+m = 0.075 #Decay factor for chunking
 
 INFERENCE_FPS = float(cli.inference_fps)
 target_interval_ms = (1.0 / INFERENCE_FPS) * 1000
@@ -469,7 +480,7 @@ try:
 
         pos_vel_tuple = (
             get_current_slave_right_positions()
-            if cli.arm_side == "right"
+            if str(cli.arm_side) == "right"
             else get_current_slave_left_positions()
         )
 
@@ -546,11 +557,15 @@ try:
             else:
                 positions_to_publish = predicted_trajectory_np[0].astype(np.float32)
 
-            # Gripper scale/clamp like go_home.py
+            raw_gripper = float(positions_to_publish[6])
+
+            # Gripper scaling/clamp (controller units)
             if float(cli.gripper_scale) != 1.0:
                 positions_to_publish[-1] *= float(cli.gripper_scale)
             if float(cli.gripper_max) >= 0:
-                positions_to_publish[-1] = min(positions_to_publish[-1], float(cli.gripper_max))
+                positions_to_publish[-1] = min(float(positions_to_publish[-1]), float(cli.gripper_max))
+
+            scaled_gripper = float(positions_to_publish[6])
 
             # Rate-limit to avoid big jumps when inference/update Hz is low.
             desired = positions_to_publish.astype(np.float32)
@@ -576,6 +591,16 @@ try:
 
                 last_cmd = cmd.astype(np.float32)
                 last_cmd_t = now_t
+
+            if DEBUG:
+                # Print a compact view of where the gripper command gets flattened:
+                #   model/raw -> scaled/clamped -> published(after rate limit)
+                pub_gripper = float(last_cmd[6]) if last_cmd is not None else float("nan")
+                rospy.loginfo(
+                    f"[gripper] raw={raw_gripper:.6f}  "
+                    f"scaled={scaled_gripper:.3f} (scale={float(cli.gripper_scale):g}, max={float(cli.gripper_max):g})  "
+                    f"published={pub_gripper:.3f}  max_dg/step={float(cli.max_gripper_speed) * max(1e-3, float(now_t - (last_cmd_t or now_t))):.3f}"
+                )
 
         # Publish at the same cadence as inference updates.
         if last_cmd is not None:
