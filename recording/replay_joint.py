@@ -21,15 +21,35 @@ from typing import Optional, Sequence, Tuple
 import numpy as np
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_DATA_DIR = os.path.join(SCRIPT_DIR, "joint-data", "npy")
+
+
+def _first_existing_dir(*candidates: str) -> str:
+    for c in candidates:
+        if c and os.path.isdir(c):
+            return c
+    return candidates[0] if candidates else ""
+
+
+# Back-compat default (old layout). If it doesn't exist, prefer the newer session layout.
+DEFAULT_DATA_DIR = _first_existing_dir(
+    os.path.join(SCRIPT_DIR, "joint-data", "npy"),
+    os.path.join(SCRIPT_DIR, "sessions", "teleop_bimanual", "joint-data"),
+)
 
 DEFAULT_JOINT_NAMES = tuple(f"joint{i}" for i in range(1, 7))
 
 # Bimanual tabletop teleop: replay on slave (follower) arms.
+# iarm_node_slave_* subscribes to /arm_joint_command_slave_* (signal_arm/arm_control).
+# The older /arm_joint_target_position_slave_* (sensor_msgs/JointState) is typically used by
+# tracker/bridge nodes, not the controller itself.
 DEFAULT_LEFT_ARM_TOPIC = "/arm_joint_target_position_slave_left"
 DEFAULT_LEFT_GRIPPER_TOPIC = "/gripper_position_control_slave_left"
 DEFAULT_RIGHT_ARM_TOPIC = "/arm_joint_target_position_slave_right"
 DEFAULT_RIGHT_GRIPPER_TOPIC = "/gripper_position_control_slave_right"
+
+# Direct controller command topics (bypass jointTracker).
+DEFAULT_LEFT_ARM_COMMAND_TOPIC = "/arm_joint_command_slave_left"
+DEFAULT_RIGHT_ARM_COMMAND_TOPIC = "/arm_joint_command_slave_right"
 
 # Single-arm fallback (A1_SDK style).
 DEFAULT_SINGLE_ARM_TOPIC = "/arm_joint_target_position"
@@ -60,9 +80,87 @@ def _right_timestamp_name(rec_id: str) -> str:
     return f"joint_timestamp_right_{rec_id}.npy"
 
 
+def _looks_like_session_jointdata_dir(data_dir: str) -> bool:
+    # New layout:
+    #   <...>/joint-data/{left,right}/{position,time}/joint_position_<id>.npy
+    return (
+        os.path.isdir(os.path.join(data_dir, "left", "position"))
+        and os.path.isdir(os.path.join(data_dir, "right", "position"))
+    )
+
+
+def _normalize_data_dir(data_dir: str) -> str:
+    """
+    Accept any of:
+      - old: .../joint-data/npy
+      - new: .../joint-data
+      - session root: .../sessions/<session-name>
+    and normalize to a concrete directory used by resolution helpers.
+    """
+    data_dir = os.path.abspath(data_dir)
+    if _looks_like_session_jointdata_dir(data_dir):
+        return data_dir
+    maybe_joint_data = os.path.join(data_dir, "joint-data")
+    if _looks_like_session_jointdata_dir(maybe_joint_data):
+        return maybe_joint_data
+    return data_dir
+
+
+def _infer_rec_id_from_position_path(position_path: str) -> Optional[str]:
+    base = os.path.basename(position_path)
+    if base.startswith("joint_position_") and base.endswith(".npy"):
+        return base.removeprefix("joint_position_").removesuffix(".npy")
+    if base.startswith("joint_position_right_") and base.endswith(".npy"):
+        return base.removeprefix("joint_position_right_").removesuffix(".npy")
+    return None
+
+
+def _infer_timestamp_path(position_path: str) -> Optional[str]:
+    """
+    Best-effort inference for timestamp path from a position path.
+    Supports both old flat layout and new session layout.
+    """
+    pos_base = os.path.basename(position_path)
+    ts_base = None
+    if pos_base.startswith("joint_position_right_"):
+        ts_base = pos_base.replace("joint_position_right_", "joint_timestamp_right_", 1)
+    elif pos_base.startswith("joint_position_"):
+        ts_base = pos_base.replace("joint_position_", "joint_timestamp_", 1)
+    if ts_base is None:
+        return None
+
+    # New layout: replace /position/ with /time/ if present
+    parts = position_path.split(os.sep)
+    try:
+        idx = parts.index("position")
+    except ValueError:
+        idx = -1
+    if idx != -1:
+        parts[idx] = "time"
+        candidate = os.sep.join(parts[:-1] + [ts_base])
+        if os.path.isfile(candidate):
+            return candidate
+
+    # Old flat layout (same directory)
+    candidate = os.path.join(os.path.dirname(position_path), ts_base)
+    if os.path.isfile(candidate):
+        return candidate
+    return None
+
+
 def list_available_recordings(data_dir: str) -> list[str]:
-    """Return ids with at least a left-arm position file."""
-    ids = set()
+    """Return ids with at least one position file (left or right)."""
+    data_dir = _normalize_data_dir(data_dir)
+    ids: set[str] = set()
+
+    if _looks_like_session_jointdata_dir(data_dir):
+        for side in ("left", "right"):
+            pos_dir = os.path.join(data_dir, side, "position")
+            for path in glob.glob(os.path.join(pos_dir, "joint_position_*.npy")):
+                name = os.path.basename(path)
+                ids.add(name.removeprefix("joint_position_").removesuffix(".npy"))
+        return sorted(ids)
+
     for path in glob.glob(os.path.join(data_dir, "joint_position_*.npy")):
         name = os.path.basename(path)
         if name.startswith("joint_position_right_"):
@@ -73,7 +171,14 @@ def list_available_recordings(data_dir: str) -> list[str]:
 
 
 def has_right_recording(data_dir: str, rec_id: str) -> bool:
-    return os.path.isfile(os.path.join(data_dir, _right_position_name(rec_id)))
+    data_dir = _normalize_data_dir(data_dir)
+    if _looks_like_session_jointdata_dir(data_dir):
+        right_pos_dir = os.path.join(data_dir, "right", "position")
+        return os.path.isfile(os.path.join(right_pos_dir, _left_position_name(rec_id)))
+    # Old flat layout: accept either naming.
+    return os.path.isfile(os.path.join(data_dir, _right_position_name(rec_id))) or os.path.isfile(
+        os.path.join(data_dir, _left_position_name(rec_id))
+    )
 
 
 def resolve_arm_paths(
@@ -85,22 +190,58 @@ def resolve_arm_paths(
 ) -> Tuple[str, Optional[str]]:
     if position_file:
         pos_path = os.path.abspath(position_file)
-        ts_path = os.path.abspath(timestamp_file) if timestamp_file else None
+        if not os.path.isfile(pos_path):
+            raise FileNotFoundError(f"{side} position file not found: {pos_path}")
+
+        if timestamp_file:
+            ts_path = os.path.abspath(timestamp_file)
+            if not os.path.isfile(ts_path):
+                raise FileNotFoundError(f"{side} timestamp file not found: {ts_path}")
+            return pos_path, ts_path
+
+        inferred = _infer_timestamp_path(pos_path)
+        return pos_path, os.path.abspath(inferred) if inferred else None
+
+    data_dir = _normalize_data_dir(data_dir)
+
+    if _looks_like_session_jointdata_dir(data_dir):
+        pos_dir = os.path.join(data_dir, side, "position")
+        ts_dir = os.path.join(data_dir, side, "time")
+        pos_name = _left_position_name(rec_id)  # new layout uses same naming for both
+        ts_name = _left_timestamp_name(rec_id)
+        pos_path = os.path.join(pos_dir, pos_name)
+        ts_path = os.path.join(ts_dir, ts_name)
+        if not os.path.isfile(pos_path):
+            raise FileNotFoundError(f"{side} position file not found: {pos_path}")
+        if not os.path.isfile(ts_path):
+            return pos_path, None
         return pos_path, ts_path
 
+    # Old flat layout: right arm sometimes stored as joint_position_right_<id>.npy.
     if side == "right":
-        pos_name = _right_position_name(rec_id)
-        ts_name = _right_timestamp_name(rec_id)
+        pos_candidates = [_right_position_name(rec_id), _left_position_name(rec_id)]
+        ts_candidates = [_right_timestamp_name(rec_id), _left_timestamp_name(rec_id)]
     else:
-        pos_name = _left_position_name(rec_id)
-        ts_name = _left_timestamp_name(rec_id)
+        pos_candidates = [_left_position_name(rec_id)]
+        ts_candidates = [_left_timestamp_name(rec_id)]
 
-    pos_path = os.path.join(data_dir, pos_name)
-    ts_path = os.path.join(data_dir, ts_name)
-    if not os.path.isfile(pos_path):
-        raise FileNotFoundError(f"{side} position file not found: {pos_path}")
-    if not os.path.isfile(ts_path):
-        return pos_path, None
+    pos_path = None
+    for name in pos_candidates:
+        candidate = os.path.join(data_dir, name)
+        if os.path.isfile(candidate):
+            pos_path = candidate
+            break
+    if pos_path is None:
+        raise FileNotFoundError(
+            f"{side} position file not found in {data_dir}; tried: {pos_candidates}"
+        )
+
+    ts_path = None
+    for name in ts_candidates:
+        candidate = os.path.join(data_dir, name)
+        if os.path.isfile(candidate):
+            ts_path = candidate
+            break
     return pos_path, ts_path
 
 
@@ -158,6 +299,11 @@ class JointReplayer:
         joint_names: Sequence[str],
         frame_id: str,
         queue_size: int,
+        *,
+        arm_msg_type: str = "joint_state",
+        arm_kp: float = 10.0,
+        arm_kd: float = 1.0,
+        arm_mode: int = 0,
     ) -> None:
         import rospy
         from sensor_msgs.msg import JointState
@@ -167,7 +313,25 @@ class JointReplayer:
         self._rospy = rospy
         self._JointState = JointState
         self._gripper_position_control = gripper_position_control
-        self._arm_pub = rospy.Publisher(arm_topic, JointState, queue_size=queue_size)
+        self._arm_msg_type = str(arm_msg_type)
+        self._arm_kp = float(arm_kp)
+        self._arm_kd = float(arm_kd)
+        self._arm_mode = int(arm_mode)
+
+        self._arm_control = None
+        if self._arm_msg_type == "arm_control":
+            try:
+                from signal_arm.msg import arm_control
+            except Exception as exc:
+                raise RuntimeError(
+                    "arm_control publishing requested, but signal_arm/arm_control could not be imported. "
+                    "Source Tabletop_Teleoperation_SDK install/setup.bash in this shell."
+                ) from exc
+            self._arm_control = arm_control
+            self._arm_pub = rospy.Publisher(arm_topic, arm_control, queue_size=queue_size)
+        else:
+            self._arm_pub = rospy.Publisher(arm_topic, JointState, queue_size=queue_size)
+
         self._gripper_pub = rospy.Publisher(
             gripper_topic, gripper_position_control, queue_size=queue_size
         )
@@ -198,19 +362,35 @@ class JointReplayer:
 
     def publish_step(self, positions_7d: np.ndarray) -> None:
         rospy = self._rospy
-        JointState = self._JointState
         gripper_position_control = self._gripper_position_control
 
-        arm_msg = JointState()
-        arm_msg.header.stamp = rospy.Time.now()
-        arm_msg.header.frame_id = self._frame_id
-        arm_msg.name = self._joint_names
-        arm_msg.position = positions_7d[:6].astype(np.float32).tolist()
-        arm_msg.velocity = []
-        arm_msg.effort = []
+        stamp = rospy.Time.now()
+
+        if self._arm_msg_type == "arm_control":
+            arm_control = self._arm_control
+            if arm_control is None:
+                raise RuntimeError("arm_control message type not available.")
+            arm_msg = arm_control()
+            arm_msg.header.stamp = stamp
+            arm_msg.header.frame_id = self._frame_id
+            arm_msg.p_des = positions_7d[:6].astype(np.float32).tolist()
+            arm_msg.v_des = [0.0] * 6
+            arm_msg.kp = [float(self._arm_kp)] * 6
+            arm_msg.kd = [float(self._arm_kd)] * 6
+            arm_msg.t_ff = [0.0] * 6
+            arm_msg.mode = int(self._arm_mode)
+        else:
+            JointState = self._JointState
+            arm_msg = JointState()
+            arm_msg.header.stamp = stamp
+            arm_msg.header.frame_id = self._frame_id
+            arm_msg.name = self._joint_names
+            arm_msg.position = positions_7d[:6].astype(np.float32).tolist()
+            arm_msg.velocity = []
+            arm_msg.effort = []
 
         gripper_msg = gripper_position_control()
-        gripper_msg.header.stamp = arm_msg.header.stamp
+        gripper_msg.header.stamp = stamp
         gripper_msg.header.frame_id = self._frame_id
         gripper_msg.gripper_stroke = float(positions_7d[6])
 
@@ -306,7 +486,7 @@ def replay(
                 left_i = start_steps[0] + step_idx
                 rospy.loginfo(
                     f"Replay progress: {step_idx + 1}/{n_steps} ({pct:.0f}%) "
-                    f"left j1={arms[0][0].positions[left_i, 1]:.3f}"
+                    f"{arms[0][0].label} j1={arms[0][0].positions[left_i, 1]:.3f}"
                 )
                 next_progress = now + progress_interval_sec
 
@@ -339,6 +519,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-step", type=int, default=0)
     parser.add_argument("--subscriber-timeout", type=float, default=10.0)
     parser.add_argument("--progress-interval-sec", type=float, default=5.0)
+
+    parser.add_argument(
+        "--arm-msg-type",
+        choices=("arm_control", "joint_state"),
+        default="joint_state",
+        help="Arm command message type. iarm_node_slave_* expects signal_arm/arm_control.",
+    )
+    parser.add_argument("--arm-kp", type=float, default=10.0, help="arm_control kp gain (per joint).")
+    parser.add_argument("--arm-kd", type=float, default=1.0, help="arm_control kd gain (per joint).")
+    parser.add_argument("--arm-mode", type=int, default=0, help="arm_control mode (0=position).")
 
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
@@ -377,7 +567,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    data_dir = os.path.abspath(args.data_dir)
+    data_dir = _normalize_data_dir(args.data_dir)
 
     if args.list:
         ids = list_available_recordings(data_dir)
@@ -412,13 +602,12 @@ def main() -> None:
         print("Source SDK workspace for signal_arm.", file=sys.stderr)
         raise SystemExit(1) from exc
 
+    # If explicit position files are provided, we can replay without discovering a recording id
+    # in data_dir (useful with session-style folder structures).
     rec_id = args.datetime_id
-    if not rec_id:
-        available = list_available_recordings(data_dir)
-        if not available:
-            raise SystemExit(f"No recordings found in {data_dir}")
-        rec_id = available[-1]
-        print(f"Using latest recording id: {rec_id}")
+    inferred_id = _infer_rec_id_from_position_path(args.right_position_file) if args.right_position_file else None
+    if not rec_id and inferred_id:
+        rec_id = inferred_id
 
     left_pos_file = args.left_position_file or args.position_file
     left_ts_file = args.left_timestamp_file or args.timestamp_file
@@ -426,11 +615,30 @@ def main() -> None:
     replay_left = not args.right_only
     replay_right = args.dual or args.right_only
     if not args.dual and not args.left_only and not args.right_only:
-        replay_right = has_right_recording(data_dir, rec_id)
+        replay_right = has_right_recording(data_dir, rec_id) if rec_id else False
+
+    needs_rec_id = (replay_left and not left_pos_file) or (replay_right and not args.right_position_file)
+    if not rec_id and needs_rec_id:
+        available = list_available_recordings(data_dir)
+        if not available:
+            raise SystemExit(
+                f"No recordings found in {data_dir}. "
+                "Either pass --datetime-id (matching the .npy suffix), "
+                "or pass explicit --left-position-file/--right-position-file."
+            )
+        rec_id = available[-1]
+        print(f"Using latest recording id: {rec_id}")
 
     arms: list[Tuple[ArmTrajectory, JointReplayer]] = []
 
     rospy.init_node("joint_data_replayer", anonymous=True)
+
+    # If user wants to publish arm_control and did not override topics, switch to the controller topics.
+    if args.arm_msg_type == "arm_control":
+        if args.left_arm_topic == DEFAULT_LEFT_ARM_TOPIC:
+            args.left_arm_topic = DEFAULT_LEFT_ARM_COMMAND_TOPIC
+        if args.right_arm_topic == DEFAULT_RIGHT_ARM_TOPIC:
+            args.right_arm_topic = DEFAULT_RIGHT_ARM_COMMAND_TOPIC
 
     if replay_left:
         pos_path, ts_path = resolve_arm_paths(
@@ -446,6 +654,10 @@ def main() -> None:
             DEFAULT_JOINT_NAMES,
             "world",
             1000,
+            arm_msg_type=args.arm_msg_type,
+            arm_kp=args.arm_kp,
+            arm_kd=args.arm_kd,
+            arm_mode=args.arm_mode,
         )
         arms.append(
             (
@@ -476,6 +688,10 @@ def main() -> None:
             DEFAULT_JOINT_NAMES,
             "world",
             1000,
+            arm_msg_type=args.arm_msg_type,
+            arm_kp=args.arm_kp,
+            arm_kd=args.arm_kd,
+            arm_mode=args.arm_mode,
         )
         arms.append(
             (

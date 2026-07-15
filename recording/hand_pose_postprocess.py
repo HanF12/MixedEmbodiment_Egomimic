@@ -43,25 +43,48 @@ def canonicalize_hands(positions, quaternions, handedness, valid, max_hands=2):
     return out_pos, out_quat, out_valid, out_labels
 
 
-def reject_position_outliers(positions, valid, max_speed_m_s=3.0, max_jump_m=0.12):
-    """Drop single-frame spikes using speed and per-frame jump limits."""
+def reject_position_outliers(
+    positions,
+    valid,
+    max_speed_m_s=3.0,
+    max_jump_m=0.25,
+    *,
+    timestamps=None,
+    default_fps=30.0,
+):
+    """
+    Drop single-frame spikes using speed and per-frame jump limits.
+
+    If timestamps are provided (seconds), compute dt from them; otherwise fall back
+    to an index-based dt assuming default_fps.
+    """
     cleaned = valid.copy()
     n = positions.shape[0]
+    t = None
+    if timestamps is not None:
+        t = np.asarray(timestamps, dtype=np.float64).reshape(-1)
+        if t.shape[0] != n:
+            t = None
     for h in range(positions.shape[1]):
         prev_idx = None
         prev_pos = None
-        for t in range(n):
-            if not valid[t, h]:
+        for idx in range(n):
+            if not valid[idx, h]:
                 continue
-            pos = positions[t, h]
+            pos = positions[idx, h]
             if prev_idx is not None:
-                dt = max(t - prev_idx, 1) / 30.0
+                if t is not None:
+                    dt = float(t[idx] - t[prev_idx])
+                    if not np.isfinite(dt) or dt <= 1e-6:
+                        dt = max(idx - prev_idx, 1) / float(default_fps)
+                else:
+                    dt = max(idx - prev_idx, 1) / float(default_fps)
                 speed = np.linalg.norm(pos - prev_pos) / dt
                 jump = np.linalg.norm(pos - prev_pos)
                 if speed > max_speed_m_s or jump > max_jump_m:
-                    cleaned[t, h] = False
+                    cleaned[idx, h] = False
                     continue
-            prev_idx = t
+            prev_idx = idx
             prev_pos = pos
     return cleaned
 
@@ -272,7 +295,7 @@ def postprocess_hand_pose(
     smooth_window=9,
     smooth_poly=3,
     max_speed_m_s=3.0,
-    max_jump_m=0.12,
+    max_jump_m=0.25,
 ):
     """
     Full pipeline: canonicalize -> outlier reject -> interpolate gaps -> smooth.
@@ -292,7 +315,12 @@ def postprocess_hand_pose(
 
     valid_raw = valid.copy()
     valid = reject_position_outliers(
-        pos, valid, max_speed_m_s=max_speed_m_s, max_jump_m=max_jump_m
+        pos,
+        valid,
+        max_speed_m_s=max_speed_m_s,
+        max_jump_m=max_jump_m,
+        timestamps=timestamps,
+        default_fps=30.0,
     )
 
     pos_patched, valid_patched = interpolate_positions(pos, valid, max_gap_frames=max_gap_frames)

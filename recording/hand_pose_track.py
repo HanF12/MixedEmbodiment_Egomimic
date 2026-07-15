@@ -8,6 +8,7 @@ import time
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -21,17 +22,23 @@ MODEL_URL = (
 )
 MODEL_PATH = MODEL_DIR / "hand_landmarker.task"
 
-# Physical setup (cameras swapped): 317222=left arm, 332522=bird/center, 317422=right arm
+# Physical setup:
+# - 317222=left wrist (D435)
+# - 317422=right wrist (D435I)
+# - 332522=bird/center (D435)
+# - f1422839=front (L515)
 CAMERA_MAP = {
     "317222072157": "left",
     "317422075805": "right",
     "332522076706": "center",
+    "f1422839": "front",
 }
 
 ROLE_KEYS = {
     ord("l"): "left",
     ord("r"): "right",
     ord("c"): "center",
+    ord("f"): "front",
     ord("u"): "unassigned",
 }
 
@@ -305,12 +312,13 @@ class HandPoseTracker:
         self._detector = vision.HandLandmarker.create_from_options(options)
         self._frame_idx = 0
 
-    def process(self, color_bgr, depth_frame, intrinsics):
+    def process(self, color_bgr, depth_frame, intrinsics, *, timestamp_ms: Optional[int] = None):
         import mediapipe as mp
 
         rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        timestamp_ms = int(self._frame_idx * 1000 / 30)
+        if timestamp_ms is None:
+            timestamp_ms = int(self._frame_idx * 1000 / 30)
         self._frame_idx += 1
 
         result = self._detector.detect_for_video(mp_image, timestamp_ms)
@@ -437,7 +445,7 @@ def draw_overlay(frame, serial, role, extra_lines=None):
     lines = [
         f"Serial: {serial}",
         f"Role:   {role}",
-        "Keys: l=left  r=right  c=center  u=unassigned  q=quit",
+        "Keys: l=left  r=right  c=center  f=front  u=unassigned  q=quit",
     ]
     if extra_lines:
         lines = extra_lines + lines

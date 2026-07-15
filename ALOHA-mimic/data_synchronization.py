@@ -2,7 +2,10 @@ import numpy as np
 import csv
 import pandas as pd
 import os
-import h5py
+try:
+    import h5py  # type: ignore
+except Exception:  # pragma: no cover
+    h5py = None
 
 def calculate_fps_array(input: np.array, savepath: str = None):
     times = input.astype(np.float64)
@@ -71,6 +74,8 @@ def hdf5_to_csv(hdf5_path, csv_path):
         hdf5_path (str): Path to the input HDF5 file.
         csv_path  (str): Path where the output CSV should be written.
     """
+    if h5py is None:
+        raise ImportError("h5py is required for hdf5_to_csv(); install with `pip install h5py`.")
     if not os.path.exists(hdf5_path):
         raise FileNotFoundError(f"HDF5 file not found: {hdf5_path}")
 
@@ -153,7 +158,7 @@ def arm_data_to_npy(csv_path: str, output_npy: str = None):
         print(f"Saved {timestamps.shape[0]} timestamps to '{output_npy}'")
     return timestamps
 
-def synchronize(joint_ts:np.array, realsense_ts_l:np.array,realsense_ts_r:np.array, bird_ts: np.array, out_csv: str, max_skew_s: float = 0.02, debug: bool = False):
+def synchronize(joint_ts:np.array, realsense_ts_l:np.array,realsense_ts_r:np.array, bird_ts: np.array, out_csv: str, max_skew_s: float = 0.050, debug: bool = False):
     """
     Synchronise three timestamp arrays and write a CSV.
 
@@ -162,7 +167,7 @@ def synchronize(joint_ts:np.array, realsense_ts_l:np.array,realsense_ts_r:np.arr
         realsense_ts : realsense timestamp numpy array
         bird_ts : bird view timestamp numpy array
         out_csv : output csv name
-        max_skew_s : maximum time different allowed (0.02 is recommended for 30-60hz systems)
+        max_skew_s : maximum time different allowed (0.050s for 15fps cameras + 30Hz joints)
         debug : bool
             If True, include raw timestamps and per-row skew in the CSV.
             If False (default), output only the index columns.
@@ -219,6 +224,113 @@ def synchronize(joint_ts:np.array, realsense_ts_l:np.array,realsense_ts_r:np.arr
     # ---------- save ----------
     df.to_csv(out_csv, index=False)
     print(f"Synced {len(df)} triplets → {out_csv} (debug={debug})")
+
+
+def synchronize_with_front(
+    joint_ts: np.array,
+    realsense_ts_l: np.array,
+    realsense_ts_r: np.array,
+    bird_ts: np.array,
+    front_ts: np.array,
+    out_csv: str,
+    max_skew_s: float = 0.050,
+    debug: bool = False,
+):
+    """
+    Synchronise joints + 4 camera timestamp arrays (left wrist, right wrist, bird, front) and write a CSV.
+
+    This is backward-compatible with the existing 3-cam pipeline: use `synchronize()` unless
+    you are explicitly recording a 4th camera view and want it in the sync CSV.
+    """
+    assert np.all(np.diff(joint_ts) > 0), "joint_data not sorted"
+    assert np.all(np.diff(realsense_ts_l) > 0), "left_data not sorted"
+    assert np.all(np.diff(realsense_ts_r) > 0), "right_data not sorted"
+    assert np.all(np.diff(bird_ts) > 0), "bird_data not sorted"
+    assert np.all(np.diff(front_ts) > 0), "front_data not sorted"
+
+    rows = []
+    i = j = k = m = f = master = 0
+    A = len(joint_ts)
+    B = len(realsense_ts_l)
+    C = len(bird_ts)
+    D = len(realsense_ts_r)
+    E = len(front_ts)
+
+    while i < A and j < B and k < C and m < D and f < E:
+        pivot = max(joint_ts[i], realsense_ts_l[j], bird_ts[k], realsense_ts_r[m], front_ts[f])
+
+        while i < A and pivot - joint_ts[i] > max_skew_s:
+            i += 1
+        while j < B and pivot - realsense_ts_l[j] > max_skew_s:
+            j += 1
+        while k < C and pivot - bird_ts[k] > max_skew_s:
+            k += 1
+        while m < D and pivot - realsense_ts_r[m] > max_skew_s:
+            m += 1
+        while f < E and pivot - front_ts[f] > max_skew_s:
+            f += 1
+        if i == A or j == B or k == C or m == D or f == E:
+            break
+
+        jt, lt, bt, rt, ft = (
+            joint_ts[i],
+            realsense_ts_l[j],
+            bird_ts[k],
+            realsense_ts_r[m],
+            front_ts[f],
+        )
+        t_min = min(jt, lt, bt, rt, ft)
+        t_max = max(jt, lt, bt, rt, ft)
+
+        if t_max - t_min <= max_skew_s:
+            rows.append((master, i, j, k, m, f, jt, lt, bt, rt, ft, t_max - t_min))
+            master += 1
+            i += 1
+            j += 1
+            k += 1
+            m += 1
+            f += 1
+        else:
+            earliest = int(np.argmin([jt, lt, bt, rt, ft]))
+            if earliest == 0:
+                i += 1
+            elif earliest == 1:
+                j += 1
+            elif earliest == 2:
+                k += 1
+            elif earliest == 3:
+                m += 1
+            else:
+                f += 1
+
+    all_cols = [
+        "master_index",
+        "joint_index",
+        "left_index",
+        "bird_index",
+        "right_index",
+        "front_index",
+        "joint_time",
+        "realsense_time",
+        "bird_time",
+        "realsense_r_time",
+        "front_time",
+        "time_diff",
+    ]
+    df = pd.DataFrame(rows, columns=all_cols)
+    if not debug:
+        df = df[
+            [
+                "master_index",
+                "joint_index",
+                "left_index",
+                "bird_index",
+                "right_index",
+                "front_index",
+            ]
+        ]
+    df.to_csv(out_csv, index=False)
+    print(f"Synced {len(df)} quintuplets → {out_csv} (debug={debug})")
 
 if __name__ == "__main__":
     # call with debug=True if you want the extra columns

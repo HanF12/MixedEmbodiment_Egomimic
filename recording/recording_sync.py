@@ -20,8 +20,8 @@ def recording_start_path(datetime_id: str) -> Path:
     return _signal_path("recording_start", datetime_id)
 
 
-def arms_ready_path(datetime_id: str) -> Path:
-    return _signal_path("arms_ready", datetime_id)
+def wrist_ready_path(datetime_id: str, side: str) -> Path:
+    return _signal_path(f"wrist_{side}_ready", datetime_id)
 
 
 def bird_ready_path(datetime_id: str) -> Path:
@@ -66,7 +66,14 @@ def signal_recording_go(datetime_id: str) -> float:
 
 
 def cleanup_sync_signals(datetime_id: str) -> None:
-    for prefix in ("recording_go", "recording_start", "arms_ready", "bird_ready"):
+    for prefix in (
+        "recording_go",
+        "recording_start",
+        "wrist_left_ready",
+        "wrist_right_ready",
+        "wrist_front_ready",
+        "bird_ready",
+    ):
         try:
             _signal_path(prefix, datetime_id).unlink(missing_ok=True)
         except OSError:
