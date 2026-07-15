@@ -7,6 +7,7 @@ import time # For timing the pre-loading
 import h5py # For HDF5 file processing
 from torchvision import transforms
 import pandas as pd
+from typing import List
 class PreloadedMultiVideoJointDatasetNEW(Dataset):
     """
     Custom Dataset for loading multiple paired video frames and joint data.
@@ -49,6 +50,7 @@ class PreloadedMultiVideoJointDatasetNEW(Dataset):
         if 'augment' in self.transform:
             self.image_transforms.append(augment_pipeline_1)
             self.image_transforms.append(augment_pipeline_2)
+        self.num_views = len(self.image_transforms)
         
 
         # Build absolute directory paths
@@ -116,6 +118,10 @@ class PreloadedMultiVideoJointDatasetNEW(Dataset):
         self.left_arm_frames_list  = []
         self.right_arm_frames_list = []
         self.joint_data            = []
+        # Map each global sample index -> which demo it came from
+        self.sample_demo_idx: List[int] = []
+        # For each demo, the starting global sample index
+        self.demo_start_idx: List[int] = []
 
         total_samples = 0
 
@@ -167,6 +173,10 @@ class PreloadedMultiVideoJointDatasetNEW(Dataset):
                 print(f"WARNING: skipping {rec_id} — no synced samples after temp_cut={self.temp_cut}")
                 continue
 
+            demo_idx = self.num_demos
+            demo_start = len(self.joint_data)
+            self.demo_start_idx.append(demo_start)
+
             print(f"Processing Recording. Ensure the following files are synced:")
             print(f"      Bird video:      {os.path.basename(bird_vid_path)}")
             print(f"      Left-arm video:  {os.path.basename(left_arm_vid_path)}")
@@ -206,6 +216,7 @@ class PreloadedMultiVideoJointDatasetNEW(Dataset):
                 self.left_arm_frames_list.append(left_arm_frames[left_arm_idxs[j]])
                 self.right_arm_frames_list.append(right_arm_frames[right_index[j]])
                 self.joint_data.append(raw_joint_list[joint_idxs[j]])
+                self.sample_demo_idx.append(demo_idx)
                 
             total_samples += N_i
             self.num_demos += 1
@@ -223,29 +234,34 @@ class PreloadedMultiVideoJointDatasetNEW(Dataset):
         print(f"Finished initializing. Original demos: {self.num_demos}")
 
     def __len__(self):
+        # OLD BEHAVIOR: length is number of demos/recordings.
+        # Each index corresponds to a demo, and __getitem__ samples a random timestep in that demo.
         return self.num_demos
 
     def __getitem__(self, idx):
-        # Determine which view to use (0=base, 1=aug1, 2=aug2) and which original episode to sample from
-        view_type = idx // self.num_demos
-        original_episode_idx = idx % self.num_demos
-        
-        ep = original_episode_idx
-        ep_start = sum(self.demo_lengths[:ep])
+        # OLD BEHAVIOR: idx selects which demo to sample from (not which exact sample).
+        ep = int(idx)
+        if ep < 0 or ep >= self.num_demos:
+            raise IndexError(f"Episode index out of range: {ep} (num_demos={self.num_demos})")
+
+        # Determine episode range in the flattened lists.
+        # (We keep demo_start_idx for O(1) access.)
+        ep_start = self.demo_start_idx[ep]
         ep_len = self.demo_lengths[ep]
         if ep_len <= 0:
             raise RuntimeError(f"Episode {ep} has no synced samples — remove empty sync CSVs and retry.")
-        # Sample a random start time within this episode
+
+        # Sample a random timestep within this demo.
         start_ts_in_ep = np.random.randint(0, ep_len)
-        sample_idx = ep_start + start_ts_in_ep # This is the global index for the start frame
+        sample_idx = ep_start + start_ts_in_ep
 
         # 1) grab current frames as numpy arrays
         bird_np  = self.bird_frames_list[sample_idx]
         left_np  = self.left_arm_frames_list[sample_idx]
         right_np = self.right_arm_frames_list[sample_idx]
         
-        # Get the correct image transformation pipeline
-        transform_pipeline = self.image_transforms[view_type]
+        # OLD BEHAVIOR: always use the base transform (augment indexing wasn't active).
+        transform_pipeline = self.image_transforms[0]
         
         # Apply the chosen transformation
         bird_frame = transform_pipeline(bird_np)

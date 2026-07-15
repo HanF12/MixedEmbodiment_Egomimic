@@ -8,11 +8,16 @@ import numpy as np
 from IPython.display import display, clear_output
 from tqdm import tqdm
 
+try:
+    import wandb  # type: ignore
+except Exception:  # wandb is optional
+    wandb = None
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, random_split, Subset
 
 from core import build, kl_divergence
 from dataloader_3cam import *
@@ -34,6 +39,12 @@ parser.add_argument('-t', '--training_loss', type=float, default=1e-4, help='num
 parser.add_argument('-g', '--gpu_number', type=int, default=0, help='GPU number to run on (URIL uses GPU 0-7), defaults to 0')
 parser.add_argument('--data_root', type=str, default=".", help="Root folder containing recorded data (defaults to repo root).")
 parser.add_argument('--sync_dir', type=str, default="m-synced-csvs", help="Where to write synchronized index CSVs.")
+parser.add_argument('--save_every_epochs', type=int, default=1000, help="Save (and wandb-upload, if enabled) a weights checkpoint every N epochs.")
+parser.add_argument('--wandb', action='store_true', help="Enable Weights & Biases logging.")
+parser.add_argument('--wandb_project', type=str, default=os.environ.get("WANDB_PROJECT", "aloha-mimic"), help="wandb project name.")
+parser.add_argument('--wandb_entity', type=str, default=os.environ.get("WANDB_ENTITY", None), help="wandb entity/team (optional).")
+parser.add_argument('--wandb_run_name', type=str, default=os.environ.get("WANDB_RUN_NAME", None), help="wandb run name (optional).")
+parser.add_argument('--wandb_mode', type=str, default=os.environ.get("WANDB_MODE", "online"), help="wandb mode: online|offline|disabled.")
 args = parser.parse_args()
 
 # ===========================================================================
@@ -84,7 +95,7 @@ for bird_ts_path in bird_time_files:
         right_arm_ts,
         bird_ts,
         os.path.join(synced_csvs, f"{id_number}.csv"),
-        max_skew_s=0.02,
+        max_skew_s=0.04,
         debug=False,
     )
 
@@ -96,6 +107,30 @@ if torch.cuda.is_available():
         print(f"  [{i}] {torch.cuda.get_device_name(i)}")
 else:
     print("No GPUs detected, falling back to CPU.")
+
+wandb_run = None
+if args.wandb:
+    if wandb is None:
+        raise RuntimeError(
+            "wandb logging requested but wandb is not installed. "
+            "Install with `pip install wandb` or disable with no `--wandb`."
+        )
+    wandb_run = wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_run_name,
+        mode=args.wandb_mode,
+        config={
+            "epochs": args.epochs,
+            "batch": args.batch,
+            "num_queries": args.num_queries,
+            "gpu_number": args.gpu_number,
+            "data_root": data_root,
+            "sync_dir": synced_csvs,
+            "lr": 1e-5,
+            "weight_decay": 0.01,
+        },
+    )
 
 print('clearing cache')
 torch.cuda.empty_cache()
@@ -122,28 +157,63 @@ qpos_std = dataset.joint_std
 save_path = "normalization_stats_direct.npz"
 np.savez(save_path, qpos_mean=qpos_mean, qpos_std=qpos_std)
 print(f"Normalization statistics saved to {save_path}")
+if wandb_run is not None:
+    wandb.save(os.path.abspath(save_path))
 
-# total number of samples
-n = len(dataset)
-if n == 0:
+# total number of items
+n_items = len(dataset)
+if n_items == 0:
     raise RuntimeError("Dataset is empty — check sync CSVs have rows and data files exist.")
 if Train_Epoch <= 0:
     raise RuntimeError(f"--epochs must be > 0 (got {Train_Epoch}).")
 
-# compute lengths — always keep at least one training sample when n >= 1
-train_len = max(1, int(0.95 * n)) if n > 1 else n
-test_len = n - train_len
-if test_len == 0 and n > 1:
-    train_len = n - 1
-    test_len = 1
-print(f"Dataset: {n} samples ({train_len} train, {test_len} val)")
-train_dataset, test_dataset = random_split(
-    dataset,
-    [train_len, test_len],
-    # generator=torch.Generator().manual_seed(42) # May need random for reproducing
-)
+num_demos = int(getattr(dataset, "num_demos", 0) or 0)
+num_samples = int(getattr(dataset, "num_samples", 0) or 0)
+num_views = int(getattr(dataset, "num_views", 1) or 1)
+print(f"Dataset items: {n_items} (samples={num_samples}, demos={num_demos}, views={num_views})")
+
+# ---- Train/val split ----
+# Prefer a demo-level split (recording-level) to avoid leakage: a recording's frames/joints
+# should never appear in both train and val. With the "old" dataset behavior, each dataset
+# index corresponds to a demo, and __getitem__ samples a random timestep within that demo.
+if num_demos > 1:
+    rng = np.random.default_rng(42)
+    demo_ids = np.arange(num_demos)
+    rng.shuffle(demo_ids)
+
+    train_demo_len = max(1, int(0.95 * num_demos))
+    if train_demo_len >= num_demos:
+        train_demo_len = num_demos - 1
+
+    train_indices = list(map(int, demo_ids[:train_demo_len]))
+    val_indices = list(map(int, demo_ids[train_demo_len:]))
+
+    train_dataset = Subset(dataset, train_indices)
+    test_dataset = Subset(dataset, val_indices)
+
+    print(
+        f"Demo split: {len(train_indices)} train demos / {len(val_indices)} val demos "
+        f"→ {len(train_dataset)} train items / {len(test_dataset)} val items"
+    )
+else:
+    print("WARNING: insufficient demos for demo-level split; falling back to sample-level split.")
+    # compute lengths — always keep at least one training sample when n_items >= 1
+    train_len = max(1, int(0.95 * n_items)) if n_items > 1 else n_items
+    test_len = n_items - train_len
+    if test_len == 0 and n_items > 1:
+        train_len = n_items - 1
+        test_len = 1
+    print(f"Sample split: {n_items} items ({train_len} train, {test_len} val)")
+    train_dataset, test_dataset = random_split(
+        dataset,
+        [train_len, test_len],
+        generator=torch.Generator().manual_seed(42),
+    )
+
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True, persistent_workers=True)
-val_loader  = DataLoader(test_dataset,  batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True, persistent_workers=True)
+# val can be empty if you have too few demos; don't crash on shuffle sampler
+val_shuffle = len(test_dataset) > 0
+val_loader  = DataLoader(test_dataset,  batch_size=BATCH_SIZE, shuffle=val_shuffle, num_workers=4, pin_memory=True, persistent_workers=True)
 
 # sanity check
 batch_sanity_check(train_loader)
@@ -195,11 +265,14 @@ loss_history, val_loss_history = [], []
 batch_counter = 0
 
 try:
+    os.makedirs("weights", exist_ok=True)
     # ─── Training loop with live plot ────────────────────────────────────────────
     for epoch in range(Train_Epoch):
         # ---------------- TRAIN ----------------
         model.train()
-        running_loss = 0.0
+        running_rec_loss = 0.0
+        running_total_loss = 0.0
+        running_kld = 0.0
         train_batches = 0
 
         loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{Train_Epoch}", unit="batch")
@@ -221,23 +294,49 @@ try:
                 mask   = (~is_pad).unsqueeze(-1)                                         # [bs,seq,1]
                 rec_loss = (all_l1 * mask).sum() / mask.sum()                            # average over valid frames
 
-                loss = rec_loss + total_kld[0] * 10
+                kld = total_kld[0]
+                loss = rec_loss + kld * 10
 
             scaler.scale(loss).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
 
-            running_loss += rec_loss.item()
+            rec_loss_item = float(rec_loss.detach().cpu().item())
+            kld_item = float(kld.detach().cpu().item())
+            total_loss_item = float(loss.detach().cpu().item())
+
+            running_rec_loss += rec_loss_item
+            running_kld += kld_item
+            running_total_loss += total_loss_item
             train_batches += 1
-            loop.set_postfix(avg_loss=running_loss / train_batches)
+            batch_counter += 1
+
+            loop.set_postfix(
+                rec=running_rec_loss / train_batches,
+                kld=running_kld / train_batches,
+                loss=running_total_loss / train_batches,
+            )
+
+            if wandb_run is not None:
+                wandb.log(
+                    {
+                        "train/rec_loss_step": rec_loss_item,
+                        "train/kld_step": kld_item,
+                        "train/loss_step": total_loss_item,
+                        "lr": optimizer.param_groups[0].get("lr", None),
+                    },
+                    step=batch_counter,
+                )
 
         if train_batches == 0:
             raise RuntimeError(
                 "Training loop completed zero batches — check batch size vs dataset size."
             )
-        avg_train = running_loss / train_batches
-        loss_history.append(avg_train)
+        avg_rec = running_rec_loss / train_batches
+        avg_kld = running_kld / train_batches
+        avg_loss = running_total_loss / train_batches
+        loss_history.append(avg_loss)
 
         # ---------------- VALIDATION ----------------
         model.eval()
@@ -266,11 +365,28 @@ try:
         avg_val = val_running / val_batches if val_batches else float("nan")
         val_loss_history.append(avg_val)
 
-        print(f"→ Epoch {epoch+1} train: {avg_train:.4f} │ val: {avg_val:.4f}")
+        print(f"→ Epoch {epoch+1} train loss: {avg_loss:.4f} (rec {avg_rec:.4f}, kld {avg_kld:.4f}) │ val rec: {avg_val:.4f}")
+        if wandb_run is not None:
+            wandb.log(
+                {
+                    "epoch": epoch + 1,
+                    "train/rec_loss": avg_rec,
+                    "train/kld": avg_kld,
+                    "train/loss": avg_loss,
+                    "val/rec_loss": avg_val,
+                    "lr": optimizer.param_groups[0].get("lr", None),
+                },
+                step=batch_counter,
+            )
 
         # save every 10 epochs, regardless of val score
-        if epoch % 3000 == 0 and epoch > 9000:
-            torch.save(model.state_dict(), f"weights/Vinilla_ACT_{epoch}.pth")
+        save_every = int(getattr(args, "save_every_epochs", 0) or 0)
+        if save_every > 0 and (epoch + 1) % save_every == 0:
+            ckpt_path = f"weights/Vinilla_ACT_epoch_{epoch+1}.pth"
+            torch.save(model.state_dict(), ckpt_path)
+            print(f"Checkpoint saved: {ckpt_path}")
+            if wandb_run is not None:
+                wandb.save(os.path.abspath(ckpt_path))
 
 except Exception as exc:
     print(f"Training stopped early: {type(exc).__name__}: {exc}", flush=True)
@@ -282,6 +398,8 @@ finally:
     try:
         torch.save(model.state_dict(), "weights/Vinilla_ACT.pth")
         print('Model saved successfully')
+        if wandb_run is not None:
+            wandb.save(os.path.abspath("weights/Vinilla_ACT.pth"))
     except Exception as e:
         print("Model save failed:", e)
 
@@ -303,6 +421,10 @@ finally:
     try:
         fig.savefig("final_loss_curve_lr_813.png")
         print('Chart saved successfully')
+        if wandb_run is not None:
+            wandb.save(os.path.abspath("final_loss_curve_lr_813.png"))
     except Exception as e:
         print("Chart save failed:", e)
     plt.close(fig)
+    if wandb_run is not None:
+        wandb.finish()

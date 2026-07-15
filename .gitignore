@@ -12,6 +12,7 @@ recording/sessions/
 recording/.recording/
 m-synced-csvs/
 ros_data/
+wandb/
 
 # Model artifacts
 weights/

@@ -1,0 +1,36 @@
+# ALOHA-mimic Python deps (pip/uv installable)
+# -------------------------------------------
+# Notes:
+# - ROS deps used by `inference.py`, `ros_pub.py`, `joint_lisener.py`:
+#     `rospy` and `sensor_msgs` are provided by your ROS installation (not pip).
+#     Install ROS separately and source your ROS env before running those scripts.
+# - PyTorch wheels vary by CUDA/CPU. If you need CUDA, install torch/torchvision
+#   from the appropriate PyTorch index first, then install this file.
+#
+# Example (CPU):
+#   uv pip install -r ALOHA-mimic/requirements.txt
+#
+# Example (CUDA, pick the right one for your system):
+#   uv pip install --index-url "https://download.pytorch.org/whl/cu124" torch torchvision
+#   uv pip install -r ALOHA-mimic/requirements.txt
+
+numpy>=1.23
+pandas>=2.0
+h5py>=3.9
+tqdm>=4.66
+matplotlib>=3.7
+ipython>=8.0
+
+# Computer vision / video IO
+opencv-python-headless>=4.8
+
+# Deep learning
+torch>=2.1
+torchvision>=0.16
+
+# Experiment tracking (optional at runtime; required if you pass --wandb)
+wandb>=0.16
+
+# RealSense python bindings (used by inference.py). May require system libs.
+pyrealsense2; platform_system == "Linux"
+
