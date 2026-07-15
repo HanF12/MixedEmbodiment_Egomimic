@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import List
 
 import cv2
 import numpy as np
@@ -107,6 +108,7 @@ class PreloadedBimanualEpisodeDataset(Dataset):
         )
         base_normalization = transforms.Compose([transforms.ToTensor(), normalize_transform])
         self.image_transforms = [base_normalization] if "resnet_normalization" in transform else [transforms.ToTensor()]
+        self.num_views = len(self.image_transforms)
 
         self.bird_vids_path = resolve_path(bird_vids_dir)
         self.front_vids_path = resolve_path(front_vids_dir)
@@ -142,6 +144,8 @@ class PreloadedBimanualEpisodeDataset(Dataset):
         self.bird_frames_list: list[np.ndarray] = []
         self.front_frames_list: list[np.ndarray] = []
         self.joint_data: list[torch.Tensor] = []
+        self.sample_demo_idx: List[int] = []
+        self.demo_start_idx: List[int] = []
         self.num_demos = 0
         total_samples = 0
 
@@ -188,6 +192,10 @@ class PreloadedBimanualEpisodeDataset(Dataset):
                 print(f"WARNING: skipping {rec_id} - no synced rows after temp_cut={self.temp_cut}")
                 continue
 
+            demo_idx = self.num_demos
+            demo_start = len(self.joint_data)
+            self.demo_start_idx.append(demo_start)
+
             left_frames = _load_video_frames(left_arm_vids_by_id[rec_id], label=f"Left wrist ({rec_id})")[self.temp_cut :]
             right_frames = _load_video_frames(right_arm_vids_by_id[rec_id], label=f"Right wrist ({rec_id})")[self.temp_cut :]
             bird_frames = _load_video_frames(bird_vids_by_id[rec_id], label=f"Bird ({rec_id})")[self.temp_cut :]
@@ -226,11 +234,13 @@ class PreloadedBimanualEpisodeDataset(Dataset):
                         rec_id=rec_id,
                     )
                 )
+                self.sample_demo_idx.append(demo_idx)
 
             total_samples += n_i
             self.num_demos += 1
             print(f"    -> Added {n_i} synced samples for {rec_id} (total={total_samples})")
 
+        self.num_samples = total_samples
         if self.num_demos == 0:
             raise FileNotFoundError("No complete bimanual demonstrations found after matching sync CSVs to data files.")
 
@@ -240,13 +250,14 @@ class PreloadedBimanualEpisodeDataset(Dataset):
         print(f"Finished initializing bimanual dataset with {self.num_demos} demos.")
 
     def __len__(self) -> int:
-        return self.num_demos * len(self.image_transforms)
+        return self.num_demos
 
     def __getitem__(self, idx: int):
-        view_type = idx // self.num_demos
-        episode_idx = idx % self.num_demos
+        episode_idx = int(idx)
+        if episode_idx < 0 or episode_idx >= self.num_demos:
+            raise IndexError(f"Episode index out of range: {episode_idx} (num_demos={self.num_demos})")
 
-        ep_start = sum(self.demo_lengths[:episode_idx])
+        ep_start = self.demo_start_idx[episode_idx]
         ep_len = self.demo_lengths[episode_idx]
         if ep_len <= 0:
             raise RuntimeError(f"Episode {episode_idx} has no synced samples.")
@@ -255,7 +266,7 @@ class PreloadedBimanualEpisodeDataset(Dataset):
         sample_idx = ep_start + start_ts_in_ep
         demo_end_idx = ep_start + ep_len
 
-        transform_pipeline = self.image_transforms[view_type]
+        transform_pipeline = self.image_transforms[0]
         left_frame = transform_pipeline(self.left_frames_list[sample_idx])
         right_frame = transform_pipeline(self.right_frames_list[sample_idx])
         bird_frame = transform_pipeline(self.bird_frames_list[sample_idx])
