@@ -88,12 +88,33 @@ RECORDING_MODES: dict[str, RecordingMode] = {
         hand_pose=True,
         track_hand="both",
     ),
+    # Raw capture for offline hand pose: no hand tracking/postprocess during collection.
+    # Saves bird RealSense MP4 + timestamps + depth .bag (when enabled below).
+    "human_hands_bimanual_raw": RecordingMode(
+        session_dir="human_hands_bimanual_raw",
+        joint_arms=None,
+        wrist_arms=None,
+        webcam_bird=False,
+        bird_realsense=True,
+        hand_pose=False,
+        track_hand="both",
+    ),
 }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Record demos with foot-pedal start/stop control.",
+    )
+    parser.add_argument(
+        "--data-root",
+        type=str,
+        default=None,
+        help=(
+            "Optional base directory to save data outside this repo. "
+            "Outputs will be written under <data-root>/sessions/<mode>/... "
+            "(default: recording/sessions/<mode>/)."
+        ),
     )
     parser.add_argument(
         "--bird-camera",
@@ -107,6 +128,11 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Serial for bird-view RealSense (default: auto via CAMERA_MAP center role)",
+    )
+    parser.add_argument(
+        "--front-realsense",
+        action="store_true",
+        help="Also record the RealSense mapped as role 'front' (e.g., L515).",
     )
     parser.add_argument(
         "--no-hand-pose",
@@ -149,6 +175,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--run-subdir",
+        type=str,
+        default=None,
+        help=(
+            "Optional subfolder under the mode directory (e.g. 0714). "
+            "Outputs go to recording/sessions/<mode>/<run-subdir>/... "
+            "and all recorders inherit this via RECORDING_DATA_ROOT."
+        ),
+    )
+    parser.add_argument(
         "--boot-seconds",
         type=float,
         default=DEFAULT_BOOT_SECONDS,
@@ -179,7 +215,27 @@ def _spawn(cmd: list[str], env: dict[str, str] | None = None) -> subprocess.Pope
 
 
 def session_data_root(mode: RecordingMode) -> str:
+    # Back-compat wrapper; prefer session_data_root_for_args().
     return os.path.join("sessions", mode.session_dir)
+
+
+def session_data_root_for_args(mode: RecordingMode, args: argparse.Namespace) -> str:
+    """
+    Root folder for this recording mode.
+
+    Default (repo-local):  recording/sessions/<mode>/
+    With --data-root DIR:  DIR/sessions/<mode>/
+    """
+    subdir = str(getattr(args, "run_subdir", "") or "").strip().strip("/").strip()
+    if getattr(args, "data_root", None):
+        # User-specified external root: make absolute.
+        base = os.path.abspath(os.path.expanduser(str(args.data_root)))
+        root = os.path.join(base, "sessions", mode.session_dir)
+    else:
+        # Repo-local default: always anchor under the recording/ folder so all
+        # subprocesses + verifiers resolve paths consistently regardless of cwd.
+        root = os.path.join(SCRIPT_DIR, "sessions", mode.session_dir)
+    return os.path.join(root, subdir) if subdir else root
 
 
 def build_bird_rs_cmd(
@@ -189,6 +245,8 @@ def build_bird_rs_cmd(
     track_hand: str,
     display: bool,
     stream_fps: int,
+    save_bag: bool,
+    bag_depth: bool | None,
 ) -> list[str]:
     python = sys.executable
     cmd = [
@@ -205,6 +263,10 @@ def build_bird_rs_cmd(
         cmd.extend(["--serial", bird_realsense_serial])
     if not hand_pose:
         cmd.append("--no-hand-pose")
+    if save_bag:
+        cmd.append("--save-bag")
+        if bag_depth is not None:
+            cmd.append("--bag-depth" if bag_depth else "--no-bag-depth")
     if not display:
         cmd.append("--no-display")
     cmd.append("--wait-for-go")
@@ -236,7 +298,9 @@ def wait_streams_ready(
     *,
     wrist_arms: str | None,
     need_bird: bool,
+    need_front: bool,
     wrist_procs: dict[str, subprocess.Popen],
+    front_proc: subprocess.Popen | None = None,
     bird_proc: subprocess.Popen | None = None,
     timeout: float = 45.0,
 ) -> bool:
@@ -255,6 +319,8 @@ def wait_streams_ready(
         )
     if need_bird:
         pending.append(("Bird RealSense", bird_ready_path(datetime_id), bird_proc))
+    if need_front:
+        pending.append(("Front RealSense", wrist_ready_path(datetime_id, "front"), front_proc))
     if not pending:
         return True
 
@@ -302,9 +368,8 @@ def resolve_bird_realsense_serial(explicit: str | None) -> str | None:
     return find_serial_for_role(CAMERA_MAP, "center")
 
 
-def verify_demo_outputs(datetime_id: str, mode: RecordingMode) -> None:
+def verify_demo_outputs(datetime_id: str, mode: RecordingMode, root: str) -> None:
     """Print whether each stream produced a non-empty file for this demo id."""
-    root = session_data_root(mode)
     checks: list[tuple[str, Path | None]] = []
 
     if mode.wrist_arms in ("left", "both"):
@@ -364,6 +429,18 @@ def verify_demo_outputs(datetime_id: str, mode: RecordingMode) -> None:
             tag = "OK" if size >= 1000 else "EMPTY"
             print(f"  {tag:<8} Bird RealSense: {bird_rs_path} ({size} bytes)", flush=True)
 
+    # Optional front RealSense (recorded when --front-realsense is enabled).
+    front_mp4 = Path(root) / "front-realsense-data/mp4" / f"video_recording_realsense_front#{datetime_id}.mp4"
+    front_npy = Path(root) / "front-realsense-data/npy" / f"video_recording_realsense_front#{datetime_id}.npy"
+    if front_mp4.exists() or front_npy.exists():
+        for label, path in (("Front RealSense mp4", front_mp4), ("Front RealSense ts", front_npy)):
+            if not path.exists():
+                print(f"  MISSING  {label}: {path}", flush=True)
+                continue
+            size = path.stat().st_size
+            tag = "OK" if size >= 1000 else "EMPTY"
+            print(f"  {tag:<8} {label}: {path} ({size} bytes)", flush=True)
+
     if mode.hand_pose:
         hand_glob = list(Path(root, "hand-pose-data").glob(f"hand_pose_*#{datetime_id}.npz"))
         hand_path = hand_glob[0] if hand_glob else None
@@ -378,19 +455,22 @@ def verify_demo_outputs(datetime_id: str, mode: RecordingMode) -> None:
 def start_recorders(
     datetime_id: str,
     mode: RecordingMode,
+    data_root: str,
     bird_camera: int,
     stream_fps: int,
     bird_realsense_serial: str | None = None,
     bird_display: bool = True,
+    front_realsense: bool = False,
 ) -> tuple[list[subprocess.Popen], dict[str, subprocess.Popen], subprocess.Popen | None]:
     """Spawn one process per stream (joints, each wrist camera, bird)."""
     python = sys.executable
     common = ["--datetime-id", datetime_id, "--wait-for-go"]
-    data_env = {"RECORDING_DATA_ROOT": session_data_root(mode)}
+    data_env = {"RECORDING_DATA_ROOT": data_root}
 
     procs: list[subprocess.Popen] = []
     wrist_procs: dict[str, subprocess.Popen] = {}
     bird_proc: subprocess.Popen | None = None
+    front_proc: subprocess.Popen | None = None
 
     if mode.joint_arms:
         procs.append(
@@ -438,7 +518,24 @@ def start_recorders(
             procs.append(proc)
             wrist_procs[arm] = proc
 
+    if front_realsense:
+        front_proc = _spawn(
+            [
+                python,
+                os.path.join(SCRIPT_DIR, "realsense_double_record.py"),
+                *common,
+                "--arms",
+                "front",
+                "--color-fps",
+                str(stream_fps),
+            ],
+            env=data_env,
+        )
+        procs.append(front_proc)
+
     if mode.bird_realsense and bird_realsense_serial:
+        # For raw modes we want depth in the bag even when hand pose is disabled.
+        bag_depth = True if mode.session_dir.endswith("_raw") else None
         bird_proc = _spawn(
             build_bird_rs_cmd(
                 datetime_id,
@@ -447,12 +544,14 @@ def start_recorders(
                 mode.track_hand,
                 bird_display,
                 stream_fps,
+                save_bag=True,
+                bag_depth=bag_depth,
             ),
             env=data_env,
         )
         procs.append(bird_proc)
 
-    return procs, wrist_procs, bird_proc
+    return procs, wrist_procs, bird_proc, front_proc
 
 
 def stop_recorders(procs: list[subprocess.Popen], timeout: float = 30.0) -> None:
@@ -524,6 +623,7 @@ def main() -> int:
         return 0
 
     mode = resolve_mode(args)
+    data_root = session_data_root_for_args(mode, args)
 
     signal.signal(signal.SIGINT, handle_sigint)
     signal.signal(signal.SIGTERM, handle_sigint)
@@ -536,7 +636,7 @@ def main() -> int:
 
     print("=" * 60)
     print(f"Foot-pedal recording  [mode={mode.session_dir}]")
-    print(f"  Output root: {session_data_root(mode)}/")
+    print(f"  Output root: {data_root}/")
     print(f"  Sync boot:   {args.boot_seconds:g}s after all streams ready")
     print("  Pedal press  -> boot streams, sync, then record")
     print("  Pedal press  -> stop demo and save")
@@ -593,24 +693,37 @@ def main() -> int:
             )
             print(f"  Connected RealSense: {connected or '(none)'}", flush=True)
 
-        active_procs, wrist_procs, bird_proc = start_recorders(
+        # Resolve optional front camera (role='front' in CAMERA_MAP)
+        front_serial = find_serial_for_role(CAMERA_MAP, "front") if args.front_realsense else None
+        if args.front_realsense and not front_serial:
+            print(
+                "WARNING: front RealSense (role='front') not connected — skipping front-realsense-data/.",
+                flush=True,
+            )
+
+        active_procs, wrist_procs, bird_proc, front_proc = start_recorders(
             datetime_id,
             mode,
+            data_root,
             args.bird_camera,
             args.stream_fps,
             bird_realsense_serial=bird_serial_now,
             bird_display=not args.no_display,
+            front_realsense=bool(args.front_realsense and front_serial),
         )
 
         need_bird = bool(mode.bird_realsense and bird_serial_now)
-        if mode.wrist_arms or need_bird:
+        need_front = bool(args.front_realsense and front_serial)
+        if mode.wrist_arms or need_bird or need_front:
             print("Waiting for camera recorder(s) to boot...", flush=True)
             if not wait_streams_ready(
                 datetime_id,
                 wrist_arms=mode.wrist_arms,
                 need_bird=need_bird,
+                need_front=need_front,
                 wrist_procs=wrist_procs,
                 bird_proc=bird_proc,
+                front_proc=front_proc,
             ):
                 stop_recorders(active_procs)
                 cleanup_sync_signals(datetime_id)
@@ -644,7 +757,7 @@ def main() -> int:
         stop_recorders(active_procs)
         cleanup_sync_signals(datetime_id)
         active_procs = []
-        verify_demo_outputs(datetime_id, mode)
+        verify_demo_outputs(datetime_id, mode, data_root)
         print(f">>> Demo {demo_num} saved  (id={datetime_id})\n", flush=True)
         demo_num += 1
 

@@ -44,25 +44,47 @@ def parse_args():
     )
     parser.add_argument(
         "--arms",
-        choices=("left", "right"),
+        choices=("left", "right", "front"),
         required=True,
-        help="Which wrist RealSense camera to record.",
+        help="Which RealSense camera role to record (left/right wrist or front).",
+    )
+    parser.add_argument(
+        "--serial",
+        type=str,
+        default=None,
+        help=(
+            "Optional explicit RealSense serial. If provided, overrides CAMERA_MAP role lookup. "
+            "Useful when multiple processes race to enumerate devices."
+        ),
     )
     parser.add_argument(
         "--wait-for-go",
         action="store_true",
         help="Wait for record_pedal.py sync signal before saving frames.",
     )
+    parser.add_argument(
+        "--timestamp-source",
+        choices=("wall", "realsense"),
+        default="realsense",
+        help=(
+            "How to timestamp frames for the saved .npy array. "
+            "'wall' uses time.time() when the frame is read; "
+            "'realsense' uses the RealSense frame timestamp (ms) converted to seconds. "
+            "Using 'realsense' + global time reduces host scheduling jitter."
+        ),
+    )
     return parser.parse_args()
 
 
-def find_arm_device(devices, role: str):
-    """Return (device, serial) for left/right role, or (None, None)."""
-    for device in devices:
-        serial = device.get_info(rs.camera_info.serial_number)
-        if CAMERA_MAP.get(serial) == role:
-            return device, serial
-    return None, None
+def _enable_global_time(profile) -> None:
+    """Best-effort: ask device to stamp frames in system time domain."""
+    try:
+        dev = profile.get_device()
+        for s in dev.query_sensors():
+            if s.supports(rs.option.global_time_enabled):
+                s.set_option(rs.option.global_time_enabled, 1)
+    except Exception:
+        pass
 
 
 def main(args):
@@ -70,23 +92,16 @@ def main(args):
     should_stop = lambda: stop_recording
     arm_type = args.arms
 
-    ctx = rs.context()
-    devices = list(ctx.query_devices())
-    print(f"Found {len(devices)} RealSense cameras.")
-    for device in devices:
-        serial = device.get_info(rs.camera_info.serial_number)
-        role = CAMERA_MAP.get(serial, "unassigned")
-        print(f"  {serial}  ->  {role}")
-
-    device, serial_number = find_arm_device(devices, arm_type)
-    if device is None:
-        expected = serial_for_role(CAMERA_MAP, arm_type) or arm_type
-        print(f"ERROR: {arm_type.capitalize()} arm RealSense ({expected}) is not connected / not visible on USB.")
-        connected = [d.get_info(rs.camera_info.serial_number) for d in devices]
-        print(f"  Currently visible RealSense serials: {connected or '(none)'}")
+    # Avoid enumerating all devices here: when other processes are opening cameras,
+    # `ctx.query_devices()` can throw "Device or resource busy" on some models/drivers.
+    # We only need the specific serial we intend to record.
+    serial_number = str(args.serial) if args.serial else (serial_for_role(CAMERA_MAP, arm_type) or "")
+    if not serial_number:
+        print(f"ERROR: No serial found in CAMERA_MAP for role={arm_type!r}.")
+        print("  Update recording/hand_pose_track.py CAMERA_MAP or pass --serial <SERIAL>.")
         sys.exit(1)
 
-    print(f"Configuring camera with serial number: {serial_number} (Mapped to {arm_type} arm)")
+    print(f"Configuring camera serial: {serial_number} (role={arm_type})")
 
     pipeline = rs.pipeline()
     config = rs.config()
@@ -97,6 +112,7 @@ def main(args):
 
     try:
         profile = pipeline.start(config)
+        _enable_global_time(profile)
         warmup_pipeline(pipeline, should_stop=should_stop)
         color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
         print(
@@ -108,11 +124,19 @@ def main(args):
         print("Please ensure the requested camera is connected and not in use by another application.")
         sys.exit(1)
 
-    mp4_dir = os.path.join(under_recording("aloha-data"), arm_type, "mp4")
-    npy_dir = os.path.join(under_recording("aloha-data"), arm_type, "npy")
+    # Keep legacy paths for wrists; store front separately to avoid mixing with wrist dataset layout.
+    if arm_type in ("left", "right"):
+        root = under_recording("aloha-data")
+        mp4_dir = os.path.join(root, arm_type, "mp4")
+        npy_dir = os.path.join(root, arm_type, "npy")
+    else:
+        root = under_recording("front-realsense-data")
+        mp4_dir = os.path.join(root, "mp4")
+        npy_dir = os.path.join(root, "npy")
     os.makedirs(mp4_dir, exist_ok=True)
     os.makedirs(npy_dir, exist_ok=True)
 
+    # Keep a stable filename prefix per role.
     mp4_path = os.path.join(mp4_dir, f"video_recording_realsense_{arm_type}#{current_datetime_id}.mp4")
     npy_path = os.path.join(npy_dir, f"video_recording_realsense_{arm_type}#{current_datetime_id}.npy")
 
@@ -174,7 +198,10 @@ def main(args):
             if not color_frame:
                 continue
 
-            frame_t = time.time()
+            if str(args.timestamp_source) == "realsense":
+                frame_t = float(color_frame.get_timestamp()) / 1000.0
+            else:
+                frame_t = time.time()
             color_image = np.asanyarray(color_frame.get_data())
             video_writer.write(color_image)
             cv2.imshow(

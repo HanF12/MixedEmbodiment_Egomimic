@@ -7,6 +7,7 @@ Outputs (separate from webcam bird-data/):
   bird-realsense-data/npy/video_recording_bird_realsense_<serial>#<id>.npy
   hand-pose-data/hand_pose_<serial>#<id>.npz          (raw)
   hand-pose-data/hand_pose_<serial>#<id>_processed.npy (smoothed)
+  bird-realsense-data/bag/bird_realsense_<serial>#<id>.bag (optional; contains color(+depth) for offline re-tracking)
 """
 
 from __future__ import annotations
@@ -81,6 +82,32 @@ def parse_args():
         help="Record video only (no RGBD hand tracking).",
     )
     parser.add_argument(
+        "--save-bag",
+        action="store_true",
+        help=(
+            "Also save a RealSense .bag recording for offline processing "
+            "(includes depth when available)."
+        ),
+    )
+    parser.add_argument(
+        "--bag-after-go",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "If saving a .bag, start recording it only after the shared go signal "
+            "(default: true). This makes the .bag match the MP4 frames 1:1."
+        ),
+    )
+    parser.add_argument(
+        "--bag-depth",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "When saving a .bag, include the depth stream. "
+            "Default: enabled only when hand pose is enabled."
+        ),
+    )
+    parser.add_argument(
         "--display",
         action="store_true",
         default=True,
@@ -102,7 +129,28 @@ def parse_args():
         action="store_true",
         help="Wait for record_pedal.py sync signal before saving frames.",
     )
+    parser.add_argument(
+        "--timestamp-source",
+        choices=("wall", "realsense"),
+        default="realsense",
+        help=(
+            "How to timestamp frames for the saved .npy array. "
+            "'wall' uses time.time() when the frame is read; "
+            "'realsense' uses the RealSense frame timestamp (ms) converted to seconds."
+        ),
+    )
     return parser.parse_args()
+
+
+def _enable_global_time(profile) -> None:
+    """Best-effort: ask device to stamp frames in system time domain."""
+    try:
+        dev = profile.get_device()
+        for s in dev.query_sensors():
+            if s.supports(rs.option.global_time_enabled):
+                s.set_option(rs.option.global_time_enabled, 1)
+    except Exception:
+        pass
 
 
 def filter_detections_by_hand(detections, track_hand: str):
@@ -166,12 +214,16 @@ def main(args):
 
     mp4_dir = Path(BASE_OUT_DIR) / "mp4"
     npy_dir = Path(BASE_OUT_DIR) / "npy"
+    bag_dir = Path(BASE_OUT_DIR) / "bag"
     mp4_dir.mkdir(parents=True, exist_ok=True)
     npy_dir.mkdir(parents=True, exist_ok=True)
+    if args.save_bag:
+        bag_dir.mkdir(parents=True, exist_ok=True)
     Path(HAND_POSE_DIR).mkdir(parents=True, exist_ok=True)
 
     video_path = mp4_dir / f"video_recording_bird_realsense_{serial}#{session_id}.mp4"
     ts_path = npy_dir / f"video_recording_bird_realsense_{serial}#{session_id}.npy"
+    bag_path = bag_dir / f"bird_realsense_{serial}#{session_id}.bag"
     hand_raw_path = Path(HAND_POSE_DIR) / f"hand_pose_{serial}#{session_id}.npz"
 
     signal.signal(signal.SIGINT, request_stop)
@@ -188,28 +240,25 @@ def main(args):
         print(f"Hand pose (RGBD) -> {hand_raw_path} (+ _processed.npy)")
 
     try:
-        pipeline, profile, _, align = start_pipeline(
-            device,
-            args.width,
-            args.height,
-            args.fps,
-            enable_depth=hand_pose_enabled,
-        )
+        # Decide whether depth is needed in the pipeline.
+        want_depth = hand_pose_enabled if args.bag_depth is None else bool(args.bag_depth)
+
+        # 1) Boot a pipeline early so we can warm up exposure and signal readiness.
+        pipeline = rs.pipeline()
+        boot_cfg = rs.config()
+        boot_cfg.enable_device(serial)
+        boot_cfg.enable_stream(rs.stream.color, args.width, args.height, rs.format.bgr8, args.fps)
+        if want_depth:
+            boot_cfg.enable_stream(rs.stream.depth, args.width, args.height, rs.format.z16, args.fps)
+        profile = pipeline.start(boot_cfg)
+        _enable_global_time(profile)
+        align = rs.align(rs.stream.color) if hand_pose_enabled else None
+
         color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
         w, h, fps = color_profile.width(), color_profile.height(), color_profile.fps()
         print(f"Stream: {w}x{h} @ {fps} FPS  hand_pose={'on' if hand_pose_enabled else 'off'}")
 
         warmup_pipeline(pipeline, should_stop=should_stop)
-
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        video_writer = cv2.VideoWriter(str(video_path), fourcc, fps, (w, h))
-        if not video_writer.isOpened():
-            print(f"Error: could not open video writer for {video_path}")
-            sys.exit(1)
-
-        intrinsics = get_color_intrinsics(profile) if hand_pose_enabled else None
-        if hand_pose_enabled:
-            tracker = HandPoseTracker(num_hands=num_hands)
 
         ready_path = bird_ready_path(session_id)
         ready_path.parent.mkdir(parents=True, exist_ok=True)
@@ -222,23 +271,60 @@ def main(args):
             return
 
         recording_t0 = read_recording_start(session_id)
-        drained = drain_pipeline(pipeline, should_stop=should_stop)
-        print(f"[bird] Drained {drained} stale frame(s) from pipeline buffer.", flush=True)
         if recording_t0 is not None:
             print(f"[bird] Shared recording t0={recording_t0:.3f}", flush=True)
 
+        # 2) If we are saving a .bag and want it to start *after* go, restart the pipeline with recording enabled.
+        if args.save_bag:
+            if bool(args.bag_after_go):
+                try:
+                    pipeline.stop()
+                except Exception:
+                    pass
+                pipeline = rs.pipeline()
+                rec_cfg = rs.config()
+                rec_cfg.enable_device(serial)
+                rec_cfg.enable_stream(rs.stream.color, args.width, args.height, rs.format.bgr8, args.fps)
+                if want_depth:
+                    rec_cfg.enable_stream(rs.stream.depth, args.width, args.height, rs.format.z16, args.fps)
+                rec_cfg.enable_record_to_file(str(bag_path))
+                profile = pipeline.start(rec_cfg)
+                _enable_global_time(profile)
+                align = rs.align(rs.stream.color) if hand_pose_enabled else None
+                print(f"Bag -> {bag_path}")
+            else:
+                # Legacy behavior: bag starts at boot (includes warmup + pre-go).
+                print(f"Bag (boot) -> {bag_path}")
+        else:
+            bag_path = None
+
+        # 3) Open MP4 writer only once we are ready to capture frames (so mp4 and bag align when bag_after_go).
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        video_writer = cv2.VideoWriter(str(video_path), fourcc, fps, (w, h))
+        if not video_writer.isOpened():
+            print(f"Error: could not open video writer for {video_path}")
+            sys.exit(1)
+
+        intrinsics = get_color_intrinsics(profile) if hand_pose_enabled else None
+        if hand_pose_enabled:
+            tracker = HandPoseTracker(num_hands=num_hands)
+
+        # 4) Capture loop (bag + mp4 + timestamp array are 1:1 when bag_after_go).
         while not stop_recording:
             frames = poll_for_frames(pipeline, timeout_ms=100, should_stop=should_stop)
             if frames is None:
                 continue
 
-            if hand_pose_enabled:
+            if hand_pose_enabled and align is not None:
                 frames = align.process(frames)
             color_frame = frames.get_color_frame()
             if not color_frame:
                 continue
 
-            frame_t = time.time()
+            if str(args.timestamp_source) == "realsense":
+                frame_t = float(color_frame.get_timestamp()) / 1000.0
+            else:
+                frame_t = time.time()
             frame = np.asanyarray(color_frame.get_data())
             video_writer.write(frame)
             timestamps.append(frame_t)
