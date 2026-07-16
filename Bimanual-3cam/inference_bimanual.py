@@ -16,11 +16,13 @@ import rospy
 import torch
 from sensor_msgs.msg import JointState
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+_PKG_DIR = Path(__file__).resolve().parent
+REPO_ROOT = _PKG_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(_PKG_DIR))
 
-from Bimanual.config import (
+from config import (  # noqa: E402
     CAMERA_ORDER,
     DEFAULT_NUM_QUERIES,
     GRIPPER_INDICES,
@@ -33,7 +35,7 @@ from Bimanual.config import (
     stack_camera_tensors,
     validate_run_metadata,
 )
-from Bimanual.core import build
+from core import build  # noqa: E402
 
 ALOHA_DIR = (Path(__file__).resolve().parents[1] / "ALOHA-mimic").resolve()
 if str(ALOHA_DIR) not in sys.path:
@@ -138,10 +140,17 @@ def annotate(img_bgr: np.ndarray, lines: list[str]) -> np.ndarray:
     return out
 
 
-def stack_preview(a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray) -> np.ndarray:
+def stack_preview(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
     top = np.concatenate([a, b], axis=1)
-    bottom = np.concatenate([c, d], axis=1)
-    return np.concatenate([top, bottom], axis=0)
+    # Pad bird to match top width so the 3-cam mosaic stays rectangular.
+    pad_w = top.shape[1] - c.shape[1]
+    if pad_w > 0:
+        left_pad = pad_w // 2
+        right_pad = pad_w - left_pad
+        c = np.pad(c, ((0, 0), (left_pad, right_pad), (0, 0)))
+    elif pad_w < 0:
+        c = c[:, : top.shape[1]]
+    return np.concatenate([top, c], axis=0)
 
 
 class ArmPublishers:
@@ -193,7 +202,7 @@ class Args:
         self.state_dim = STATE_DIM
 
 
-parser = argparse.ArgumentParser(description="Bimanual ACT inference controller")
+parser = argparse.ArgumentParser(description="Bimanual-3cam ACT inference controller (no front camera)")
 parser.add_argument("--checkpoint", type=str, required=True)
 parser.add_argument("--normalization_path", type=str, required=True)
 parser.add_argument("--num_queries", type=int, default=DEFAULT_NUM_QUERIES)
@@ -225,9 +234,6 @@ parser.add_argument("--right_wrist_color_fps", type=int, default=15)
 parser.add_argument("--bird_role", choices=("left", "right", "center", "front"), default="center")
 parser.add_argument("--bird_serial", type=str, default=None)
 parser.add_argument("--bird_color_fps", type=int, default=15)
-parser.add_argument("--front_role", choices=("left", "right", "center", "front"), default="front")
-parser.add_argument("--front_serial", type=str, default=None)
-parser.add_argument("--front_color_fps", type=int, default=15)
 cli = parser.parse_args(rospy.myargv(argv=sys.argv)[1:])
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -245,7 +251,7 @@ stats = np.load(str(resolve_path(cli.normalization_path)))
 qpos_mean = torch.from_numpy(np.asarray(stats["qpos_mean"], dtype=np.float32).reshape(1, STATE_DIM)).to(device)
 qpos_std = torch.from_numpy(np.asarray(stats["qpos_std"], dtype=np.float32).reshape(1, STATE_DIM)).to(device)
 
-rospy.init_node("bimanual_act_inference", anonymous=True)
+rospy.init_node("bimanual_3cam_act_inference", anonymous=True)
 joint_state_listener(topic=str(cli.left_joint_topic), side="left")
 joint_state_listener(topic=str(cli.right_joint_topic), side="right")
 left_publishers = ArmPublishers(str(cli.topic_arm_left), str(cli.topic_gripper_left))
@@ -257,7 +263,6 @@ camera_specs = [
     (CAMERA_ORDER[0], str(cli.left_wrist_role), cli.left_wrist_serial, int(cli.left_wrist_color_fps)),
     (CAMERA_ORDER[1], str(cli.right_wrist_role), cli.right_wrist_serial, int(cli.right_wrist_color_fps)),
     (CAMERA_ORDER[2], str(cli.bird_role), cli.bird_serial, int(cli.bird_color_fps)),
-    (CAMERA_ORDER[3], str(cli.front_role), cli.front_serial, int(cli.front_color_fps)),
 ]
 
 pipelines: list[tuple[str, str, rs.pipeline]] = []
@@ -304,7 +309,6 @@ try:
             to_resnet_norm_rgb_tensor(frames[0]),
             to_resnet_norm_rgb_tensor(frames[1]),
             to_resnet_norm_rgb_tensor(frames[2]),
-            to_resnet_norm_rgb_tensor(frames[3]),
         ).unsqueeze(0).to(device)
         with torch.no_grad():
             pred, _, _ = model(qpos, stacked_images, None)
@@ -337,23 +341,10 @@ try:
         desired = positions_to_publish.astype(np.float32)
         now_t = time.monotonic()
         if last_cmd is None or last_cmd_t is None:
-            # Seed in the same units as `desired` (gripper already scaled/clamped above).
-            # Publishing raw qpos grippers here used to snap the first command.
             last_cmd = qpos_np.astype(np.float32).copy()
-            last_cmd[list(GRIPPER_INDICES)] *= float(cli.gripper_scale)
-            if float(cli.gripper_max) >= 0:
-                last_cmd[GRIPPER_INDICES[0]] = min(
-                    float(last_cmd[GRIPPER_INDICES[0]]), float(cli.gripper_max)
-                )
-                last_cmd[GRIPPER_INDICES[1]] = min(
-                    float(last_cmd[GRIPPER_INDICES[1]]), float(cli.gripper_max)
-                )
             last_cmd_t = now_t
-            # Hold measured pose on the seed step; first chase happens next cycle.
         else:
-            # Cap dt so a slow/first chase after a stall cannot authorize a huge step.
-            dt_nom = 1.0 / max(1e-3, float(cli.inference_fps))
-            dt = min(max(1e-3, float(now_t - last_cmd_t)), dt_nom)
+            dt = max(1e-3, float(now_t - last_cmd_t))
             max_dq = float(cli.max_joint_speed) * dt
             max_dg = float(cli.max_gripper_speed) * dt
             cmd = last_cmd.copy()
@@ -387,9 +378,8 @@ try:
                     shown[0][:h, :w],
                     shown[1][:h, :w],
                     shown[2][:h, :w],
-                    shown[3][:h, :w],
                 )
-                cv2.imshow("Bimanual ACT Inference", preview)
+                cv2.imshow("Bimanual-3cam ACT Inference", preview)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
 
