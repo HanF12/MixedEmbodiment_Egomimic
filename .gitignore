@@ -7,6 +7,7 @@ aloha-data/
 bird-data/
 joint-data/
 hand-pose-data/
+front-realsense-data/
 bird-realsense-data/
 recording/sessions/
 recording/.recording/
