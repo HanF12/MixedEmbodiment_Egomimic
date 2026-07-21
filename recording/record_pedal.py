@@ -66,8 +66,10 @@ RECORDING_MODES: dict[str, RecordingMode] = {
         wrist_arms="left",
         webcam_bird=False,
         bird_realsense=True,
-        hand_pose=True,
-        track_hand="right",
+        # Default to "pure-hands style" collection: no realtime hand pose.
+        # Use the .bag for offline processing instead (e.g. WiLoR+RGBD).
+        hand_pose=False,
+        track_hand="both",
     ),
     # Right robot arm + left human hand (opposite of above).
     "right_robot_left_hand": RecordingMode(
@@ -76,8 +78,10 @@ RECORDING_MODES: dict[str, RecordingMode] = {
         wrist_arms="right",
         webcam_bird=False,
         bird_realsense=True,
-        hand_pose=True,
-        track_hand="left",
+        # Default to "pure-hands style" collection: no realtime hand pose.
+        # Use the .bag for offline processing instead (e.g. WiLoR+RGBD).
+        hand_pose=False,
+        track_hand="both",
     ),
     "human_hands_bimanual": RecordingMode(
         session_dir="human_hands_bimanual",
@@ -131,8 +135,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--front-realsense",
-        action="store_true",
-        help="Also record the RealSense mapped as role 'front' (e.g., L515).",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Record the RealSense mapped as role 'front' (default: true).",
     )
     parser.add_argument(
         "--no-hand-pose",
@@ -198,6 +203,11 @@ def parse_args() -> argparse.Namespace:
 
 def resolve_mode(args: argparse.Namespace) -> RecordingMode:
     mode = RECORDING_MODES[args.mode]
+    # Collaboration + raw collection default: never run realtime hand pose.
+    # (Pure-hands / offline pipelines should consume the .bag instead.)
+    if args.mode in ("left_robot_right_hand", "right_robot_left_hand", "human_hands_bimanual_raw"):
+        return replace(mode, hand_pose=False, track_hand="both")
+
     hand_pose = mode.hand_pose and not args.no_hand_pose
     return replace(mode, hand_pose=hand_pose)
 
@@ -534,8 +544,9 @@ def start_recorders(
         procs.append(front_proc)
 
     if mode.bird_realsense and bird_realsense_serial:
-        # For raw modes we want depth in the bag even when hand pose is disabled.
-        bag_depth = True if mode.session_dir.endswith("_raw") else None
+        # If we are not running realtime hand pose, we still want depth in the .bag
+        # for offline processing (e.g. WiLoR+RGBD).
+b        bag_depth = True if not mode.hand_pose else None
         bird_proc = _spawn(
             build_bird_rs_cmd(
                 datetime_id,

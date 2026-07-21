@@ -341,10 +341,23 @@ try:
         desired = positions_to_publish.astype(np.float32)
         now_t = time.monotonic()
         if last_cmd is None or last_cmd_t is None:
+            # Seed in the same units as `desired` (gripper already scaled/clamped above).
+            # Publishing raw qpos grippers here used to snap the first command.
             last_cmd = qpos_np.astype(np.float32).copy()
+            last_cmd[list(GRIPPER_INDICES)] *= float(cli.gripper_scale)
+            if float(cli.gripper_max) >= 0:
+                last_cmd[GRIPPER_INDICES[0]] = min(
+                    float(last_cmd[GRIPPER_INDICES[0]]), float(cli.gripper_max)
+                )
+                last_cmd[GRIPPER_INDICES[1]] = min(
+                    float(last_cmd[GRIPPER_INDICES[1]]), float(cli.gripper_max)
+                )
             last_cmd_t = now_t
+            # Hold measured pose on the seed step; first chase happens next cycle.
         else:
-            dt = max(1e-3, float(now_t - last_cmd_t))
+            # Cap dt so a slow/first chase after a stall cannot authorize a huge step.
+            dt_nom = 1.0 / max(1e-3, float(cli.inference_fps))
+            dt = min(max(1e-3, float(now_t - last_cmd_t)), dt_nom)
             max_dq = float(cli.max_joint_speed) * dt
             max_dg = float(cli.max_gripper_speed) * dt
             cmd = last_cmd.copy()
