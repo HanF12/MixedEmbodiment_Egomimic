@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_demos", type=int, default=None)
     parser.add_argument("--save_every", type=int, default=50)
-    parser.add_argument("--save_every_epochs", type=int, default=1000, help="Save (and wandb-upload, if enabled) a checkpoint every N epochs.")
+    parser.add_argument("--save_every_epochs", type=int, default=10000, help="Save (and wandb-upload, if enabled) a checkpoint every N epochs.")
     parser.add_argument(
         "--save_periodic_checkpoints",
         action=argparse.BooleanOptionalAction,
