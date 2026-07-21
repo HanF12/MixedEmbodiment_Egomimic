@@ -1,34 +1,22 @@
 #!/usr/bin/env python3
 """
-WiLoR + RealSense depth -> wrist 6DOF dataset aligned to recording frame indices.
+WiLoR + RealSense depth -> wrist 6DOF dataset.
 
 Inputs:
-  - RGB MP4 video (color)
-  - RealSense .bag (depth + color, used to fetch aligned depth)
-  - (optional) timestamps .npy written by realsense_bird_record.py (one per MP4 frame)
-  - OR a single bird-realsense-data directory containing mp4/npy/bag subfolders
+  - RealSense .bag (depth + color)
+  - optional MP4 / timestamps .npy (only needed for --pose-timeline npy)
+  - OR a bird-realsense-data directory containing bag/ (and optionally mp4/, npy/)
 
-Pipeline per frame (frame index i):
-  1) Run WiLoR-mini on the RGB frame -> per-hand outputs with:
-       - pred_keypoints_2d (wrist pixel is joint 0)
-       - pred_keypoints_3d (OpenPose hand joints in MANO/wrist frame)
-  2) Sample depth around the wrist pixel from the bag's aligned depth frame
-  3) Deproject (u,v,depth) -> XYZ in meters in the RealSense optical frame
-  4) Orientation: derive a palm frame from WiLoR 3D joints in wrist frame and store rot6d (first two columns)
-  5) Openness: compute a scale-invariant openness score from WiLoR joints and threshold it
-  6) Postprocess each modality (pos, rot, open) independently:
-       - fill short gaps (<= max_gap_frames)
-       - smooth (pos: Savitzky-Golay)
-       - invalidate long gaps (do not drop frames)
+Timeline (--pose-timeline):
+  - bag (default): ALL aligned bag color+depth frames, bag timestamps (~30 fps).
+  - npy: subsample bag to mp4/npy timestamps (~15 fps).
 
-Output (.npz):
-  - timestamps: (N,)
-  - pose: (N,2,10) = [x,y,z, rot6d(6), hand_open] with NaNs where invalid
-  - valid_pos, valid_rot, valid_open: (N,2) bool
+Two-phase pipeline (postprocess never runs inside the frame loop):
+  Phase 1 (per frame): WiLoR detect -> sample depth -> deproject XYZ; store rot/open raw
+  Phase 2 (full arrays): outlier clean -> gap-fill -> smooth; pack pose
 
-Frame count:
-  - If timestamps_npy is provided, N is taken from it and we align by frame index.
-  - Otherwise N is min(n_mp4_frames, n_bag_frames_processed).
+Output (.npz): timestamps, pose (N,2,10), valid_*, pose_xyz_raw, valid_pos_raw,
+              open_score_*, pose_timeline
 """
 
 from __future__ import annotations
@@ -153,25 +141,38 @@ def _palm_center_openpose(j: np.ndarray) -> np.ndarray:
 
 def _palm_frame_R_from_openpose_joints(j: np.ndarray) -> np.ndarray:
     """
-    Wrist-frame orientation from WiLoR MANO/OpenPose joints (translation irrelevant).
+    Palm orientation from WiLoR OpenPose joints (MediaPipe-style, translation-invariant).
+
     Columns of R:
       x: wrist -> index_mcp (5)
-      y: wrist -> palm_center (projected orthogonal to x)
-      z: cross(x,y)
+      z: palm normal = normalize(cross(x, wrist->pinky_mcp))
+      y: normalize(cross(z, x))
+
+    Using index×pinky is much more stable than projecting wrist->palm_center
+    (that y-axis vanishes when the palm points along the index, causing ~180°
+    normal flips that look like crazy rotation with almost no real motion).
     """
     wrist = j[0]
     index_mcp = j[5]
-    palm_center = _palm_center_openpose(j)
-    palm_dir = _normalize(palm_center - wrist)
+    pinky_mcp = j[17]
     x = _normalize(index_mcp - wrist)
-    y = palm_dir - float(np.dot(palm_dir, x)) * x
-    y = _normalize(y)
-    if float(np.linalg.norm(y)) < 1e-8:
-        tmp = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-        if abs(float(np.dot(tmp, x))) > 0.9:
-            tmp = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-        y = _normalize(tmp - float(np.dot(tmp, x)) * x)
-    z = _normalize(np.cross(x, y))
+    if float(np.linalg.norm(x)) < 1e-8:
+        return np.full((3, 3), np.nan, dtype=np.float64)
+    palm_span = pinky_mcp - wrist
+    z = np.cross(x, palm_span)
+    z_n = float(np.linalg.norm(z))
+    if z_n < 1e-8:
+        # Degenerate (index/pinky collinear): fall back to palm-center plane.
+        palm_center = _palm_center_openpose(j)
+        palm_dir = _normalize(palm_center - wrist)
+        y = palm_dir - float(np.dot(palm_dir, x)) * x
+        y = _normalize(y)
+        if float(np.linalg.norm(y)) < 1e-8:
+            return np.full((3, 3), np.nan, dtype=np.float64)
+        z = _normalize(np.cross(x, y))
+        y = _normalize(np.cross(z, x))
+        return np.column_stack([x, y, z])
+    z = z / z_n
     y = _normalize(np.cross(z, x))
     return np.column_stack([x, y, z])
 
@@ -201,6 +202,52 @@ def _sample_depth_m(depth_frame, u: float, v: float, *, radius: int = 4):
         return None
     depth_scale = depth_frame.get_units()
     return float(_np.median(valid) * depth_scale)
+
+
+def _scan_bag_aligned_color_timestamps(bag_path: Path) -> np.ndarray:
+    """Timestamps (s) for every aligned color+depth frame in the bag."""
+    import pyrealsense2 as rs
+
+    pipeline = rs.pipeline()
+    config = rs.config()
+    config.enable_device_from_file(str(bag_path), repeat_playback=False)
+    profile = pipeline.start(config)
+    playback = profile.get_device().as_playback()
+    playback.set_real_time(False)
+    align = rs.align(rs.stream.color)
+    ts = []
+    try:
+        while True:
+            try:
+                frames = pipeline.wait_for_frames(timeout_ms=1000)
+            except RuntimeError:
+                break
+            frames = align.process(frames)
+            depth_frame = frames.get_depth_frame()
+            color_frame = frames.get_color_frame()
+            if not depth_frame or not color_frame:
+                continue
+            ts.append(float(color_frame.get_timestamp()) / 1000.0)
+    finally:
+        pipeline.stop()
+    return np.asarray(ts, dtype=np.float64)
+
+
+def _bag_indices_for_timestamps(bag_ts: np.ndarray, target_ts: np.ndarray) -> np.ndarray:
+    """
+    Map each MP4/npy timestamp to the nearest bag frame.
+
+    Bags often store ~2x frames over the same timespan as the 15 FPS MP4. Taking the
+    first N bag frames then writing at 15 FPS makes a slow-mo, clipped overlay/dataset.
+    """
+    bag_ts = np.asarray(bag_ts, dtype=np.float64)
+    target_ts = np.asarray(target_ts, dtype=np.float64)
+    if bag_ts.size == 0 or target_ts.size == 0:
+        return np.zeros((0,), dtype=np.int64)
+    idxs = np.empty((target_ts.shape[0],), dtype=np.int64)
+    for i, t in enumerate(target_ts):
+        idxs[i] = int(np.argmin(np.abs(bag_ts - float(t))))
+    return idxs
 
 
 def _det_bbox_center_x(det: dict) -> float | None:
@@ -316,11 +363,12 @@ def _assign_detections_to_slots(
 
 
 def run(
-    mp4_path: Path,
+    mp4_path: Path | None,
     bag_path: Path,
     *,
     out_path: Path,
     timestamps_npy: Path | None,
+    pose_timeline: str = "bag",
     device: str = "auto",
     dtype: str = "auto",
     wilor_stride: int = 1,
@@ -331,42 +379,67 @@ def run(
     use_bag_color: bool = True,
     slot_mode: str = "auto",
     debug_overlay_path: Path | None = None,
-    debug_max_frames: int = 300,
+    debug_max_frames: int = 10_000_000,
     debug_kp: bool = False,
     debug_kp_label: bool = True,
     smooth_window: int = 9,
     smooth_poly: int = 3,
     max_speed_m_s: float = 3.0,
     max_jump_m: float = 0.25,
+    open_min_run_frames: int = 5,
 ):
     import cv2
     import pyrealsense2 as rs
-    from scipy.signal import savgol_filter
-    from scipy.spatial.transform import Rotation
-
     from wilor_mini.pipelines.wilor_hand_pose3d_estimation_pipeline import WiLorHandPose3dEstimationPipeline
 
-    mp4_path = Path(mp4_path)
     bag_path = Path(bag_path)
     out_path = Path(out_path)
-
-    if timestamps_npy is not None:
-        ts = np.asarray(np.load(timestamps_npy), dtype=np.float64)
-        N_target = int(ts.shape[0])
-    else:
-        ts = None
-        N_target = None
+    mp4_path = Path(mp4_path) if mp4_path is not None else None
+    pose_timeline = str(pose_timeline).lower().strip()
+    if pose_timeline not in ("bag", "npy"):
+        raise ValueError("pose_timeline must be 'bag' or 'npy'")
 
     cap = None
     if not use_bag_color:
+        if mp4_path is None:
+            raise RuntimeError("--use-mp4-color requires an mp4 path")
         cap = cv2.VideoCapture(str(mp4_path))
         if not cap.isOpened():
             raise RuntimeError(f"Failed to open mp4: {mp4_path}")
 
-    # For the current workflow we assume bag/mp4/npy are already 1:1 aligned per frame.
-    # (Bag starts at "go". If you ever need to debug legacy bags with extra leading frames,
-    # do it with the dedicated alignment scripts, not by guessing here.)
-    bag_start_idx = 0
+    keep_bag_indices = None
+    if pose_timeline == "bag":
+        # Default: every aligned bag frame + bag timestamps.
+        ts = _scan_bag_aligned_color_timestamps(bag_path)
+        N = int(ts.shape[0])
+        if N == 0:
+            raise RuntimeError(f"No aligned color+depth frames in bag: {bag_path}")
+        span = float(ts[-1] - ts[0]) if N > 1 else float("nan")
+        fps_est = float((N - 1) / span) if span > 1e-6 else float("nan")
+        print(
+            f"[timeline=bag] using ALL bag frames N={N} span={span:.3f}s ~{fps_est:.2f} fps",
+            flush=True,
+        )
+    else:
+        # Subsample bag to mp4/npy timestamps.
+        if timestamps_npy is None:
+            raise RuntimeError("--pose-timeline npy requires --timestamps-npy or data-dir with npy/")
+        ts = np.asarray(np.load(timestamps_npy), dtype=np.float64)
+        N_target = int(ts.shape[0])
+        if cap is not None:
+            mp4_n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if mp4_n > 0:
+                N_target = min(N_target, mp4_n)
+        ts = ts[: int(N_target)]
+        N = int(ts.shape[0])
+        bag_ts = _scan_bag_aligned_color_timestamps(bag_path)
+        keep_bag_indices = _bag_indices_for_timestamps(bag_ts, ts)
+        step = float(np.median(np.diff(keep_bag_indices))) if keep_bag_indices.size > 1 else 1.0
+        print(
+            f"[timeline=npy] bag_frames={bag_ts.size} npy_frames={N} "
+            f"nearest-index playback (median step={step:.1f})",
+            flush=True,
+        )
 
     # Bag playback (main)
     pipeline = rs.pipeline()
@@ -398,40 +471,18 @@ def run(
     torch_dtype = torch.float16 if dt in ("fp16", "float16") else torch.float32
     pipe = WiLorHandPose3dEstimationPipeline(device=torch.device(dev), dtype=torch_dtype, verbose=False)
 
-    # Pre-allocate
-    # pose = [x,y,z, rot6d, open]
-    if N_target is None:
-        # estimate from mp4 frame count
-        if cap is not None:
-            N_target = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        else:
-            # No timestamps and no mp4 reader: we'll grow arrays dynamically by processed frames.
-            N_target = 0
-    else:
-        # if timestamps are provided, drop extra timestamps that exceed the mp4 length
-        if cap is not None:
-            mp4_n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-            if mp4_n > 0:
-                N_target = min(int(N_target), int(mp4_n))
-    N = int(N_target)
-    if N > 0:
-        pose = np.full((N, 2, 10), np.nan, dtype=np.float64)
-        valid_pos = np.zeros((N, 2), dtype=bool)
-        valid_rot = np.zeros((N, 2), dtype=bool)
-        valid_open = np.zeros((N, 2), dtype=bool)
-        R_raw = np.full((N, 2, 3, 3), np.nan, dtype=np.float64)
-        open_score = np.full((N, 2), np.nan, dtype=np.float64)
-    else:
-        # dynamic lists
-        pose_l = []
-        vpos_l = []
-        vrot_l = []
-        vopen_l = []
-        R_l = []
-        score_l = []
+    pose = np.full((N, 2, 10), np.nan, dtype=np.float64)
+    valid_pos = np.zeros((N, 2), dtype=bool)
+    valid_rot = np.zeros((N, 2), dtype=bool)
+    valid_open = np.zeros((N, 2), dtype=bool)
+    R_raw = np.full((N, 2, 3, 3), np.nan, dtype=np.float64)
+    open_score = np.full((N, 2), np.nan, dtype=np.float64)
 
-    # Iterate frames by index using mp4, and depth using bag
+    # Iterate bag frames (all of them, or the npy-aligned subset).
     i = 0
+    bag_i = 0
+    keep_ptr = 0
+    keep_list = keep_bag_indices.tolist() if keep_bag_indices is not None else None
     prev_u = np.array([np.nan, np.nan], dtype=np.float64)
     oob_uv = np.zeros((2,), dtype=np.int64)
     have_uv = np.zeros((2,), dtype=np.int64)
@@ -446,16 +497,22 @@ def run(
             frames = align.process(frames)
             depth_frame = frames.get_depth_frame()
             color_frame = frames.get_color_frame()
-            if not depth_frame:
-                if ts is not None and i >= N:
-                    break
-                continue
-            if use_bag_color and not color_frame:
-                if ts is not None and i >= N:
-                    break
+            if not depth_frame or not color_frame:
                 continue
 
-            if ts is not None and i >= N:
+            take = True
+            if keep_list is not None:
+                if keep_ptr >= len(keep_list):
+                    break
+                if bag_i != int(keep_list[keep_ptr]):
+                    take = False
+                else:
+                    keep_ptr += 1
+            bag_i += 1
+            if not take:
+                continue
+
+            if i >= N:
                 break
 
             if use_bag_color:
@@ -470,12 +527,11 @@ def run(
                 debug_overlay_path = Path(debug_overlay_path)
                 debug_overlay_path.parent.mkdir(parents=True, exist_ok=True)
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                # Match overlay playback speed to the recording timestamps if available.
+                # Mean fps over the full timeline (avoids median-dt rounding that
+                # stretches bag timelines when bags are ~2x denser than mp4).
                 if ts is not None and ts.shape[0] > 2:
-                    dt = np.diff(ts)
-                    dt = dt[np.isfinite(dt) & (dt > 1e-6)]
-                    fps_est = float(1.0 / np.median(dt)) if dt.size else float(color_profile.fps())
-                    # Prefer a clean integer FPS for correct playback in most players.
+                    span = float(ts[-1] - ts[0])
+                    fps_est = float((ts.shape[0] - 1) / span) if span > 1e-6 else float(color_profile.fps())
                     fps_out = float(round(fps_est)) if fps_est > 1e-6 else float(color_profile.fps())
                 else:
                     fps_out = float(color_profile.fps())
@@ -599,12 +655,8 @@ def run(
                     xyz = np.asarray(xyz, dtype=np.float64)
                     if xyz.shape == (3,) and np.all(np.isfinite(xyz)):
                         xyz_np = xyz
-                        if N > 0:
-                            pose[i, hand, 0:3] = xyz
-                            valid_pos[i, hand] = True
-                        else:
-                            pose_l[-1][hand, 0:3] = xyz
-                            vpos_l[-1][hand] = True
+                        pose[i, hand, 0:3] = xyz
+                        valid_pos[i, hand] = True
 
                 if frame_dbg is not None:
                     color = (255, 0, 0) if hand == 0 else (0, 0, 255)
@@ -641,25 +693,15 @@ def run(
                         j = k3d[0]  # (21,3)
                         R = _palm_frame_R_from_openpose_joints(j)
                         if np.all(np.isfinite(R)):
-                            if N > 0:
-                                R_raw[i, hand] = R
-                                valid_rot[i, hand] = True
-                                pose[i, hand, 3:6] = R[:, 0]
-                                pose[i, hand, 6:9] = R[:, 1]
-                            else:
-                                R_l[-1][hand] = R
-                                vrot_l[-1][hand] = True
-                                pose_l[-1][hand, 3:6] = R[:, 0]
-                                pose_l[-1][hand, 6:9] = R[:, 1]
+                            R_raw[i, hand] = R
+                            valid_rot[i, hand] = True
+                            pose[i, hand, 3:6] = R[:, 0]
+                            pose[i, hand, 6:9] = R[:, 1]
 
                         s = _open_score_from_openpose_joints(j)
                         if np.isfinite(s):
-                            if N > 0:
-                                open_score[i, hand] = float(s)
-                                valid_open[i, hand] = True
-                            else:
-                                score_l[-1][hand] = float(s)
-                                vopen_l[-1][hand] = True
+                            open_score[i, hand] = float(s)
+                            valid_open[i, hand] = True
 
                             if frame_dbg is not None:
                                 # show raw score and current threshold
@@ -677,15 +719,6 @@ def run(
             if frame_dbg is not None and dbg_writer is not None and i < int(debug_max_frames):
                 dbg_writer.write(frame_dbg)
 
-            if N <= 0:
-                # append a new frame in dynamic mode
-                pose_l.append(np.full((2, 10), np.nan, dtype=np.float64))
-                vpos_l.append(np.zeros((2,), dtype=bool))
-                vrot_l.append(np.zeros((2,), dtype=bool))
-                vopen_l.append(np.zeros((2,), dtype=bool))
-                R_l.append(np.full((2, 3, 3), np.nan, dtype=np.float64))
-                score_l.append(np.full((2,), np.nan, dtype=np.float64))
-
             i += 1
 
     finally:
@@ -695,47 +728,24 @@ def run(
         if dbg_writer is not None:
             dbg_writer.release()
 
-    if N <= 0:
-        pose = np.stack(pose_l, axis=0) if pose_l else np.zeros((0, 2, 10), dtype=np.float64)
-        valid_pos = np.stack(vpos_l, axis=0) if vpos_l else np.zeros((0, 2), dtype=bool)
-        valid_rot = np.stack(vrot_l, axis=0) if vrot_l else np.zeros((0, 2), dtype=bool)
-        valid_open = np.stack(vopen_l, axis=0) if vopen_l else np.zeros((0, 2), dtype=bool)
-        R_raw = np.stack(R_l, axis=0) if R_l else np.zeros((0, 2, 3, 3), dtype=np.float64)
-        open_score = np.stack(score_l, axis=0) if score_l else np.zeros((0, 2), dtype=np.float64)
-
     processed = int(i)
-
-    # Build time axis for processing (keep full length when timestamps are provided)
-    if ts is None:
-        ts = np.arange(processed, dtype=np.float64)
-        N_out = processed
-    else:
-        ts = np.asarray(ts, dtype=np.float64)[:N]
-        N_out = int(ts.shape[0])
-
-    if ts is None:
-        # (unreachable, kept for clarity)
+    ts = np.asarray(ts, dtype=np.float64)[:N]
+    if processed < N:
+        # Keep trailing frames invalid so indices still match bag timestamps.
         pass
-    elif processed < N_out:
-        # We could not read all frames from mp4/bag; keep trailing frames invalid
-        # so frame indices still match timestamps.
-        pass
-
-    if ts.shape[0] != pose.shape[0]:
-        # If timestamps provided, pose was preallocated to same length.
-        # If timestamps were not provided, we will truncate pose to processed below.
-        pass
-
-    if ts.shape[0] == processed:
-        # normal case with no timestamps_npy: we operate on the full arrays and save them
+    if processed == N:
         pose = pose[:processed]
         valid_pos = valid_pos[:processed]
         valid_rot = valid_rot[:processed]
         valid_open = valid_open[:processed]
         R_raw = R_raw[:processed]
         open_score = open_score[:processed]
+        ts = ts[:processed]
 
-    # --- Postprocess (no dropping frames) ---
+    # -------------------------------------------------------------------------
+    # Phase 2 — postprocess the FULL arrays only (never during the frame loop).
+    # Phase 1 above only: detect → sample depth → deproject → store raw values.
+    # -------------------------------------------------------------------------
     if ts.shape[0] == processed:
         proc_slice = slice(None)
         ts_proc = ts
@@ -745,97 +755,108 @@ def run(
 
     t_rel = ts_proc - ts_proc[0] if ts_proc.size > 0 else ts_proc
 
-    # Position postprocess (match MediaPipe offline pipeline):
-    # outlier reject -> interpolate gaps -> smooth.
-    pos_f = pose[proc_slice, :, 0:3].copy()
-    vpos = valid_pos[proc_slice].copy() & np.isfinite(pos_f).all(axis=-1)
-    # Reuse the same logic as recording/hand_pose_postprocess.py for XYZ.
-    # That pipeline operates on fixed-length arrays without dropping frames.
     from hand_pose_postprocess import (
+        enforce_rotation_sign_continuity,
         interpolate_positions,
+        reject_orientation_outliers,
         reject_position_outliers,
+        smooth_binary_runs,
         smooth_positions,
+        smooth_rotations_so3,
     )
 
+    # Snapshot raw deprojected XYZ before any cleaning.
+    pos_raw = pose[proc_slice, :, 0:3].copy()
+    valid_pos_raw = valid_pos[proc_slice].copy() & np.isfinite(pos_raw).all(axis=-1)
+    R_raw_snap = R_raw[proc_slice].copy()
+    valid_rot_raw = valid_rot[proc_slice].copy()
+    open_score_raw = open_score[proc_slice].copy()
+    valid_open_raw = valid_open[proc_slice].copy() & np.isfinite(open_score_raw)
+
+    # Position: reject outliers on the completed track → gap-fill → smooth.
     vpos_clean = reject_position_outliers(
-        pos_f, vpos, max_speed_m_s=float(max_speed_m_s), max_jump_m=float(max_jump_m)
+        pos_raw,
+        valid_pos_raw,
+        max_speed_m_s=float(max_speed_m_s),
+        max_jump_m=float(max_jump_m),
+        timestamps=ts_proc,
     )
-    pos_for_patch = pos_f.copy()
+    pos_for_patch = pos_raw.copy()
     pos_for_patch[~vpos_clean] = np.nan
     pos_patched, vpos_patched = interpolate_positions(
         pos_for_patch, vpos_clean, max_gap_frames=int(max_gap_frames)
     )
-    pos_smooth = smooth_positions(
+    pos_f = smooth_positions(
         pos_patched, vpos_patched, window=int(smooth_window), poly=int(smooth_poly)
     )
-    pos_f = pos_smooth
     vpos = vpos_patched
 
-    # Orientation: fill short gaps in SO(3)
-    R_f = R_raw[proc_slice].copy()
-    vori = valid_rot[proc_slice].copy()
+    # Orientation: undo palm-axis sign flips, reject remaining jumps, gap-fill + smooth.
+    R_f = enforce_rotation_sign_continuity(R_raw_snap, valid_rot_raw)
+    vori = reject_orientation_outliers(
+        R_f,
+        valid_rot_raw,
+        timestamps=ts_proc,
+    )
     for h in (0, 1):
-        R_f[:, h], vori[:, h] = _fill_short_gaps_so3(t_rel, R_f[:, h], vori[:, h], max_gap_frames=int(max_gap_frames))
+        R_f[:, h], vori[:, h] = _fill_short_gaps_so3(
+            t_rel, R_f[:, h], vori[:, h], max_gap_frames=int(max_gap_frames)
+        )
 
-    # Orientation: smooth in rotation-vector space (MediaPipe-style).
-    win = int(smooth_window)
-    if win % 2 == 0:
-        win += 1
-    poly = min(int(smooth_poly), max(0, win - 1))
-    if win >= 3 and poly >= 1:
-        for h in (0, 1):
-            for start, end in _contiguous_segments(vori[:, h]):
-                seg_len = int(end - start + 1)
-                if seg_len < win:
-                    continue
-                R_seg = np.asarray(R_f[start : end + 1, h], dtype=np.float64)
-                if not np.isfinite(R_seg).all():
-                    continue
-                # (seg_len, 3) rotvec
-                rv = Rotation.from_matrix(R_seg).as_rotvec()
-                for axis in range(3):
-                    rv[:, axis] = savgol_filter(rv[:, axis], window_length=win, polyorder=min(poly, win - 1))
-                R_smooth = Rotation.from_rotvec(rv).as_matrix()
-                R_f[start : end + 1, h] = R_smooth
+    # Quaternion-component smooth (NOT rotvec — rotvec Savitzky-Golay blows up
+    # near the ±π branch cut and was inventing ~100°+ jumps on an otherwise
+    # stable left-hand track).
+    R_f = smooth_rotations_so3(
+        R_f, vori, window=int(smooth_window), poly=int(smooth_poly)
+    )
 
-    # Open: fill score short gaps and threshold
-    s_raw = open_score[proc_slice].copy()
+    # Open: fill score gaps on the full series, then threshold.
+    s_raw = open_score_raw.copy()
     s_f = s_raw.copy()
-    vs = valid_open[proc_slice].copy() & np.isfinite(s_f)
+    vs = valid_open_raw.copy()
     for h in (0, 1):
-        s_f[:, h], vs[:, h] = _fill_short_gaps_linear(t_rel, s_f[:, h], vs[:, h], max_gap_frames=int(max_gap_frames))
+        s_f[:, h], vs[:, h] = _fill_short_gaps_linear(
+            t_rel, s_f[:, h], vs[:, h], max_gap_frames=int(max_gap_frames)
+        )
     open_flag = (s_f > float(open_threshold)).astype(np.float64)
+    open_flag = smooth_binary_runs(
+        open_flag, vs, min_run_frames=int(open_min_run_frames)
+    )
 
-    # Write back into pose with NaNs where invalid
-    pose[proc_slice, :, 0:3] = np.where(vpos[..., None], pos_f, np.nan)
-    for k in range(pose[proc_slice].shape[0]):
+    # Pack postprocessed pose (raw kept separately below).
+    pose_out = np.full_like(pose[proc_slice], np.nan)
+    pose_out[:, :, 0:3] = np.where(vpos[..., None], pos_f, np.nan)
+    for k in range(pose_out.shape[0]):
         for h in (0, 1):
             if vori[k, h]:
-                pose[k, h, 3:6] = R_f[k, h, :, 0]
-                pose[k, h, 6:9] = R_f[k, h, :, 1]
-            else:
-                pose[k, h, 3:9] = np.nan
+                pose_out[k, h, 3:6] = R_f[k, h, :, 0]
+                pose_out[k, h, 6:9] = R_f[k, h, :, 1]
             if vs[k, h]:
-                pose[k, h, 9] = open_flag[k, h]
-            else:
-                pose[k, h, 9] = np.nan
+                pose_out[k, h, 9] = open_flag[k, h]
 
-    # If we processed a prefix only (timestamps_npy longer than readable frames),
-    # write back validity masks for that prefix and keep the tail invalid.
     if ts.shape[0] != processed:
+        pose[proc_slice] = pose_out
         valid_pos[proc_slice] = vpos
         valid_rot[proc_slice] = vori
         valid_open[proc_slice] = vs
+        # Pad raw snapshots to full timestamp length with NaNs / False.
+        pos_raw_full = np.full((ts.shape[0], 2, 3), np.nan, dtype=np.float64)
+        valid_pos_raw_full = np.zeros((ts.shape[0], 2), dtype=bool)
+        R_raw_full = np.full((ts.shape[0], 2, 3, 3), np.nan, dtype=np.float64)
+        valid_rot_raw_full = np.zeros((ts.shape[0], 2), dtype=bool)
+        pos_raw_full[proc_slice] = pos_raw
+        valid_pos_raw_full[proc_slice] = valid_pos_raw
+        R_raw_full[proc_slice] = R_raw_snap
+        valid_rot_raw_full[proc_slice] = valid_rot_raw
+        pos_raw, valid_pos_raw = pos_raw_full, valid_pos_raw_full
+        R_raw_snap, valid_rot_raw = R_raw_full, valid_rot_raw_full
     else:
+        pose = pose_out
         valid_pos = vpos
         valid_rot = vori
         valid_open = vs
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    # Also save continuous openness scores for threshold tuning.
-    # - open_score_raw: per-frame score from WiLoR joints (NaN where missing)
-    # - open_score_filled: gap-filled score used for binarization
-    # - open_score_valid: validity mask after gap-fill
     np.savez(
         out_path,
         timestamps=ts,
@@ -843,15 +864,24 @@ def run(
         valid_pos=valid_pos,
         valid_rot=valid_rot,
         valid_open=valid_open,
+        # Phase-1 raw (before gap-fill / smooth).
+        pose_xyz_raw=pos_raw,
+        valid_pos_raw=valid_pos_raw,
+        R_raw=R_raw_snap,
+        valid_rot_raw=valid_rot_raw,
         open_score_raw=s_raw,
         open_score_filled=s_f,
         open_score_valid=vs,
         open_threshold=float(open_threshold),
+        pose_timeline=np.asarray(pose_timeline),
     )
     if pose.shape[0] > 0:
+        span = float(ts[-1] - ts[0]) if ts.shape[0] > 1 else float("nan")
+        fps_est = float((ts.shape[0] - 1) / span) if span > 1e-6 else float("nan")
         print(
-            f"Saved -> {out_path} (N={pose.shape[0]})  "
-            f"valid_pos%={valid_pos.mean(axis=0)} valid_rot%={valid_rot.mean(axis=0)} valid_open%={valid_open.mean(axis=0)}"
+            f"Saved -> {out_path} (N={pose.shape[0]}, timeline={pose_timeline}, ~{fps_est:.2f} fps)  "
+            f"raw_pos%={valid_pos_raw.mean(axis=0)} post_pos%={valid_pos.mean(axis=0)} "
+            f"valid_rot%={valid_rot.mean(axis=0)} valid_open%={valid_open.mean(axis=0)}"
         )
         for h in (0, 1):
             if have_uv[h] > 0:
@@ -894,35 +924,47 @@ def _parse_bird_mp4_name(mp4_name: str):
     return serial, session
 
 
-def _resolve_triplets(data_dir: Path):
+def _resolve_triplets(data_dir: Path, *, require_npy: bool = True):
     """
-    Yield (mp4, bag, npy, out_name_base) for each recording found in data_dir/mp4.
-    If bag/npy are missing, that recording is skipped.
+    Yield (mp4|None, bag, npy|None, out_base) for each recording.
+
+    Prefer discovering from bags so --pose-timeline bag works without npy/mp4.
     """
     data_dir = Path(data_dir)
-    mp4_dir = data_dir / "mp4"
-    npy_dir = data_dir / "npy"
-    bag_dir = data_dir / "bag"
-    if not mp4_dir.is_dir():
-        raise FileNotFoundError(f"Expected mp4 folder: {mp4_dir}")
-    if not npy_dir.is_dir():
-        raise FileNotFoundError(f"Expected npy folder: {npy_dir}")
+    mp4_dir, npy_dir, bag_dir = data_dir / "mp4", data_dir / "npy", data_dir / "bag"
     if not bag_dir.is_dir():
         raise FileNotFoundError(f"Expected bag folder: {bag_dir}")
 
-    mp4s = sorted(mp4_dir.glob("*.mp4"))
-    for mp4 in mp4s:
+    bags = sorted(bag_dir.glob("*.bag"))
+    if bags:
+        for bag in bags:
+            stem = bag.stem  # bird_realsense_{serial}#{session}
+            if not stem.startswith("bird_realsense_") or "#" not in stem:
+                continue
+            rest = stem[len("bird_realsense_") :]
+            serial, session = rest.split("#", 1)
+            out_base = f"video_recording_bird_realsense_{serial}#{session}"
+            mp4 = mp4_dir / f"{out_base}.mp4"
+            npy = npy_dir / f"{out_base}.npy"
+            if require_npy and (not npy.is_file() or not mp4.is_file()):
+                continue
+            yield (mp4 if mp4.is_file() else None), bag, (npy if npy.is_file() else None), out_base
+        return
+
+    if not mp4_dir.is_dir():
+        raise FileNotFoundError(f"Expected mp4 folder: {mp4_dir}")
+    for mp4 in sorted(mp4_dir.glob("*.mp4")):
         parsed = _parse_bird_mp4_name(mp4.name)
         if parsed is None:
             continue
         serial, session = parsed
         npy = npy_dir / f"video_recording_bird_realsense_{serial}#{session}.npy"
         bag = bag_dir / f"bird_realsense_{serial}#{session}.bag"
-        if not npy.is_file() or not bag.is_file():
-            # user requested: if trio isn't present, skip it
+        if not bag.is_file():
             continue
-        out_base = f"video_recording_bird_realsense_{serial}#{session}"
-        yield mp4, bag, npy, out_base
+        if require_npy and not npy.is_file():
+            continue
+        yield mp4, bag, (npy if npy.is_file() else None), f"video_recording_bird_realsense_{serial}#{session}"
 
 
 def main():
@@ -932,19 +974,29 @@ def main():
         type=str,
         default=None,
         help=(
-            "Process a whole bird-realsense-data directory containing mp4/, npy/, bag/. "
-            "Each mp4 is matched to its corresponding npy+bag by filename."
+            "Process a bird-realsense-data directory containing bag/ "
+            "(and optionally mp4/, npy/). Discoveries are bag-first."
         ),
     )
-    parser.add_argument("--mp4", type=str, default=None, help="Input RGB mp4")
+    parser.add_argument("--mp4", type=str, default=None, help="Input RGB mp4 (required for --use-mp4-color / --pose-timeline npy)")
     parser.add_argument("--bag", type=str, default=None, help="Input RealSense .bag with depth")
-    parser.add_argument("--timestamps-npy", type=str, default=None, help="Optional timestamps .npy (frame-aligned)")
+    parser.add_argument("--timestamps-npy", type=str, default=None, help="Timestamps .npy (required for --pose-timeline npy)")
     parser.add_argument("-o", "--output", type=str, default=None, help="Output .npz path (single-file mode)")
     parser.add_argument(
         "--output-dir",
         type=str,
         default=None,
         help="Output directory (data-dir batch mode). Writes one .npz per recording.",
+    )
+    parser.add_argument(
+        "--pose-timeline",
+        type=str,
+        default="bag",
+        choices=["bag", "npy"],
+        help=(
+            "bag (default): use ALL bag frames + bag timestamps (~30fps) in the npz "
+            "(sync to mp4 later). npy: subsample bag to mp4/npy timestamps (~15fps)."
+        ),
     )
 
     parser.add_argument("--device", type=str, default="auto", help="auto|cuda|cpu")
@@ -953,6 +1005,12 @@ def main():
 
     parser.add_argument("--max-gap-frames", type=int, default=3, help="Fill gaps up to this many frames per modality")
     parser.add_argument("--open-threshold", type=float, default=1.10, help="Fixed threshold for openness score")
+    parser.add_argument(
+        "--open-min-run-frames",
+        type=int,
+        default=5,
+        help="Debounce binary open/close: flip runs shorter than this many frames (~5 @30fps ≈ 0.17s).",
+    )
     parser.add_argument("--depth-radius", type=int, default=4, help="Depth patch radius (pixels)")
     parser.add_argument(
         "--match-mediapipe-xyz",
@@ -967,7 +1025,7 @@ def main():
     parser.add_argument(
         "--use-bag-color",
         action="store_true",
-        help="Run WiLoR on bag color frames (better depth alignment).",
+        help="Run WiLoR on bag color frames (better depth alignment). This is already the default.",
     )
     parser.add_argument(
         "--use-mp4-color",
@@ -1000,7 +1058,7 @@ def main():
     parser.add_argument(
         "--debug-max-frames",
         type=int,
-        default=300,
+        default=10_000_000,
         help="Max frames to write into debug overlay video.",
     )
 
@@ -1010,18 +1068,22 @@ def main():
     parser.add_argument("--max-jump", type=float, default=0.25, help="Position spike reject jump (m)")
 
     args = parser.parse_args()
+    pose_timeline = str(args.pose_timeline)
 
     if args.data_dir:
         out_dir = Path(args.output_dir) if args.output_dir else (Path(args.data_dir) / "combined_npz")
         out_dir.mkdir(parents=True, exist_ok=True)
         n = 0
-        for mp4, bag, npy, out_base in _resolve_triplets(Path(args.data_dir)):
+        for mp4, bag, npy, out_base in _resolve_triplets(
+            Path(args.data_dir), require_npy=(pose_timeline == "npy")
+        ):
             out_path = out_dir / f"{out_base}_wilor_rgbd_pose.npz"
             run(
                 mp4,
                 bag,
                 out_path=out_path,
                 timestamps_npy=npy,
+                pose_timeline=pose_timeline,
                 device=args.device,
                 dtype=args.dtype,
                 wilor_stride=int(args.wilor_stride),
@@ -1039,19 +1101,25 @@ def main():
                 smooth_poly=int(args.smooth_poly),
                 max_speed_m_s=float(args.max_speed),
                 max_jump_m=float(args.max_jump),
+                open_min_run_frames=int(args.open_min_run_frames),
             )
             n += 1
         print(f"Done. Wrote {n} file(s) to {out_dir}")
         return
 
-    if not (args.mp4 and args.bag and args.output):
-        raise SystemExit("Provide either --data-dir OR (--mp4 --bag --output).")
+    if not (args.bag and args.output):
+        raise SystemExit("Provide either --data-dir OR (--bag --output).")
+    if pose_timeline == "npy" and not args.timestamps_npy:
+        raise SystemExit("--pose-timeline npy requires --timestamps-npy.")
+    if args.use_mp4_color and not args.mp4:
+        raise SystemExit("--use-mp4-color requires --mp4.")
 
     run(
-        Path(args.mp4),
+        Path(args.mp4) if args.mp4 else None,
         Path(args.bag),
         out_path=Path(args.output),
         timestamps_npy=Path(args.timestamps_npy) if args.timestamps_npy else None,
+        pose_timeline=pose_timeline,
         device=args.device,
         dtype=args.dtype,
         wilor_stride=int(args.wilor_stride),
@@ -1069,6 +1137,7 @@ def main():
         smooth_poly=int(args.smooth_poly),
         max_speed_m_s=float(args.max_speed),
         max_jump_m=float(args.max_jump),
+        open_min_run_frames=int(args.open_min_run_frames),
     )
 
 
