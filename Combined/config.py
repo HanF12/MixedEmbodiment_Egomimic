@@ -1,17 +1,21 @@
 """
 Combined (mixed human + robot) ACT constants and helpers.
 
+Aligned with EgoMimic sharing, with Combined-specific pose = xyz+gripper (no rot6d).
+
 Camera slot order is fixed as:
   [bird, front, left_wrist, right_wrist]  -> model cams cam0..cam3
 
-Robot:
-  state/action dim = 14  (left 7 + right 7)
-  camera_mask = [1, 1, 1, 1]
+Shared pose (human hands / robot EEF), EgoMimic-style shared head:
+  8D = left 4 + right 4
+  each side: xyz(3) + gripper/open(1)
+  Source NPZ layout is still [2, 10] = xyz(3)+rot6d(6)+grip(1); rot is dropped at load.
 
-Human:
-  state/action dim = 20  (left hand 10 + right hand 10)
-  hand 10D = xyz(3) + rot6d(6) + open/close(1)
-  camera_mask = [1, 1, 0, 0]
+Robot joints:
+  14D = left 7 + right 7
+
+Robot proprio for the model (EgoMimic-style): joints only [14]
+Human proprio: pose [8]
 """
 
 from __future__ import annotations
@@ -24,20 +28,40 @@ from typing import Any
 import numpy as np
 import torch
 
-DEFAULT_NUM_QUERIES = 45
+DEFAULT_NUM_QUERIES = 45  # keep Combined horizon (EgoMimic uses 100)
 
-# --- Robot ---
-ROBOT_STATE_DIM = 14
+# EgoMimic-matched training defaults
+DEFAULT_NUM_EPOCHS = 10000
+DEFAULT_EPOCH_EVERY_N_STEPS = 100
+DEFAULT_BATCH_SIZE = 16
+DEFAULT_LR = 5e-5
+DEFAULT_WEIGHT_DECAY = 1e-4
+DEFAULT_KL_WEIGHT = 20.0
+DEFAULT_HAND_LAMBDA = 1.0
+DEFAULT_RECON_LOSS = "l1"
+
+# Temporal convention for action chunks:
+# actions[k] is the target at absolute demo timestep t+k.
+ACTION_CHUNK_STARTS_AT_CURRENT = True
+
+# --- Robot joints ---
+ROBOT_JOINT_DIM = 14
 JOINT_DIM_PER_ARM = 7
 LEFT_ARM_SLICE = slice(0, JOINT_DIM_PER_ARM)
-RIGHT_ARM_SLICE = slice(JOINT_DIM_PER_ARM, ROBOT_STATE_DIM)
-GRIPPER_INDICES = (JOINT_DIM_PER_ARM - 1, ROBOT_STATE_DIM - 1)
+RIGHT_ARM_SLICE = slice(JOINT_DIM_PER_ARM, ROBOT_JOINT_DIM)
+ROBOT_STATE_DIM = ROBOT_JOINT_DIM  # proprio = joints only (EgoMimic)
 
-# --- Human hands ---
-HAND_DIM_PER_HAND = 10
-HUMAN_STATE_DIM = 20  # left 10 + right 10
-LEFT_HAND_SLICE = slice(0, HAND_DIM_PER_HAND)
-RIGHT_HAND_SLICE = slice(HAND_DIM_PER_HAND, HUMAN_STATE_DIM)
+# --- Raw NPZ pose layout (before dropping rotation) ---
+RAW_HAND_DIM = 10  # xyz(3) + rot6d(6) + grip(1)
+RAW_XYZ_SLICE = slice(0, 3)
+RAW_GRIP_INDEX = 9
+
+# --- Shared pose used in training (xyz + gripper only) ---
+POSE_DIM_PER_SIDE = 4  # xyz(3) + grip(1)
+POSE_DIM = 8  # left 4 + right 4
+HUMAN_STATE_DIM = POSE_DIM
+HUMAN_PROPRIO_DIM = POSE_DIM
+ROBOT_PROPRIO_DIM = ROBOT_JOINT_DIM  # EgoMimic: joints only
 
 # --- Shared camera layout ---
 CAMERA_ORDER = ("bird", "front", "left_wrist", "right_wrist")
@@ -51,8 +75,17 @@ EMBODIMENT_ROBOT = 0
 EMBODIMENT_HUMAN = 1
 EMBODIMENT_NAMES = ("robot", "human")
 
-# Robot sync CSV columns (same semantics as Bimanual, independent copy)
 ROBOT_SYNC_INDEX_COLUMNS = (
+    "left_joint_index",
+    "right_joint_index",
+    "left_index",
+    "right_index",
+    "bird_index",
+    "front_index",
+    "eef_pose_index",
+)
+
+ROBOT_TEMP_CUT_INDEX_COLUMNS = (
     "left_joint_index",
     "right_joint_index",
     "left_index",
@@ -61,14 +94,25 @@ ROBOT_SYNC_INDEX_COLUMNS = (
     "front_index",
 )
 
-# Human sync: bird + front cameras + hand-pose stream
 HUMAN_SYNC_INDEX_COLUMNS = (
     "bird_index",
     "front_index",
     "pose_index",
 )
 
-MAX_STATE_DIM = HUMAN_STATE_DIM  # pad robot -> 20 when needed for mixed utilities
+ROBOT_EEF_RELDIR = Path("joint-data") / "combined_npz_commonframe"
+ROBOT_EEF_COORD_FRAME = (
+    "arm_fk_targetframe_commonframe: left/right arm-base FK poses "
+    "transformed into a shared midline frame. "
+    "Training uses xyz+gripper only (rotation dropped)."
+)
+
+# Default pose NPZ layouts under each modality root (0714 layout).
+HUMAN_POSE_RELDIR = Path("bird-realsense-data") / "combined_npz_targetframe"
+DEFAULT_ROBOT_DATA_ROOT = Path("Combined") / "teleop_bimanual" / "0714"
+DEFAULT_HUMAN_DATA_ROOT = Path("Combined") / "human_hands_bimanual_raw" / "0714"
+
+MAX_STATE_DIM = max(POSE_DIM, ROBOT_JOINT_DIM)
 
 
 def default_run_name() -> str:
@@ -100,19 +144,32 @@ def concat_bimanual_joints(
     return torch.cat([left_tensor[:JOINT_DIM_PER_ARM], right_tensor[:JOINT_DIM_PER_ARM]], dim=0)
 
 
-def flatten_hand_pose(pose_t: np.ndarray | torch.Tensor, *, rec_id: str = "") -> torch.Tensor:
+def flatten_bimanual_pose(pose_t: np.ndarray | torch.Tensor, *, rec_id: str = "") -> torch.Tensor:
     """
-    Flatten one timestep of hand pose.
+    Extract xyz+gripper from one bimanual pose timestep and flatten.
 
-    Expected input shape: [2, 10] with slot0=left, slot1=right.
-    Output shape: [20]
+    Expected input shape: [2, 10] (raw NPZ layout).
+    Output shape: [8] = [left_xyz(3), left_grip(1), right_xyz(3), right_grip(1)].
+    Rotation (indices 3:9) is discarded.
     """
     pose = torch.as_tensor(pose_t, dtype=torch.float32)
-    if pose.shape != (2, HAND_DIM_PER_HAND):
+    if pose.shape != (2, RAW_HAND_DIM):
         raise ValueError(
-            f"Expected pose timestep shape (2, {HAND_DIM_PER_HAND}) for {rec_id or 'sample'}, got {tuple(pose.shape)}"
+            f"Expected pose timestep shape (2, {RAW_HAND_DIM}) for {rec_id or 'sample'}, "
+            f"got {tuple(pose.shape)}"
         )
-    return pose.reshape(HUMAN_STATE_DIM)
+    left = torch.cat([pose[0, RAW_XYZ_SLICE], pose[0, RAW_GRIP_INDEX : RAW_GRIP_INDEX + 1]], dim=0)
+    right = torch.cat([pose[1, RAW_XYZ_SLICE], pose[1, RAW_GRIP_INDEX : RAW_GRIP_INDEX + 1]], dim=0)
+    flat = torch.cat([left, right], dim=0)
+    if flat.numel() != POSE_DIM:
+        raise ValueError(f"Internal pose flatten error: got {flat.numel()} != {POSE_DIM}")
+    if not torch.isfinite(flat).all():
+        raise ValueError(f"Non-finite pose values for {rec_id or 'sample'}")
+    return flat
+
+
+# Backward-compatible alias
+flatten_hand_pose = flatten_bimanual_pose
 
 
 def stack_camera_tensors(
@@ -122,7 +179,6 @@ def stack_camera_tensors(
     right_frame: torch.Tensor,
 ) -> torch.Tensor:
     """Stack to [4, C, H, W] in CAMERA_ORDER."""
-    # shapes: each [C,H,W] -> stacked [4,C,H,W]
     return torch.stack([bird_frame, front_frame, left_frame, right_frame], dim=0)
 
 
@@ -142,21 +198,62 @@ def build_run_metadata(
     human_sync_dir: str | Path | None,
     num_queries: int,
     max_skew_s: float,
+    robot_eef_dir: str | Path | None = None,
+    action_chunk_starts_at_current: bool = ACTION_CHUNK_STARTS_AT_CURRENT,
+    pose_loss_weight: float = 1.0,
+    joint_loss_weight: float = 1.0,
+    kl_weight: float = DEFAULT_KL_WEIGHT,
+    reconstruction_loss: str = DEFAULT_RECON_LOSS,
+    joint_modality_update: bool = True,
+    hand_lambda: float = DEFAULT_HAND_LAMBDA,
+    epoch_every_n_steps: int = DEFAULT_EPOCH_EVERY_N_STEPS,
+    num_epochs: int = DEFAULT_NUM_EPOCHS,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    lr: float = DEFAULT_LR,
 ) -> dict[str, Any]:
     return {
-        "variant": "combined-mixed-act",
+        "variant": "combined-egomimic-style",
+        "pose_layout": "xyz+gripper only (8D); rot6d dropped at load",
+        "embodiment_cue": "modality routing (separate projs/heads/cams), no embedding token",
         "camera_order": list(CAMERA_ORDER),
         "model_camera_names": list(MODEL_CAMERA_NAMES),
-        "robot_state_dim": ROBOT_STATE_DIM,
-        "human_state_dim": HUMAN_STATE_DIM,
+        "pose_dim": POSE_DIM,
+        "robot_joint_dim": ROBOT_JOINT_DIM,
+        "robot_proprio_dim": ROBOT_PROPRIO_DIM,
+        "human_proprio_dim": HUMAN_PROPRIO_DIM,
         "robot_camera_mask": list(ROBOT_CAMERA_MASK),
         "human_camera_mask": list(HUMAN_CAMERA_MASK),
         "num_queries": int(num_queries),
+        "action_chunk_starts_at_current": bool(action_chunk_starts_at_current),
+        "action_chunk_convention": (
+            "actions[k] = value at observation timestep t+k; actions[0] matches current state"
+        ),
         "robot_data_root": str(robot_data_root) if robot_data_root is not None else None,
         "human_data_root": str(human_data_root) if human_data_root is not None else None,
         "robot_sync_dir": str(robot_sync_dir) if robot_sync_dir is not None else None,
         "human_sync_dir": str(human_sync_dir) if human_sync_dir is not None else None,
+        "robot_eef_dir": str(robot_eef_dir) if robot_eef_dir is not None else None,
+        "robot_eef_file_format": "npz",
+        "robot_eef_pose_dim": POSE_DIM,
+        "robot_eef_sync_column": "eef_pose_index",
+        "robot_eef_coord_frame": ROBOT_EEF_COORD_FRAME,
+        "robot_eef_reldir": str(ROBOT_EEF_RELDIR),
+        "human_pose_reldir": str(HUMAN_POSE_RELDIR),
+        "gripper_semantics": (
+            "shared last per-side dim: human open/close (typically binary); "
+            "robot gripper retained as-recorded"
+        ),
         "max_skew_s": float(max_skew_s),
+        "pose_loss_weight": float(pose_loss_weight),
+        "joint_loss_weight": float(joint_loss_weight),
+        "kl_weight": float(kl_weight),
+        "hand_lambda": float(hand_lambda),
+        "reconstruction_loss": str(reconstruction_loss),
+        "joint_modality_update": bool(joint_modality_update),
+        "num_epochs": int(num_epochs),
+        "epoch_every_n_steps": int(epoch_every_n_steps),
+        "batch_size": int(batch_size),
+        "lr": float(lr),
     }
 
 
