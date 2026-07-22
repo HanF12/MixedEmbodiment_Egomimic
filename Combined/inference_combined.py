@@ -1,0 +1,450 @@
+#!/usr/bin/env python
+"""
+Combined mixed-ACT inference (robot / joint pathway only).
+
+Uses the same RealSense + ROS joint I/O pattern as Bimanual-3cam/inference_bimanual.py,
+but drives Combined.MixedDETRVAE with:
+  - embodiment = robot (14D joints)
+  - camera slots [bird, front, left_wrist, right_wrist]
+  - robot camera_mask (all ones)
+
+No human pose pathway: no pose npz, no human action head.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+import cv2
+import numpy as np
+import pyrealsense2 as rs
+import rospy
+import torch
+from sensor_msgs.msg import JointState
+
+_PKG_DIR = Path(__file__).resolve().parent
+REPO_ROOT = _PKG_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(_PKG_DIR))
+
+from config import (  # noqa: E402
+    CAMERA_ORDER,
+    DEFAULT_NUM_QUERIES,
+    EMBODIMENT_ROBOT,
+    GRIPPER_INDICES,
+    LEFT_ARM_SLICE,
+    MODEL_CAMERA_NAMES,
+    RIGHT_ARM_SLICE,
+    ROBOT_STATE_DIM,
+    camera_mask_tensor,
+    concat_bimanual_joints,
+    load_run_metadata,
+    stack_camera_tensors,
+    validate_run_metadata,
+)
+from core import build  # noqa: E402
+
+ALOHA_DIR = (Path(__file__).resolve().parents[1] / "ALOHA-mimic").resolve()
+if str(ALOHA_DIR) not in sys.path:
+    sys.path.insert(0, str(ALOHA_DIR))
+
+from joint_lisener import (  # type: ignore  # noqa: E402
+    get_current_slave_left_positions,
+    get_current_slave_right_positions,
+    joint_state_listener,
+)
+
+
+RESNET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+RESNET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+
+
+def resolve_path(path_like: str) -> Path:
+    path = Path(path_like).expanduser()
+    if not path.is_absolute():
+        path = (Path(__file__).resolve().parent / path).resolve()
+    return path
+
+
+def serial_matches(requested: str, device_serial: str) -> bool:
+    return requested == device_serial or requested in device_serial or device_serial.endswith(requested)
+
+
+def load_camera_map() -> dict[str, str]:
+    try:
+        from recording.hand_pose_track import CAMERA_MAP  # type: ignore
+
+        return dict(CAMERA_MAP)
+    except Exception:
+        return {}
+
+
+def connected_realsense_devices():
+    ctx = rs.context()
+    return list(ctx.query_devices())
+
+
+def pick_realsense_serial(*, role: str | None, serial_arg: str | None) -> str:
+    devices = connected_realsense_devices()
+    if not devices:
+        raise RuntimeError("No RealSense devices found.")
+
+    if serial_arg:
+        for device in devices:
+            serial = device.get_info(rs.camera_info.serial_number)
+            if serial_matches(serial_arg, serial):
+                return serial
+        raise RuntimeError(f"Requested RealSense serial {serial_arg!r} not found.")
+
+    camera_map = load_camera_map()
+    if role:
+        for mapped_serial, mapped_role in camera_map.items():
+            if mapped_role != role:
+                continue
+            for device in devices:
+                serial = device.get_info(rs.camera_info.serial_number)
+                if serial_matches(mapped_serial, serial):
+                    return serial
+
+    if len(devices) == 1:
+        return devices[0].get_info(rs.camera_info.serial_number)
+    connected = [device.get_info(rs.camera_info.serial_number) for device in devices]
+    raise RuntimeError(f"Multiple RealSense devices detected; please pass a serial or role. Connected: {connected}")
+
+
+def to_resnet_norm_rgb_tensor(bgr_image: np.ndarray) -> torch.Tensor:
+    rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+    tensor = torch.from_numpy(rgb.transpose(2, 0, 1)).to(dtype=torch.float32).div_(255.0)
+    return (tensor - RESNET_MEAN) / RESNET_STD
+
+
+def poll_color_bgr(pipeline: rs.pipeline, *, timeout_ms: int = 120) -> Optional[np.ndarray]:
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        frames = pipeline.poll_for_frames()
+        if frames:
+            color_frame = frames.get_color_frame()
+            if color_frame:
+                return np.asanyarray(color_frame.get_data())
+        time.sleep(0.002)
+    return None
+
+
+def maybe_resize(img_bgr: np.ndarray, scale: float) -> np.ndarray:
+    if scale == 1.0:
+        return img_bgr
+    h, w = img_bgr.shape[:2]
+    return cv2.resize(img_bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
+
+def annotate(img_bgr: np.ndarray, lines: list[str]) -> np.ndarray:
+    out = img_bgr.copy()
+    y = 24
+    for line in lines:
+        cv2.putText(out, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(out, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA)
+        y += 22
+    return out
+
+
+def stack_preview(a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray) -> np.ndarray:
+    # Combined camera order preview: bird | front / left_wrist | right_wrist
+    top = np.concatenate([a, b], axis=1)
+    bottom = np.concatenate([c, d], axis=1)
+    return np.concatenate([top, bottom], axis=0)
+
+
+class ArmPublishers:
+    def __init__(self, arm_topic: str, gripper_topic: str, frame_id: str = "world"):
+        self.arm_pub = rospy.Publisher(arm_topic, JointState, queue_size=10)
+        self.gripper_pub = None
+        self.gripper_msg_type = None
+        self.frame_id = frame_id
+        try:
+            from signal_arm.msg import gripper_position_control  # type: ignore
+
+            self.gripper_msg_type = gripper_position_control
+            self.gripper_pub = rospy.Publisher(gripper_topic, gripper_position_control, queue_size=10)
+        except Exception as exc:
+            rospy.logwarn(f"Gripper publisher disabled for {gripper_topic}: {exc}")
+
+    def publish(self, positions: np.ndarray) -> None:
+        arm_msg = JointState()
+        arm_msg.header.stamp = rospy.Time.now()
+        arm_msg.header.frame_id = self.frame_id
+        arm_msg.name = [f"joint{i}" for i in range(1, 7)]
+        arm_msg.position = positions[:6].tolist()
+        self.arm_pub.publish(arm_msg)
+
+        if self.gripper_pub is not None and self.gripper_msg_type is not None and len(positions) >= 7:
+            grip_msg = self.gripper_msg_type()
+            grip_msg.header.stamp = arm_msg.header.stamp
+            grip_msg.header.frame_id = self.frame_id
+            grip_msg.gripper_stroke = float(positions[6])
+            self.gripper_pub.publish(grip_msg)
+
+
+class Args:
+    def __init__(self, num_queries: int):
+        self.num_queries = int(num_queries)
+        self.camera_names = list(MODEL_CAMERA_NAMES)
+        self.hidden_dim = 512
+        self.dropout = 0.1
+        self.nheads = 8
+        self.dim_feedforward = 3200
+        self.enc_layers = 4
+        self.dec_layers = 7
+        self.pre_norm = False
+        self.position_embedding = "sine"
+        self.backbone = "resnet18"
+        self.lr_backbone = 1e-5
+        self.masks = False
+        self.dilation = False
+
+
+parser = argparse.ArgumentParser(
+    description="Combined ACT inference (robot/joint pathway only; no human pose)"
+)
+parser.add_argument("--checkpoint", type=str, required=True)
+parser.add_argument(
+    "--normalization_path",
+    type=str,
+    required=True,
+    help="Robot normalization npz (qpos_mean/qpos_std), e.g. normalization_stats_robot.npz",
+)
+parser.add_argument("--num_queries", type=int, default=DEFAULT_NUM_QUERIES)
+parser.add_argument("--display", action=argparse.BooleanOptionalAction, default=True)
+parser.add_argument("--display_scale", type=float, default=0.5)
+parser.add_argument("--display_max_fps", type=float, default=15.0)
+parser.add_argument("--chunking", action=argparse.BooleanOptionalAction, default=True)
+parser.add_argument("--inference_fps", type=float, default=30.0)
+parser.add_argument("--resize_factor", type=float, default=1.0)
+parser.add_argument("--width", type=int, default=640)
+parser.add_argument("--height", type=int, default=480)
+parser.add_argument("--aggregation_horizon", type=int, default=None)
+parser.add_argument("--left_joint_topic", type=str, default="/joint_states_slave_left")
+parser.add_argument("--right_joint_topic", type=str, default="/joint_states_slave_right")
+parser.add_argument("--topic_arm_left", type=str, default="/arm_joint_target_position_slave_left")
+parser.add_argument("--topic_gripper_left", type=str, default="/gripper_position_control_slave_left")
+parser.add_argument("--topic_arm_right", type=str, default="/arm_joint_target_position_slave_right")
+parser.add_argument("--topic_gripper_right", type=str, default="/gripper_position_control_slave_right")
+parser.add_argument("--gripper_scale", type=float, default=48)
+parser.add_argument("--gripper_max", type=float, default=80)
+parser.add_argument("--max_joint_speed", type=float, default=0.25)
+parser.add_argument("--max_gripper_speed", type=float, default=100)
+# Combined CAMERA_ORDER = (bird, front, left_wrist, right_wrist)
+parser.add_argument("--bird_role", choices=("left", "right", "center", "front"), default="center")
+parser.add_argument("--bird_serial", type=str, default=None)
+parser.add_argument("--bird_color_fps", type=int, default=15)
+parser.add_argument("--front_role", choices=("left", "right", "center", "front"), default="front")
+parser.add_argument("--front_serial", type=str, default=None)
+parser.add_argument("--front_color_fps", type=int, default=15)
+parser.add_argument("--left_wrist_role", choices=("left", "right", "center", "front"), default="left")
+parser.add_argument("--left_wrist_serial", type=str, default=None)
+parser.add_argument("--left_wrist_color_fps", type=int, default=15)
+parser.add_argument("--right_wrist_role", choices=("left", "right", "center", "front"), default="right")
+parser.add_argument("--right_wrist_serial", type=str, default=None)
+parser.add_argument("--right_wrist_color_fps", type=int, default=15)
+cli = parser.parse_args(rospy.myargv(argv=sys.argv)[1:])
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+checkpoint_path = resolve_path(cli.checkpoint)
+metadata = load_run_metadata(checkpoint_path.parent)
+if metadata is not None:
+    validate_run_metadata(metadata, num_queries=cli.num_queries)
+
+model = build(Args(cli.num_queries)).to(device)
+state_dict = torch.load(str(checkpoint_path), map_location=device)
+model.load_state_dict(state_dict)
+model.eval()
+
+stats = np.load(str(resolve_path(cli.normalization_path)))
+# Prefer robot keys; accept legacy aliases if present.
+if "qpos_mean" in stats.files:
+    mean_key, std_key = "qpos_mean", "qpos_std"
+elif "state_mean" in stats.files:
+    mean_key, std_key = "state_mean", "state_std"
+else:
+    raise KeyError(
+        f"{cli.normalization_path} missing qpos_mean/qpos_std "
+        f"(keys={stats.files}). Use normalization_stats_robot.npz."
+    )
+qpos_mean = torch.from_numpy(np.asarray(stats[mean_key], dtype=np.float32).reshape(1, ROBOT_STATE_DIM)).to(device)
+qpos_std = torch.from_numpy(np.asarray(stats[std_key], dtype=np.float32).reshape(1, ROBOT_STATE_DIM)).to(device)
+
+robot_cam_mask = camera_mask_tensor(EMBODIMENT_ROBOT).unsqueeze(0).to(device)  # [1,4]
+
+rospy.init_node("combined_act_inference_robot", anonymous=True)
+joint_state_listener(topic=str(cli.left_joint_topic), side="left")
+joint_state_listener(topic=str(cli.right_joint_topic), side="right")
+left_publishers = ArmPublishers(str(cli.topic_arm_left), str(cli.topic_gripper_left))
+right_publishers = ArmPublishers(str(cli.topic_arm_right), str(cli.topic_gripper_right))
+
+color_width = int(cli.width)
+color_height = int(cli.height)
+# Must match Combined.config.CAMERA_ORDER / stack_camera_tensors args.
+camera_specs = [
+    (CAMERA_ORDER[0], str(cli.bird_role), cli.bird_serial, int(cli.bird_color_fps)),
+    (CAMERA_ORDER[1], str(cli.front_role), cli.front_serial, int(cli.front_color_fps)),
+    (CAMERA_ORDER[2], str(cli.left_wrist_role), cli.left_wrist_serial, int(cli.left_wrist_color_fps)),
+    (CAMERA_ORDER[3], str(cli.right_wrist_role), cli.right_wrist_serial, int(cli.right_wrist_color_fps)),
+]
+
+pipelines: list[tuple[str, str, rs.pipeline]] = []
+for label, role, serial_arg, fps in camera_specs:
+    serial = pick_realsense_serial(role=role, serial_arg=serial_arg)
+    pipeline = rs.pipeline()
+    config = rs.config()
+    config.enable_device(serial)
+    config.enable_stream(rs.stream.color, color_width, color_height, rs.format.bgr8, fps)
+    pipeline.start(config)
+    pipelines.append((label, serial, pipeline))
+    print(f"Started {label} camera on serial {serial}")
+
+prediction_horizon = int(cli.num_queries)
+aggregation_horizon = int(cli.aggregation_horizon) if cli.aggregation_horizon is not None else prediction_horizon
+decay = 0.075
+past_predictions_buffer = collections.deque(maxlen=aggregation_horizon)
+loop_rate = rospy.Rate(float(cli.inference_fps))
+last_cmd: Optional[np.ndarray] = None
+last_cmd_t: Optional[float] = None
+last_preview_t = 0.0
+
+try:
+    while not rospy.is_shutdown():
+        frames = [poll_color_bgr(pipeline, timeout_ms=90) for _, _, pipeline in pipelines]
+        left_state = get_current_slave_left_positions()
+        right_state = get_current_slave_right_positions()
+        if any(frame is None for frame in frames) or left_state is None or right_state is None:
+            loop_rate.sleep()
+            continue
+
+        qpos_np = concat_bimanual_joints(
+            np.asarray(list(left_state[0]), dtype=np.float32),
+            np.asarray(list(right_state[0]), dtype=np.float32),
+            rec_id="live_inference",
+        ).cpu().numpy()
+        qpos = torch.from_numpy(qpos_np).unsqueeze(0).to(device)
+        qpos = (qpos - qpos_mean) / qpos_std
+
+        if float(cli.resize_factor) != 1.0:
+            frames = [maybe_resize(frame, float(cli.resize_factor)) for frame in frames]
+
+        # stack_camera_tensors(bird, front, left, right) -> [4,C,H,W]
+        stacked_images = stack_camera_tensors(
+            to_resnet_norm_rgb_tensor(frames[0]),
+            to_resnet_norm_rgb_tensor(frames[1]),
+            to_resnet_norm_rgb_tensor(frames[2]),
+            to_resnet_norm_rgb_tensor(frames[3]),
+        ).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            # Robot pathway only: 14D joint head. No human pose head.
+            pred, _, _ = model(
+                qpos,
+                stacked_images,
+                EMBODIMENT_ROBOT,
+                camera_mask=robot_cam_mask,
+                actions=None,
+            )
+
+        predicted_trajectory = pred[0] * qpos_std.squeeze(0) + qpos_mean.squeeze(0)
+        predicted_trajectory_np = predicted_trajectory.cpu().numpy()
+        past_predictions_buffer.append(predicted_trajectory_np)
+
+        positions_to_publish = np.zeros((ROBOT_STATE_DIM,), dtype=np.float32)
+        if bool(cli.chunking):
+            wsum = 0.0
+            for i in range(len(past_predictions_buffer)):
+                buffered_pred = past_predictions_buffer[-(i + 1)]
+                if i < buffered_pred.shape[0]:
+                    weight = float(np.exp(-decay * i))
+                    positions_to_publish += buffered_pred[i] * weight
+                    wsum += weight
+            if wsum > 0:
+                positions_to_publish /= wsum
+            else:
+                positions_to_publish = predicted_trajectory_np[0].astype(np.float32)
+        else:
+            positions_to_publish = predicted_trajectory_np[0].astype(np.float32)
+
+        positions_to_publish[list(GRIPPER_INDICES)] *= float(cli.gripper_scale)
+        if float(cli.gripper_max) >= 0:
+            positions_to_publish[GRIPPER_INDICES[0]] = min(float(positions_to_publish[GRIPPER_INDICES[0]]), float(cli.gripper_max))
+            positions_to_publish[GRIPPER_INDICES[1]] = min(float(positions_to_publish[GRIPPER_INDICES[1]]), float(cli.gripper_max))
+
+        desired = positions_to_publish.astype(np.float32)
+        now_t = time.monotonic()
+        if last_cmd is None or last_cmd_t is None:
+            # Seed in the same units as `desired` (gripper already scaled/clamped above).
+            # Publishing raw qpos grippers here used to snap the first command.
+            last_cmd = qpos_np.astype(np.float32).copy()
+            last_cmd[list(GRIPPER_INDICES)] *= float(cli.gripper_scale)
+            if float(cli.gripper_max) >= 0:
+                last_cmd[GRIPPER_INDICES[0]] = min(
+                    float(last_cmd[GRIPPER_INDICES[0]]), float(cli.gripper_max)
+                )
+                last_cmd[GRIPPER_INDICES[1]] = min(
+                    float(last_cmd[GRIPPER_INDICES[1]]), float(cli.gripper_max)
+                )
+            last_cmd_t = now_t
+            # Hold measured pose on the seed step; first chase happens next cycle.
+        else:
+            # Cap dt so a slow/first chase after a stall cannot authorize a huge step.
+            dt_nom = 1.0 / max(1e-3, float(cli.inference_fps))
+            dt = min(max(1e-3, float(now_t - last_cmd_t)), dt_nom)
+            max_dq = float(cli.max_joint_speed) * dt
+            max_dg = float(cli.max_gripper_speed) * dt
+            cmd = last_cmd.copy()
+
+            for offset in (0, 7):
+                dq = desired[offset : offset + 6] - cmd[offset : offset + 6]
+                dq = np.clip(dq, -max_dq, max_dq)
+                cmd[offset : offset + 6] += dq
+                dg = float(np.clip(desired[offset + 6] - cmd[offset + 6], -max_dg, max_dg))
+                cmd[offset + 6] += dg
+
+            last_cmd = cmd.astype(np.float32)
+            last_cmd_t = now_t
+
+        left_publishers.publish(last_cmd[LEFT_ARM_SLICE])
+        right_publishers.publish(last_cmd[RIGHT_ARM_SLICE])
+
+        if bool(cli.display):
+            wall = time.time()
+            min_dt = 1.0 / max(1e-3, float(cli.display_max_fps))
+            if wall - last_preview_t >= min_dt:
+                last_preview_t = wall
+                shown = [
+                    annotate(frame, [f"cam{idx} {label} ({serial})"])
+                    for idx, (frame, (label, serial, _)) in enumerate(zip(frames, pipelines))
+                ]
+                shown = [maybe_resize(frame, float(cli.display_scale)) for frame in shown]
+                h = min(frame.shape[0] for frame in shown)
+                w = min(frame.shape[1] for frame in shown)
+                preview = stack_preview(
+                    shown[0][:h, :w],
+                    shown[1][:h, :w],
+                    shown[2][:h, :w],
+                    shown[3][:h, :w],
+                )
+                cv2.imshow("Combined ACT Inference (robot)", preview)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+
+        loop_rate.sleep()
+except KeyboardInterrupt:
+    print("Inference stopped by user.")
+finally:
+    for _, _, pipeline in pipelines:
+        try:
+            pipeline.stop()
+        except Exception:
+            pass
+    cv2.destroyAllWindows()
