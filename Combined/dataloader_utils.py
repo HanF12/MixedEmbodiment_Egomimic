@@ -44,6 +44,60 @@ def demo_id_from_pose_npz(path: str | Path) -> str:
     return stem
 
 
+def demo_id_from_robot_eef_npz(path: str | Path) -> str:
+    """
+    teleop_bimanual_YYYYMMDDHHMMSS_arm_fk_pose_targetframe_commonframe.npz
+      -> teleop_bimanual_YYYYMMDDHHMMSS
+
+    Also accepts hashed names if present.
+    """
+    name = Path(path).name
+    stem = name.split("#", 1)[1].rsplit(".", 1)[0] if "#" in name else Path(path).stem
+    for suffix in (
+        "_arm_fk_pose_targetframe_commonframe",
+        "_arm_fk_pose_targetframe",
+        "_arm_fk_pose_commonframe",
+        "_arm_fk_pose",
+    ):
+        if stem.endswith(suffix):
+            return stem[: -len(suffix)]
+    return stem
+
+
+def normalize_future_chunk(
+    raw_steps: list[torch.Tensor],
+    *,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    num_queries: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Normalize valid future steps, then pad with exact zeros in normalized space.
+
+    Action-chunk convention (caller must build raw_steps accordingly):
+      actions[k] corresponds to absolute demo timestep t+k (actions[0] at current t).
+
+    Returns:
+      actions: [K, D] float32
+      is_pad:  [K] bool
+    """
+    mean = torch.as_tensor(mean, dtype=torch.float32).reshape(-1)
+    std = torch.as_tensor(std, dtype=torch.float32).reshape(-1)
+    dim = int(mean.numel())
+    valid = [((torch.as_tensor(s, dtype=torch.float32).reshape(-1) - mean) / std) for s in raw_steps]
+    raw_len = len(valid)
+    pad_len = int(num_queries) - raw_len
+    if pad_len < 0:
+        raise ValueError(f"raw_steps longer than num_queries ({raw_len} > {num_queries})")
+    if pad_len > 0:
+        valid.extend([torch.zeros(dim, dtype=torch.float32)] * pad_len)
+    is_pad = torch.zeros(int(num_queries), dtype=torch.bool)
+    if pad_len > 0:
+        is_pad[-pad_len:] = True
+    actions = torch.stack(valid, dim=0)
+    return actions, is_pad
+
+
 def index_paths_by_demo_id(paths: list[Path], id_fn) -> dict[str, Path]:
     return {id_fn(p): p for p in paths}
 

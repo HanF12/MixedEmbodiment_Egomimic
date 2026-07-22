@@ -1,7 +1,11 @@
 """
-Mixed human + robot ACT training (EgoMimic-aligned).
+Mixed human + robot ACT training with relative pose actions (EgoMimic-aligned).
 
 - Pose = xyz+gripper only (8D); rot6d dropped at load
+- Pose actions are relative to the first observation in the chunk:
+    pose_actions[k] = pose[t+k] - pose[t]
+  At inference: abs[k] = anchor_pose[t] + denorm(pred[k])
+- Joint actions remain absolute
 - Shared pose head (human primary + robot aux); robot-only joint head
 - Modality routing (no embodiment embedding)
 - EgoMimic schedule/hyperparams: epochs x steps, batch 16, lr 5e-5, L1, kl=20, hand_lambda
@@ -32,7 +36,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from Combined.config import (  # noqa: E402
+from Combined_relative.config import (  # noqa: E402
     DEFAULT_BATCH_SIZE,
     DEFAULT_EPOCH_EVERY_N_STEPS,
     DEFAULT_HAND_LAMBDA,
@@ -55,14 +59,14 @@ from Combined.config import (  # noqa: E402
     default_run_name,
     save_run_metadata,
 )
-from Combined.core import build, kl_divergence  # noqa: E402
-from Combined.data_synchronization import (  # noqa: E402
+from Combined_relative.core import build, kl_divergence  # noqa: E402
+from Combined_relative.data_synchronization import (  # noqa: E402
     synchronize_human_hands,
     synchronize_robot_bimanual,
 )
-from Combined.dataloader_human import HumanEpisodeDataset, collate_homogeneous  # noqa: E402
-from Combined.dataloader_robot import RobotEpisodeDataset  # noqa: E402
-from Combined.dataloader_utils import (  # noqa: E402
+from Combined_relative.dataloader_human import HumanEpisodeDataset, collate_homogeneous  # noqa: E402
+from Combined_relative.dataloader_robot import RobotEpisodeDataset  # noqa: E402
+from Combined_relative.dataloader_utils import (  # noqa: E402
     demo_id_from_hash_filename,
     demo_id_from_joint_npy,
     demo_id_from_pose_npz,
@@ -71,7 +75,9 @@ from Combined.dataloader_utils import (  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Combined mixed human+robot ACT training")
+    p = argparse.ArgumentParser(
+        description="Combined-relative mixed human+robot ACT training (relative pose actions)"
+    )
     p.add_argument(
         "--robot_data_root",
         type=str,
@@ -662,8 +668,15 @@ def main() -> None:
             output_dir / "normalization_stats_robot.npz",
             joint_mean=robot_ds.joint_mean.numpy(),
             joint_std=robot_ds.joint_std.numpy(),
+            # Primary action stats: relative pose (chunk-anchored deltas)
             eef_pose_mean=robot_ds.eef_mean.numpy(),
             eef_pose_std=robot_ds.eef_std.numpy(),
+            eef_pose_rel_mean=robot_ds.eef_rel_mean.numpy(),
+            eef_pose_rel_std=robot_ds.eef_rel_std.numpy(),
+            # Absolute pose stats for proprio / inference anchoring
+            eef_pose_abs_mean=robot_ds.eef_abs_mean.numpy(),
+            eef_pose_abs_std=robot_ds.eef_abs_std.numpy(),
+            pose_action_space=np.asarray("relative_to_chunk_anchor"),
             # backward-compatible aliases
             qpos_mean=robot_ds.joint_mean.numpy(),
             qpos_std=robot_ds.joint_std.numpy(),
@@ -687,8 +700,15 @@ def main() -> None:
         )
         np.savez(
             output_dir / "normalization_stats_human.npz",
+            # Primary action stats: relative pose (chunk-anchored deltas)
             pose_mean=human_ds.pose_mean.numpy(),
             pose_std=human_ds.pose_std.numpy(),
+            pose_rel_mean=human_ds.pose_rel_mean.numpy(),
+            pose_rel_std=human_ds.pose_rel_std.numpy(),
+            # Absolute pose stats for proprio / inference anchoring
+            pose_abs_mean=human_ds.pose_abs_mean.numpy(),
+            pose_abs_std=human_ds.pose_abs_std.numpy(),
+            pose_action_space=np.asarray("relative_to_chunk_anchor"),
         )
 
     meta = build_run_metadata(
@@ -725,7 +745,7 @@ def main() -> None:
     human_loader = make_loader(human_ds, cli.batch, cli.num_workers, shuffle=True) if human_ds is not None else None
 
     if cli.dry_run:
-        print("--- Combined dry run ---")
+        print("--- Combined-relative dry run ---")
         if human_loader is not None:
             batch = next(iter(human_loader))
             stats = train_step_single(model, optimizer, scaler, batch, device, use_amp, loss_cfg)
