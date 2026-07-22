@@ -258,13 +258,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--left-only", action="store_true", help="Home left slave arm only.")
     parser.add_argument("--right-only", action="store_true", help="Home right slave arm only.")
 
-    parser.add_argument("--duration-sec", type=float, default=25.0)
-    parser.add_argument("--rate-hz", type=float, default=30.0)
+    parser.add_argument("--duration-sec", type=float, default=20.0)
+    parser.add_argument("--rate-hz", type=float, default=50.0)
     parser.add_argument("--hold-sec", type=float, default=2.0)
     parser.add_argument("--warmup-sec", type=float, default=2.0)
     parser.add_argument("--subscriber-timeout", type=float, default=10.0)
     parser.add_argument("--joint-state-timeout", type=float, default=5.0)
-    parser.add_argument("--max-speed-rad-s", type=float, default=0.15)
+    parser.add_argument("--max-speed-rad-s", type=float, default=0.2)
     parser.add_argument("--at-home-tol", type=float, default=0.02)
 
     parser.add_argument("--gripper-scale", type=float, default=30.2)

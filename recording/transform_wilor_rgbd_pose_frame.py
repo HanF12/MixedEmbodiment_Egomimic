@@ -16,6 +16,13 @@ Transform specification (as requested):
   - Camera x axis and z axis are flipped.
   - Placeholder extra rotation about x axis (deg), default 0.
 
+Optional orientation-only post-process (does NOT touch xyz):
+  - After the camera->target rigid transform, apply a per-hand body-frame
+    correction: R' = R @ R_post[hand].
+  - Useful for ~180deg wrist-frame convention mismatch vs teleop
+    (roll/yaw ~180) without changing the position axes.
+  - Default: left=ry180, right=none (right is already ~aligned).
+
 Outputs:
   - Writes .npz files with the EXACT SAME keys/shapes as the input,
     but with pose/pose_xyz_raw/R_raw transformed into the target frame.
@@ -25,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
@@ -44,6 +52,27 @@ def _camera_to_target_R(*, flip_xz: bool, extra_rx_deg: float) -> np.ndarray:
 
 def _camera_origin_target_t_m(camera_pos_mm: tuple[float, float, float]) -> np.ndarray:
     return (np.asarray(camera_pos_mm, dtype=np.float64).reshape(3) / 1000.0).astype(np.float64)
+
+
+_ORIENT_POST_NAMED = {
+    "none": np.eye(3, dtype=np.float64),
+    "rx180": np.diag([1.0, -1.0, -1.0]).astype(np.float64),
+    "ry180": np.diag([-1.0, 1.0, -1.0]).astype(np.float64),
+    "rz180": np.diag([-1.0, -1.0, 1.0]).astype(np.float64),
+}
+
+
+def _parse_orient_post(name: str) -> np.ndarray:
+    key = str(name).strip().lower()
+    if key not in _ORIENT_POST_NAMED:
+        raise ValueError(
+            f"unknown orient-post {name!r}; expected one of {sorted(_ORIENT_POST_NAMED)}"
+        )
+    return _ORIENT_POST_NAMED[key].copy()
+
+
+def _orient_post_pair(left: str, right: str) -> tuple[np.ndarray, np.ndarray]:
+    return _parse_orient_post(left), _parse_orient_post(right)
 
 
 def _transform_xyz(xyz_cam_m: np.ndarray, R_tc: np.ndarray, t_tc_m: np.ndarray) -> np.ndarray:
@@ -89,9 +118,38 @@ def _gs_orthonormalize_6d(col0: np.ndarray, col1: np.ndarray) -> np.ndarray:
     return np.column_stack([b1, b2, b3])
 
 
-def _transform_pose_inplace(pose: np.ndarray, R_tc: np.ndarray, t_tc_m: np.ndarray) -> np.ndarray:
+def _apply_orient_post_R(R: np.ndarray, R_post_per_hand: Sequence[np.ndarray]) -> np.ndarray:
     """
-    pose[...,0:3] (xyz, meters) and pose[...,3:9] (rot6d) transformed to target frame.
+    Orientation-only body-frame correction: R' = R @ R_post[hand].
+    xyz is untouched by this helper. Accepts (N,2,3,3).
+    """
+    out = np.asarray(R, dtype=np.float64).copy()
+    if out.ndim != 4 or out.shape[-2:] != (3, 3) or out.shape[1] != 2:
+        raise ValueError(f"R has unexpected shape {out.shape}, expected (N,2,3,3)")
+    if len(R_post_per_hand) != 2:
+        raise ValueError("R_post_per_hand must have length 2 (left, right)")
+
+    for h, R_post in enumerate(R_post_per_hand):
+        Rp = np.asarray(R_post, dtype=np.float64).reshape(3, 3)
+        if np.allclose(Rp, np.eye(3)):
+            continue
+        Rh = out[:, h]
+        m = np.isfinite(Rh).all(axis=(-2, -1))
+        if not np.any(m):
+            continue
+        out[m, h] = Rh[m] @ Rp
+    return out
+
+
+def _transform_pose_inplace(
+    pose: np.ndarray,
+    R_tc: np.ndarray,
+    t_tc_m: np.ndarray,
+    R_post_per_hand: Sequence[np.ndarray],
+) -> np.ndarray:
+    """
+    pose[...,0:3] (xyz, meters) and pose[...,3:9] (rot6d) transformed to target frame,
+    then orientation-only body-frame post R' = R @ R_post[hand].
     Returns a new array (does not mutate input).
     """
     p = np.asarray(pose, dtype=np.float64).copy()
@@ -101,7 +159,7 @@ def _transform_pose_inplace(pose: np.ndarray, R_tc: np.ndarray, t_tc_m: np.ndarr
     # XYZ
     p[:, :, 0:3] = _transform_xyz(p[:, :, 0:3], R_tc, t_tc_m)
 
-    # Rot6D
+    # Rot6D -> R_tgt = (R_tc @ R_cam) @ R_post[hand]
     for i in range(p.shape[0]):
         for h in range(p.shape[1]):
             c0 = p[i, h, 3:6]
@@ -110,28 +168,44 @@ def _transform_pose_inplace(pose: np.ndarray, R_tc: np.ndarray, t_tc_m: np.ndarr
             if not np.isfinite(R_cam).all():
                 continue
             R_tgt = R_tc @ R_cam
+            Rp = np.asarray(R_post_per_hand[h], dtype=np.float64).reshape(3, 3)
+            if not np.allclose(Rp, np.eye(3)):
+                R_tgt = R_tgt @ Rp
             p[i, h, 3:6] = R_tgt[:, 0]
             p[i, h, 6:9] = R_tgt[:, 1]
     return p
 
 
-def _transform_R_raw(R_raw: np.ndarray, R_tc: np.ndarray) -> np.ndarray:
+def _transform_R_raw(
+    R_raw: np.ndarray,
+    R_tc: np.ndarray,
+    R_post_per_hand: Sequence[np.ndarray],
+) -> np.ndarray:
     R = np.asarray(R_raw, dtype=np.float64).copy()
     if R.ndim != 4 or R.shape[-2:] != (3, 3):
         raise ValueError(f"R_raw has unexpected shape {R.shape}, expected (N,2,3,3)")
     # R_t = R_tc @ R_c
     out = R.copy()
     m = np.isfinite(R).all(axis=(-2, -1))
-    if not np.any(m):
-        return out
-    flat = R.reshape(-1, 3, 3)
-    mf = m.reshape(-1)
-    out_flat = out.reshape(-1, 3, 3)
-    out_flat[mf] = R_tc @ flat[mf]
-    return out
+    if np.any(m):
+        flat = R.reshape(-1, 3, 3)
+        mf = m.reshape(-1)
+        out_flat = out.reshape(-1, 3, 3)
+        out_flat[mf] = R_tc @ flat[mf]
+    # then orientation-only post (xyz unaffected)
+    return _apply_orient_post_R(out, R_post_per_hand)
 
 
-def transform_npz(in_path: Path, out_path: Path, *, camera_pos_mm: tuple[float, float, float], flip_xz: bool, extra_rx_deg: float):
+def transform_npz(
+    in_path: Path,
+    out_path: Path,
+    *,
+    camera_pos_mm: tuple[float, float, float],
+    flip_xz: bool,
+    extra_rx_deg: float,
+    orient_post_left: str = "ry180",
+    orient_post_right: str = "none",
+):
     d = np.load(in_path, allow_pickle=False)
     keys = list(d.files)
 
@@ -143,14 +217,15 @@ def transform_npz(in_path: Path, out_path: Path, *, camera_pos_mm: tuple[float, 
 
     R_tc = _camera_to_target_R(flip_xz=flip_xz, extra_rx_deg=extra_rx_deg)
     t_tc_m = _camera_origin_target_t_m(camera_pos_mm)
+    R_post = _orient_post_pair(orient_post_left, orient_post_right)
 
     out = {}
     for k in keys:
         out[k] = d[k]
 
-    out["pose"] = _transform_pose_inplace(out["pose"], R_tc, t_tc_m)
+    out["pose"] = _transform_pose_inplace(out["pose"], R_tc, t_tc_m, R_post)
     out["pose_xyz_raw"] = _transform_xyz(out["pose_xyz_raw"], R_tc, t_tc_m)
-    out["R_raw"] = _transform_R_raw(out["R_raw"], R_tc)
+    out["R_raw"] = _transform_R_raw(out["R_raw"], R_tc, R_post)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(out_path, **out)
@@ -196,16 +271,47 @@ def main():
         default=-18.46,
         help="Placeholder extra rotation about +x in degrees (default 0).",
     )
+    ap.add_argument(
+        "--orient-post-left",
+        type=str,
+        default="ry180",
+        choices=sorted(_ORIENT_POST_NAMED),
+        help=(
+            "Orientation-only body-frame post for left hand: R'=R@R_post. "
+            "Does not change xyz. Default: ry180 (fixes ~180 roll/yaw vs teleop)."
+        ),
+    )
+    ap.add_argument(
+        "--orient-post-right",
+        type=str,
+        default="none",
+        choices=sorted(_ORIENT_POST_NAMED),
+        help=(
+            "Orientation-only body-frame post for right hand: R'=R@R_post. "
+            "Does not change xyz. Default: none (right already ~aligned)."
+        ),
+    )
     args = ap.parse_args()
 
     in_path = Path(args.input)
     cam_pos = _parse_xyz(args.camera_pos_mm)
     flip_xz = not bool(args.no_flip_xz)
     extra_rx_deg = float(args.extra_rx_deg)
+    orient_kwargs = dict(
+        orient_post_left=str(args.orient_post_left),
+        orient_post_right=str(args.orient_post_right),
+    )
 
     if in_path.is_file():
         out_path = Path(args.output) if args.output else (in_path.with_name(in_path.stem + "_targetframe.npz"))
-        transform_npz(in_path, out_path, camera_pos_mm=cam_pos, flip_xz=flip_xz, extra_rx_deg=extra_rx_deg)
+        transform_npz(
+            in_path,
+            out_path,
+            camera_pos_mm=cam_pos,
+            flip_xz=flip_xz,
+            extra_rx_deg=extra_rx_deg,
+            **orient_kwargs,
+        )
         print(f"wrote {out_path}")
         return
 
@@ -221,7 +327,14 @@ def main():
 
     for p in files:
         out_path = out_dir / p.name
-        transform_npz(p, out_path, camera_pos_mm=cam_pos, flip_xz=flip_xz, extra_rx_deg=extra_rx_deg)
+        transform_npz(
+            p,
+            out_path,
+            camera_pos_mm=cam_pos,
+            flip_xz=flip_xz,
+            extra_rx_deg=extra_rx_deg,
+            **orient_kwargs,
+        )
         print(f"wrote {out_path}")
 
 
