@@ -252,6 +252,54 @@ def load_video_frames(
     return frames
 
 
+def encode_frame_jpeg(rgb: np.ndarray, quality: int = 90) -> bytes:
+    """Compress an HxWx3 RGB uint8 frame to JPEG bytes (kept in RAM)."""
+    if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise ValueError(f"Expected HxWx3 uint8 RGB, got shape={getattr(rgb, 'shape', None)} dtype={getattr(rgb, 'dtype', None)}")
+    ok, buf = cv2.imencode(
+        ".jpg",
+        cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+        [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)],
+    )
+    if not ok:
+        raise RuntimeError("JPEG encode failed")
+    return buf.tobytes()
+
+
+def decode_frame_jpeg(data: bytes | bytearray | memoryview) -> np.ndarray:
+    """Decode JPEG bytes back to HxWx3 RGB uint8."""
+    arr = np.frombuffer(data, dtype=np.uint8)
+    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise RuntimeError("JPEG decode failed")
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+
+def store_frame(
+    rgb: np.ndarray,
+    *,
+    jpeg_in_ram: bool,
+    jpeg_quality: int = 90,
+) -> np.ndarray | bytes:
+    """Optionally JPEG-compress a frame before keeping it in the dataset list."""
+    if jpeg_in_ram:
+        return encode_frame_jpeg(rgb, quality=jpeg_quality)
+    return rgb
+
+
+def load_frame(stored: np.ndarray | bytes | bytearray | memoryview) -> np.ndarray:
+    """Load a stored frame (raw RGB array or JPEG bytes) to HxWx3 uint8 RGB."""
+    if isinstance(stored, (bytes, bytearray, memoryview)):
+        return decode_frame_jpeg(stored)
+    return stored
+
+
+def frame_nbytes(stored: np.ndarray | bytes | bytearray | memoryview) -> int:
+    if isinstance(stored, (bytes, bytearray, memoryview)):
+        return len(stored)
+    return int(np.asarray(stored).nbytes)
+
+
 def zero_rgb_like(ref: np.ndarray) -> np.ndarray:
     return np.zeros_like(ref)
 

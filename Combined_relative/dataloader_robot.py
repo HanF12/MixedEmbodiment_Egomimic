@@ -30,11 +30,14 @@ from Combined_relative.dataloader_utils import (
     demo_id_from_hash_filename,
     demo_id_from_joint_npy,
     demo_id_from_robot_eef_npz,
+    frame_nbytes,
     index_paths_by_demo_id,
+    load_frame,
     load_video_frames,
     normalize_future_chunk,
     relative_pose_chunk,
     resolve_path,
+    store_frame,
     zero_rgb_like,
 )
 
@@ -78,6 +81,8 @@ class RobotEpisodeDataset(Dataset):
         max_sync_rows: int | None = None,
         require_valid_eef: bool = True,
         disable_front_camera: bool = False,
+        jpeg_in_ram: bool = False,
+        jpeg_quality: int = 90,
     ) -> None:
         super().__init__()
         self.num_queries = int(num_queries)
@@ -86,6 +91,8 @@ class RobotEpisodeDataset(Dataset):
         self.max_sync_rows = int(max_sync_rows) if max_sync_rows is not None else None
         self.require_valid_eef = bool(require_valid_eef)
         self.disable_front_camera = bool(disable_front_camera)
+        self.jpeg_in_ram = bool(jpeg_in_ram)
+        self.jpeg_quality = int(jpeg_quality)
         self.image_transform = build_image_transform(transform)
 
         bird_vids = sorted(resolve_path(bird_vids_dir).glob("*.mp4"))
@@ -110,11 +117,13 @@ class RobotEpisodeDataset(Dataset):
         eef_by = index_paths_by_demo_id(eef_files, demo_id_from_robot_eef_npz)
         if self.disable_front_camera:
             print("Robot dataset: --no_front_camera → front images zeroed + masked out")
+        if self.jpeg_in_ram:
+            print(f"Robot dataset: JPEG-in-RAM enabled (quality={self.jpeg_quality})")
 
-        self.bird_frames: list[np.ndarray] = []
-        self.front_frames: list[np.ndarray] = []
-        self.left_frames: list[np.ndarray] = []
-        self.right_frames: list[np.ndarray] = []
+        self.bird_frames: list = []
+        self.front_frames: list = []
+        self.left_frames: list = []
+        self.right_frames: list = []
         self.joint_data: list[torch.Tensor] = []
         self.eef_pose_data: list[torch.Tensor] = []
         self.sample_demo_idx: List[int] = []
@@ -216,11 +225,35 @@ class RobotEpisodeDataset(Dataset):
             self.demo_lengths.append(n_i)
 
             for i in range(n_i):
-                self.bird_frames.append(bird_f[int(df.loc[i, "bird_index"])])
+                self.bird_frames.append(
+                    store_frame(
+                        bird_f[int(df.loc[i, "bird_index"])],
+                        jpeg_in_ram=self.jpeg_in_ram,
+                        jpeg_quality=self.jpeg_quality,
+                    )
+                )
                 if front_f is not None:
-                    self.front_frames.append(front_f[int(df.loc[i, "front_index"])])
-                self.left_frames.append(left_f[int(df.loc[i, "left_index"])])
-                self.right_frames.append(right_f[int(df.loc[i, "right_index"])])
+                    self.front_frames.append(
+                        store_frame(
+                            front_f[int(df.loc[i, "front_index"])],
+                            jpeg_in_ram=self.jpeg_in_ram,
+                            jpeg_quality=self.jpeg_quality,
+                        )
+                    )
+                self.left_frames.append(
+                    store_frame(
+                        left_f[int(df.loc[i, "left_index"])],
+                        jpeg_in_ram=self.jpeg_in_ram,
+                        jpeg_quality=self.jpeg_quality,
+                    )
+                )
+                self.right_frames.append(
+                    store_frame(
+                        right_f[int(df.loc[i, "right_index"])],
+                        jpeg_in_ram=self.jpeg_in_ram,
+                        jpeg_quality=self.jpeg_quality,
+                    )
+                )
                 self.joint_data.append(
                     concat_bimanual_joints(
                         left_j[int(df.loc[i, "left_joint_index"])],
@@ -263,9 +296,16 @@ class RobotEpisodeDataset(Dataset):
         # Backward-compatible aliases (state = joints for robot)
         self.state_mean = self.joint_mean
         self.state_std = self.joint_std
+        frame_bytes = sum(
+            frame_nbytes(f)
+            for frames in (self.bird_frames, self.front_frames, self.left_frames, self.right_frames)
+            for f in frames
+        )
         print(
             f"Robot dataset ready: demos={self.num_demos} samples={self.num_samples} "
-            f"(pose actions relative to chunk-anchor)"
+            f"(pose actions relative to chunk-anchor; "
+            f"frame_storage={'jpeg' if self.jpeg_in_ram else 'raw'} "
+            f"~{frame_bytes / (1024**3):.2f} GiB)"
         )
 
     def __len__(self) -> int:
@@ -279,16 +319,17 @@ class RobotEpisodeDataset(Dataset):
         sample_idx = ep_start + start_in_ep
         demo_end = ep_start + ep_len
 
-        bird_t = self.image_transform(self.bird_frames[sample_idx])
+        bird_np = load_frame(self.bird_frames[sample_idx])
+        bird_t = self.image_transform(bird_np)
         if self.disable_front_camera:
-            front_t = self.image_transform(zero_rgb_like(self.bird_frames[sample_idx]))
+            front_t = self.image_transform(zero_rgb_like(bird_np))
         else:
-            front_t = self.image_transform(self.front_frames[sample_idx])
+            front_t = self.image_transform(load_frame(self.front_frames[sample_idx]))
         images = stack_camera_tensors(
             bird_t,
             front_t,
-            self.image_transform(self.left_frames[sample_idx]),
-            self.image_transform(self.right_frames[sample_idx]),
+            self.image_transform(load_frame(self.left_frames[sample_idx])),
+            self.image_transform(load_frame(self.right_frames[sample_idx])),
         )
 
         pose_raw = self.eef_pose_data[sample_idx]  # [8] absolute, chunk anchor

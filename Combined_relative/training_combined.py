@@ -149,9 +149,21 @@ def parse_args() -> argparse.Namespace:
         help="Use only the first N human demos (sorted demo IDs). Overrides --first_n/--max_demos for human.",
     )
     p.add_argument("--resize_factor", type=float, default=1.0)
+    p.add_argument(
+        "--jpeg_in_ram",
+        action="store_true",
+        help="Store synced RGB frames as JPEG bytes in RAM (much less host memory; "
+        "decode in __getitem__). Prefer --num_workers 2 so decode overlaps GPU.",
+    )
+    p.add_argument(
+        "--jpeg_quality",
+        type=int,
+        default=90,
+        help="JPEG quality for --jpeg_in_ram (1-100, default 90).",
+    )
     p.add_argument("--max_sync_rows", type=int, default=None)
     p.add_argument("--cpu", action="store_true")
-    p.add_argument("--save_every_epochs", type=int, default=200)
+    p.add_argument("--save_every_epochs", type=int, default=1000)
     p.add_argument("--pose_loss_weight", type=float, default=1.0)
     p.add_argument("--joint_loss_weight", type=float, default=1.0)
     p.add_argument("--kl_weight", type=float, default=DEFAULT_KL_WEIGHT)
@@ -678,6 +690,8 @@ def main() -> None:
             resize_factor=cli.resize_factor,
             max_sync_rows=cli.max_sync_rows,
             disable_front_camera=cli.no_front_camera,
+            jpeg_in_ram=cli.jpeg_in_ram,
+            jpeg_quality=cli.jpeg_quality,
         )
         np.savez(
             output_dir / "normalization_stats_robot.npz",
@@ -713,6 +727,8 @@ def main() -> None:
             resize_factor=cli.resize_factor,
             max_sync_rows=cli.max_sync_rows,
             disable_front_camera=cli.no_front_camera,
+            jpeg_in_ram=cli.jpeg_in_ram,
+            jpeg_quality=cli.jpeg_quality,
         )
         np.savez(
             output_dir / "normalization_stats_human.npz",
@@ -746,6 +762,8 @@ def main() -> None:
         lr=cli.lr,
         disable_front_camera=cli.no_front_camera,
     )
+    meta["jpeg_in_ram"] = bool(cli.jpeg_in_ram)
+    meta["jpeg_quality"] = int(cli.jpeg_quality) if cli.jpeg_in_ram else None
     if human_pose_dir is not None:
         meta["human_pose_dir"] = str(human_pose_dir)
 

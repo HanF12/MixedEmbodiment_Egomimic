@@ -145,7 +145,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resize_factor", type=float, default=1.0)
     p.add_argument("--max_sync_rows", type=int, default=None)
     p.add_argument("--cpu", action="store_true")
-    p.add_argument("--save_every_epochs", type=int, default=200)
+    p.add_argument("--save_every_epochs", type=int, default=1000)
     p.add_argument("--pose_loss_weight", type=float, default=1.0)
     p.add_argument("--joint_loss_weight", type=float, default=1.0)
     p.add_argument("--kl_weight", type=float, default=DEFAULT_KL_WEIGHT)
