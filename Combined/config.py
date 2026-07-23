@@ -49,6 +49,7 @@ ROBOT_JOINT_DIM = 14
 JOINT_DIM_PER_ARM = 7
 LEFT_ARM_SLICE = slice(0, JOINT_DIM_PER_ARM)
 RIGHT_ARM_SLICE = slice(JOINT_DIM_PER_ARM, ROBOT_JOINT_DIM)
+GRIPPER_INDICES = (JOINT_DIM_PER_ARM - 1, ROBOT_JOINT_DIM - 1)
 ROBOT_STATE_DIM = ROBOT_JOINT_DIM  # proprio = joints only (EgoMimic)
 
 # --- Raw NPZ pose layout (before dropping rotation) ---

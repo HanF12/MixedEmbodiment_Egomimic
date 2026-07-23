@@ -54,6 +54,7 @@ ROBOT_JOINT_DIM = 14
 JOINT_DIM_PER_ARM = 7
 LEFT_ARM_SLICE = slice(0, JOINT_DIM_PER_ARM)
 RIGHT_ARM_SLICE = slice(JOINT_DIM_PER_ARM, ROBOT_JOINT_DIM)
+GRIPPER_INDICES = (JOINT_DIM_PER_ARM - 1, ROBOT_JOINT_DIM - 1)
 ROBOT_STATE_DIM = ROBOT_JOINT_DIM  # proprio = joints only (EgoMimic)
 
 # --- Raw NPZ pose layout (before dropping rotation) ---
@@ -272,3 +273,30 @@ def save_run_metadata(run_dir: str | Path, metadata: dict[str, Any]) -> Path:
     metadata_path = run_dir / "run_metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
     return metadata_path
+
+
+def load_run_metadata(run_dir: str | Path) -> dict[str, Any] | None:
+    metadata_path = Path(run_dir) / "run_metadata.json"
+    if not metadata_path.exists():
+        return None
+    return json.loads(metadata_path.read_text())
+
+
+def validate_run_metadata(metadata: dict[str, Any], *, num_queries: int | None = None) -> None:
+    if tuple(metadata.get("camera_order", [])) != CAMERA_ORDER:
+        raise ValueError(
+            f"Saved camera_order {metadata.get('camera_order')} does not match expected {CAMERA_ORDER}"
+        )
+    if tuple(metadata.get("model_camera_names", [])) != MODEL_CAMERA_NAMES:
+        raise ValueError(
+            "Saved model camera names do not match the fixed Combined camera order"
+        )
+    saved_joint_dim = metadata.get("robot_joint_dim", metadata.get("robot_state_dim", -1))
+    if int(saved_joint_dim) != ROBOT_JOINT_DIM:
+        raise ValueError(
+            f"Saved robot_joint_dim {saved_joint_dim} does not match {ROBOT_JOINT_DIM}"
+        )
+    if num_queries is not None and int(metadata.get("num_queries", -1)) != int(num_queries):
+        raise ValueError(
+            f"Saved num_queries {metadata.get('num_queries')} does not match CLI {num_queries}"
+        )

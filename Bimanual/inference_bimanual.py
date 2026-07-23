@@ -201,7 +201,7 @@ parser.add_argument("--display", action=argparse.BooleanOptionalAction, default=
 parser.add_argument("--display_scale", type=float, default=0.5)
 parser.add_argument("--display_max_fps", type=float, default=15.0)
 parser.add_argument("--chunking", action=argparse.BooleanOptionalAction, default=True)
-parser.add_argument("--inference_fps", type=float, default=30.0)
+parser.add_argument("--inference_fps", type=float, default=15.0)
 parser.add_argument("--resize_factor", type=float, default=1.0)
 parser.add_argument("--width", type=int, default=640)
 parser.add_argument("--height", type=int, default=480)

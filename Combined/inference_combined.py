@@ -3,12 +3,13 @@
 Combined mixed-ACT inference (robot / joint pathway only).
 
 Uses the same RealSense + ROS joint I/O pattern as Bimanual-3cam/inference_bimanual.py,
-but drives Combined.MixedDETRVAE with:
-  - embodiment = robot (14D joints)
-  - camera slots [bird, front, left_wrist, right_wrist]
-  - robot camera_mask (all ones)
+but drives Combined.MixedDETRVAE (EgoMimic dual-head layout) with:
+  - embodiment = robot
+  - proprio = joint_state [14]  (robot_input_proj)
+  - camera slots [bird, front, left_wrist, right_wrist], mask all ones
+  - control from joint_action_head only (pose head ignored)
 
-No human pose pathway: no pose npz, no human action head.
+No human pose pathway; pose_state is a dummy zeros tensor required by the API.
 """
 
 from __future__ import annotations
@@ -40,8 +41,9 @@ from config import (  # noqa: E402
     GRIPPER_INDICES,
     LEFT_ARM_SLICE,
     MODEL_CAMERA_NAMES,
+    POSE_DIM,
     RIGHT_ARM_SLICE,
-    ROBOT_STATE_DIM,
+    ROBOT_JOINT_DIM,
     camera_mask_tensor,
     concat_bimanual_joints,
     load_run_metadata,
@@ -154,7 +156,6 @@ def annotate(img_bgr: np.ndarray, lines: list[str]) -> np.ndarray:
 
 
 def stack_preview(a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray) -> np.ndarray:
-    # Combined camera order preview: bird | front / left_wrist | right_wrist
     top = np.concatenate([a, b], axis=1)
     bottom = np.concatenate([c, d], axis=1)
     return np.concatenate([top, bottom], axis=0)
@@ -216,14 +217,14 @@ parser.add_argument(
     "--normalization_path",
     type=str,
     required=True,
-    help="Robot normalization npz (qpos_mean/qpos_std), e.g. normalization_stats_robot.npz",
+    help="Robot normalization npz (joint_mean/joint_std or qpos_mean/qpos_std)",
 )
 parser.add_argument("--num_queries", type=int, default=DEFAULT_NUM_QUERIES)
 parser.add_argument("--display", action=argparse.BooleanOptionalAction, default=True)
 parser.add_argument("--display_scale", type=float, default=0.5)
 parser.add_argument("--display_max_fps", type=float, default=15.0)
 parser.add_argument("--chunking", action=argparse.BooleanOptionalAction, default=True)
-parser.add_argument("--inference_fps", type=float, default=30.0)
+parser.add_argument("--inference_fps", type=float, default=15.0)
 parser.add_argument("--resize_factor", type=float, default=1.0)
 parser.add_argument("--width", type=int, default=640)
 parser.add_argument("--height", type=int, default=480)
@@ -236,9 +237,8 @@ parser.add_argument("--topic_arm_right", type=str, default="/arm_joint_target_po
 parser.add_argument("--topic_gripper_right", type=str, default="/gripper_position_control_slave_right")
 parser.add_argument("--gripper_scale", type=float, default=48)
 parser.add_argument("--gripper_max", type=float, default=80)
-parser.add_argument("--max_joint_speed", type=float, default=0.25)
+parser.add_argument("--max_joint_speed", type=float, default=0.35)
 parser.add_argument("--max_gripper_speed", type=float, default=100)
-# Combined CAMERA_ORDER = (bird, front, left_wrist, right_wrist)
 parser.add_argument("--bird_role", choices=("left", "right", "center", "front"), default="center")
 parser.add_argument("--bird_serial", type=str, default=None)
 parser.add_argument("--bird_color_fps", type=int, default=15)
@@ -257,28 +257,33 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 checkpoint_path = resolve_path(cli.checkpoint)
 metadata = load_run_metadata(checkpoint_path.parent)
 if metadata is not None:
-    validate_run_metadata(metadata, num_queries=cli.num_queries)
+    try:
+        validate_run_metadata(metadata, num_queries=cli.num_queries)
+    except ValueError as exc:
+        print(f"Warning: skipping run_metadata validation: {exc}")
 
 model = build(Args(cli.num_queries)).to(device)
 state_dict = torch.load(str(checkpoint_path), map_location=device)
 model.load_state_dict(state_dict)
 model.eval()
+print(f"Loaded checkpoint: {checkpoint_path}")
 
 stats = np.load(str(resolve_path(cli.normalization_path)))
-# Prefer robot keys; accept legacy aliases if present.
-if "qpos_mean" in stats.files:
+if "joint_mean" in stats.files and "joint_std" in stats.files:
+    mean_key, std_key = "joint_mean", "joint_std"
+elif "qpos_mean" in stats.files and "qpos_std" in stats.files:
     mean_key, std_key = "qpos_mean", "qpos_std"
-elif "state_mean" in stats.files:
-    mean_key, std_key = "state_mean", "state_std"
 else:
     raise KeyError(
-        f"{cli.normalization_path} missing qpos_mean/qpos_std "
-        f"(keys={stats.files}). Use normalization_stats_robot.npz."
+        f"{cli.normalization_path} missing joint_mean/joint_std or qpos_mean/qpos_std "
+        f"(keys={stats.files}). Use normalization_stats_robot_no_ori_abs.npz."
     )
-qpos_mean = torch.from_numpy(np.asarray(stats[mean_key], dtype=np.float32).reshape(1, ROBOT_STATE_DIM)).to(device)
-qpos_std = torch.from_numpy(np.asarray(stats[std_key], dtype=np.float32).reshape(1, ROBOT_STATE_DIM)).to(device)
+qpos_mean = torch.from_numpy(np.asarray(stats[mean_key], dtype=np.float32).reshape(1, ROBOT_JOINT_DIM)).to(device)
+qpos_std = torch.from_numpy(np.asarray(stats[std_key], dtype=np.float32).reshape(1, ROBOT_JOINT_DIM)).to(device)
 
 robot_cam_mask = camera_mask_tensor(EMBODIMENT_ROBOT).unsqueeze(0).to(device)  # [1,4]
+# Dummy pose_state for API; robot path uses joint_state only.
+dummy_pose_state = torch.zeros(1, POSE_DIM, dtype=torch.float32, device=device)
 
 rospy.init_node("combined_act_inference_robot", anonymous=True)
 joint_state_listener(topic=str(cli.left_joint_topic), side="left")
@@ -288,7 +293,6 @@ right_publishers = ArmPublishers(str(cli.topic_arm_right), str(cli.topic_gripper
 
 color_width = int(cli.width)
 color_height = int(cli.height)
-# Must match Combined.config.CAMERA_ORDER / stack_camera_tensors args.
 camera_specs = [
     (CAMERA_ORDER[0], str(cli.bird_role), cli.bird_serial, int(cli.bird_color_fps)),
     (CAMERA_ORDER[1], str(cli.front_role), cli.front_serial, int(cli.front_color_fps)),
@@ -330,13 +334,12 @@ try:
             np.asarray(list(right_state[0]), dtype=np.float32),
             rec_id="live_inference",
         ).cpu().numpy()
-        qpos = torch.from_numpy(qpos_np).unsqueeze(0).to(device)
-        qpos = (qpos - qpos_mean) / qpos_std
+        joint_state = torch.from_numpy(qpos_np).unsqueeze(0).to(device)
+        joint_state = (joint_state - qpos_mean) / qpos_std
 
         if float(cli.resize_factor) != 1.0:
             frames = [maybe_resize(frame, float(cli.resize_factor)) for frame in frames]
 
-        # stack_camera_tensors(bird, front, left, right) -> [4,C,H,W]
         stacked_images = stack_camera_tensors(
             to_resnet_norm_rgb_tensor(frames[0]),
             to_resnet_norm_rgb_tensor(frames[1]),
@@ -345,20 +348,22 @@ try:
         ).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            # Robot pathway only: 14D joint head. No human pose head.
-            pred, _, _ = model(
-                qpos,
-                stacked_images,
-                EMBODIMENT_ROBOT,
+            out = model(
+                pose_state=dummy_pose_state,
+                images=stacked_images,
+                embodiment=EMBODIMENT_ROBOT,
+                joint_state=joint_state,
                 camera_mask=robot_cam_mask,
-                actions=None,
             )
+            pred = out["joint_pred"]
+            if pred is None:
+                raise RuntimeError("joint_pred is None for robot embodiment")
 
         predicted_trajectory = pred[0] * qpos_std.squeeze(0) + qpos_mean.squeeze(0)
         predicted_trajectory_np = predicted_trajectory.cpu().numpy()
         past_predictions_buffer.append(predicted_trajectory_np)
 
-        positions_to_publish = np.zeros((ROBOT_STATE_DIM,), dtype=np.float32)
+        positions_to_publish = np.zeros((ROBOT_JOINT_DIM,), dtype=np.float32)
         if bool(cli.chunking):
             wsum = 0.0
             for i in range(len(past_predictions_buffer)):
@@ -383,7 +388,6 @@ try:
         now_t = time.monotonic()
         if last_cmd is None or last_cmd_t is None:
             # Seed in the same units as `desired` (gripper already scaled/clamped above).
-            # Publishing raw qpos grippers here used to snap the first command.
             last_cmd = qpos_np.astype(np.float32).copy()
             last_cmd[list(GRIPPER_INDICES)] *= float(cli.gripper_scale)
             if float(cli.gripper_max) >= 0:

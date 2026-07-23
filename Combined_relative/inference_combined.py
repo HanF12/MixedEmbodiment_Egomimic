@@ -1,4 +1,26 @@
 #!/usr/bin/env python
+"""
+Combined-relative mixed-ACT inference (robot / joint pathway only).
+
+I/O closely follows Bimanual-3cam/inference_bimanual.py (RealSense + ROS joints),
+but drives Combined_relative.MixedDETRVAE with:
+  - embodiment = robot
+  - proprio = joint_state [14]  (robot_input_proj)
+  - camera slots [bird, front, left_wrist, right_wrist], mask all ones
+  - control from joint_action_head only
+
+Relative vs absolute
+--------------------
+Training uses *relative* pose actions for the shared EEF/hand head:
+  pose_actions[k] = pose[t+k] - pose[t]
+Joint actions remain *absolute*:
+  joint_actions[k] = joints[t+k]
+
+This script publishes absolute joint targets from joint_pred, so the relative
+pose training convention does **not** change the robot control loop. Human /
+EEF relative norms are optional (for logging / future pose control) and unused
+when commanding joints.
+"""
 
 from __future__ import annotations
 
@@ -25,11 +47,14 @@ sys.path.insert(0, str(_PKG_DIR))
 from config import (  # noqa: E402
     CAMERA_ORDER,
     DEFAULT_NUM_QUERIES,
+    EMBODIMENT_ROBOT,
     GRIPPER_INDICES,
     LEFT_ARM_SLICE,
     MODEL_CAMERA_NAMES,
+    POSE_DIM,
     RIGHT_ARM_SLICE,
-    STATE_DIM,
+    ROBOT_JOINT_DIM,
+    camera_mask_tensor,
     concat_bimanual_joints,
     load_run_metadata,
     stack_camera_tensors,
@@ -50,6 +75,10 @@ from joint_lisener import (  # type: ignore  # noqa: E402
 
 RESNET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 RESNET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+
+DEFAULT_CHECKPOINT = "combined_act_latest_no_ori.pth"
+DEFAULT_ROBOT_NORM = "normalization_stats_robot_no_ori.npz"
+DEFAULT_HUMAN_NORM = "normalization_stats_human_no_ori.npz"
 
 
 def resolve_path(path_like: str) -> Path:
@@ -140,17 +169,29 @@ def annotate(img_bgr: np.ndarray, lines: list[str]) -> np.ndarray:
     return out
 
 
-def stack_preview(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
+def stack_preview(a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray) -> np.ndarray:
     top = np.concatenate([a, b], axis=1)
-    # Pad bird to match top width so the 3-cam mosaic stays rectangular.
-    pad_w = top.shape[1] - c.shape[1]
-    if pad_w > 0:
-        left_pad = pad_w // 2
-        right_pad = pad_w - left_pad
-        c = np.pad(c, ((0, 0), (left_pad, right_pad), (0, 0)))
-    elif pad_w < 0:
-        c = c[:, : top.shape[1]]
-    return np.concatenate([top, c], axis=0)
+    bottom = np.concatenate([c, d], axis=1)
+    return np.concatenate([top, bottom], axis=0)
+
+
+def load_joint_norm_stats(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    stats = np.load(str(path), allow_pickle=True)
+    if "joint_mean" in stats.files and "joint_std" in stats.files:
+        mean = np.asarray(stats["joint_mean"], dtype=np.float32)
+        std = np.asarray(stats["joint_std"], dtype=np.float32)
+    elif "qpos_mean" in stats.files and "qpos_std" in stats.files:
+        mean = np.asarray(stats["qpos_mean"], dtype=np.float32)
+        std = np.asarray(stats["qpos_std"], dtype=np.float32)
+    else:
+        raise KeyError(
+            f"{path} missing joint_mean/joint_std or qpos_mean/qpos_std (keys={stats.files})."
+        )
+    if mean.shape != (ROBOT_JOINT_DIM,) or std.shape != (ROBOT_JOINT_DIM,):
+        raise ValueError(
+            f"Expected joint norm shape ({ROBOT_JOINT_DIM},), got mean={mean.shape} std={std.shape}"
+        )
+    return mean, std
 
 
 class ArmPublishers:
@@ -199,12 +240,24 @@ class Args:
         self.lr_backbone = 1e-5
         self.masks = False
         self.dilation = False
-        self.state_dim = STATE_DIM
 
 
-parser = argparse.ArgumentParser(description="Bimanual-3cam ACT inference controller (no front camera)")
-parser.add_argument("--checkpoint", type=str, required=True)
-parser.add_argument("--normalization_path", type=str, required=True)
+parser = argparse.ArgumentParser(
+    description="Combined-relative ACT inference (robot/joint pathway; absolute joint targets)"
+)
+parser.add_argument("--checkpoint", type=str, default=DEFAULT_CHECKPOINT)
+parser.add_argument(
+    "--normalization_path",
+    type=str,
+    default=DEFAULT_ROBOT_NORM,
+    help="Robot normalization npz (joint_mean/joint_std or qpos_mean/qpos_std)",
+)
+parser.add_argument(
+    "--human_normalization_path",
+    type=str,
+    default=DEFAULT_HUMAN_NORM,
+    help="Human relative-pose norms (unused for joint control; validated/logged only)",
+)
 parser.add_argument("--num_queries", type=int, default=DEFAULT_NUM_QUERIES)
 parser.add_argument("--display", action=argparse.BooleanOptionalAction, default=True)
 parser.add_argument("--display_scale", type=float, default=0.5)
@@ -223,35 +276,69 @@ parser.add_argument("--topic_arm_right", type=str, default="/arm_joint_target_po
 parser.add_argument("--topic_gripper_right", type=str, default="/gripper_position_control_slave_right")
 parser.add_argument("--gripper_scale", type=float, default=48)
 parser.add_argument("--gripper_max", type=float, default=80)
-parser.add_argument("--max_joint_speed", type=float, default=0.25)
+parser.add_argument("--max_joint_speed", type=float, default=0.35)
 parser.add_argument("--max_gripper_speed", type=float, default=100)
+parser.add_argument("--bird_role", choices=("left", "right", "center", "front"), default="center")
+parser.add_argument("--bird_serial", type=str, default=None)
+parser.add_argument("--bird_color_fps", type=int, default=15)
+parser.add_argument("--front_role", choices=("left", "right", "center", "front"), default="front")
+parser.add_argument("--front_serial", type=str, default=None)
+parser.add_argument("--front_color_fps", type=int, default=15)
 parser.add_argument("--left_wrist_role", choices=("left", "right", "center", "front"), default="left")
 parser.add_argument("--left_wrist_serial", type=str, default=None)
 parser.add_argument("--left_wrist_color_fps", type=int, default=15)
 parser.add_argument("--right_wrist_role", choices=("left", "right", "center", "front"), default="right")
 parser.add_argument("--right_wrist_serial", type=str, default=None)
 parser.add_argument("--right_wrist_color_fps", type=int, default=15)
-parser.add_argument("--bird_role", choices=("left", "right", "center", "front"), default="center")
-parser.add_argument("--bird_serial", type=str, default=None)
-parser.add_argument("--bird_color_fps", type=int, default=15)
 cli = parser.parse_args(rospy.myargv(argv=sys.argv)[1:])
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"device={device} cuda_available={torch.cuda.is_available()}")
+
 checkpoint_path = resolve_path(cli.checkpoint)
 metadata = load_run_metadata(checkpoint_path.parent)
 if metadata is not None:
-    validate_run_metadata(metadata, num_queries=cli.num_queries)
+    try:
+        validate_run_metadata(metadata, num_queries=cli.num_queries)
+        print(
+            f"run_metadata: pose_action_space={metadata.get('pose_action_space')} "
+            f"(joint control uses absolute joint_pred)"
+        )
+    except ValueError as exc:
+        print(f"Warning: skipping run_metadata validation: {exc}")
 
 model = build(Args(cli.num_queries)).to(device)
 state_dict = torch.load(str(checkpoint_path), map_location=device)
 model.load_state_dict(state_dict)
 model.eval()
+print(f"Loaded checkpoint: {checkpoint_path}")
 
-stats = np.load(str(resolve_path(cli.normalization_path)))
-qpos_mean = torch.from_numpy(np.asarray(stats["qpos_mean"], dtype=np.float32).reshape(1, STATE_DIM)).to(device)
-qpos_std = torch.from_numpy(np.asarray(stats["qpos_std"], dtype=np.float32).reshape(1, STATE_DIM)).to(device)
+robot_norm_path = resolve_path(cli.normalization_path)
+joint_mean_np, joint_std_np = load_joint_norm_stats(robot_norm_path)
+qpos_mean = torch.from_numpy(joint_mean_np.reshape(1, ROBOT_JOINT_DIM)).to(device)
+qpos_std = torch.from_numpy(joint_std_np.reshape(1, ROBOT_JOINT_DIM)).to(device)
+print(f"Robot joint norms: {robot_norm_path}")
 
-rospy.init_node("bimanual_3cam_act_inference", anonymous=True)
+human_norm_path = resolve_path(cli.human_normalization_path)
+if human_norm_path.is_file():
+    human_stats = np.load(str(human_norm_path), allow_pickle=True)
+    space = (
+        str(human_stats["pose_action_space"])
+        if "pose_action_space" in human_stats.files
+        else "unknown"
+    )
+    print(
+        f"Human pose norms (unused for joint control): {human_norm_path} "
+        f"keys={human_stats.files} pose_action_space={space}"
+    )
+else:
+    print(f"Warning: human normalization file not found: {human_norm_path}")
+
+robot_cam_mask = camera_mask_tensor(EMBODIMENT_ROBOT).unsqueeze(0).to(device)  # [1,4]
+# Dummy pose_state for API; robot path uses joint_state only.
+dummy_pose_state = torch.zeros(1, POSE_DIM, dtype=torch.float32, device=device)
+
+rospy.init_node("combined_relative_act_inference_robot", anonymous=True)
 joint_state_listener(topic=str(cli.left_joint_topic), side="left")
 joint_state_listener(topic=str(cli.right_joint_topic), side="right")
 left_publishers = ArmPublishers(str(cli.topic_arm_left), str(cli.topic_gripper_left))
@@ -260,9 +347,10 @@ right_publishers = ArmPublishers(str(cli.topic_arm_right), str(cli.topic_gripper
 color_width = int(cli.width)
 color_height = int(cli.height)
 camera_specs = [
-    (CAMERA_ORDER[0], str(cli.left_wrist_role), cli.left_wrist_serial, int(cli.left_wrist_color_fps)),
-    (CAMERA_ORDER[1], str(cli.right_wrist_role), cli.right_wrist_serial, int(cli.right_wrist_color_fps)),
-    (CAMERA_ORDER[2], str(cli.bird_role), cli.bird_serial, int(cli.bird_color_fps)),
+    (CAMERA_ORDER[0], str(cli.bird_role), cli.bird_serial, int(cli.bird_color_fps)),
+    (CAMERA_ORDER[1], str(cli.front_role), cli.front_serial, int(cli.front_color_fps)),
+    (CAMERA_ORDER[2], str(cli.left_wrist_role), cli.left_wrist_serial, int(cli.left_wrist_color_fps)),
+    (CAMERA_ORDER[3], str(cli.right_wrist_role), cli.right_wrist_serial, int(cli.right_wrist_color_fps)),
 ]
 
 pipelines: list[tuple[str, str, rs.pipeline]] = []
@@ -299,8 +387,8 @@ try:
             np.asarray(list(right_state[0]), dtype=np.float32),
             rec_id="live_inference",
         ).cpu().numpy()
-        qpos = torch.from_numpy(qpos_np).unsqueeze(0).to(device)
-        qpos = (qpos - qpos_mean) / qpos_std
+        joint_state = torch.from_numpy(qpos_np).unsqueeze(0).to(device)
+        joint_state = (joint_state - qpos_mean) / qpos_std
 
         if float(cli.resize_factor) != 1.0:
             frames = [maybe_resize(frame, float(cli.resize_factor)) for frame in frames]
@@ -309,15 +397,27 @@ try:
             to_resnet_norm_rgb_tensor(frames[0]),
             to_resnet_norm_rgb_tensor(frames[1]),
             to_resnet_norm_rgb_tensor(frames[2]),
+            to_resnet_norm_rgb_tensor(frames[3]),
         ).unsqueeze(0).to(device)
-        with torch.no_grad():
-            pred, _, _ = model(qpos, stacked_images, None)
 
+        with torch.no_grad():
+            out = model(
+                pose_state=dummy_pose_state,
+                images=stacked_images,
+                embodiment=EMBODIMENT_ROBOT,
+                joint_state=joint_state,
+                camera_mask=robot_cam_mask,
+            )
+            pred = out["joint_pred"]
+            if pred is None:
+                raise RuntimeError("joint_pred is None for robot embodiment")
+
+        # Absolute joint trajectory (training joint_actions are absolute).
         predicted_trajectory = pred[0] * qpos_std.squeeze(0) + qpos_mean.squeeze(0)
         predicted_trajectory_np = predicted_trajectory.cpu().numpy()
         past_predictions_buffer.append(predicted_trajectory_np)
 
-        positions_to_publish = np.zeros((STATE_DIM,), dtype=np.float32)
+        positions_to_publish = np.zeros((ROBOT_JOINT_DIM,), dtype=np.float32)
         if bool(cli.chunking):
             wsum = 0.0
             for i in range(len(past_predictions_buffer)):
@@ -335,14 +435,16 @@ try:
 
         positions_to_publish[list(GRIPPER_INDICES)] *= float(cli.gripper_scale)
         if float(cli.gripper_max) >= 0:
-            positions_to_publish[GRIPPER_INDICES[0]] = min(float(positions_to_publish[GRIPPER_INDICES[0]]), float(cli.gripper_max))
-            positions_to_publish[GRIPPER_INDICES[1]] = min(float(positions_to_publish[GRIPPER_INDICES[1]]), float(cli.gripper_max))
+            positions_to_publish[GRIPPER_INDICES[0]] = min(
+                float(positions_to_publish[GRIPPER_INDICES[0]]), float(cli.gripper_max)
+            )
+            positions_to_publish[GRIPPER_INDICES[1]] = min(
+                float(positions_to_publish[GRIPPER_INDICES[1]]), float(cli.gripper_max)
+            )
 
         desired = positions_to_publish.astype(np.float32)
         now_t = time.monotonic()
         if last_cmd is None or last_cmd_t is None:
-            # Seed in the same units as `desired` (gripper already scaled/clamped above).
-            # Publishing raw qpos grippers here used to snap the first command.
             last_cmd = qpos_np.astype(np.float32).copy()
             last_cmd[list(GRIPPER_INDICES)] *= float(cli.gripper_scale)
             if float(cli.gripper_max) >= 0:
@@ -353,9 +455,7 @@ try:
                     float(last_cmd[GRIPPER_INDICES[1]]), float(cli.gripper_max)
                 )
             last_cmd_t = now_t
-            # Hold measured pose on the seed step; first chase happens next cycle.
         else:
-            # Cap dt so a slow/first chase after a stall cannot authorize a huge step.
             dt_nom = 1.0 / max(1e-3, float(cli.inference_fps))
             dt = min(max(1e-3, float(now_t - last_cmd_t)), dt_nom)
             max_dq = float(cli.max_joint_speed) * dt
@@ -391,8 +491,9 @@ try:
                     shown[0][:h, :w],
                     shown[1][:h, :w],
                     shown[2][:h, :w],
+                    shown[3][:h, :w],
                 )
-                cv2.imshow("Bimanual-3cam ACT Inference", preview)
+                cv2.imshow("Combined-relative ACT Inference (robot)", preview)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
 
