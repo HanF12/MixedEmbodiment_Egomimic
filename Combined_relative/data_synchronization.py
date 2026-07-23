@@ -1,15 +1,18 @@
 """
-Timestamp synchronization for Combined training.
+Timestamp synchronization for Combined_relative training.
 
 1) synchronize_robot_bimanual  — joints + 4 cameras + EEF pose timeline
-   (drops rows lacking full EEF pose: xyz + rot + open/gripper for both sides)
+   (by default drops rows lacking xyz + gripper/open for both arms)
 2) synchronize_human_hands    — bird + front cameras + hand-pose NPZ timeline
-   (by default drops rows lacking full pose: xyz + rot + open for both hands)
+   (by default drops rows lacking xyz + gripper/open for both hands)
+
+Orientation / valid_rot is never used for frame validity (training drops rot6d).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
@@ -122,12 +125,15 @@ def xyz_gripper_valid_mask(
     valid_pos: np.ndarray | None = None,
     valid_open: np.ndarray | None = None,
     n_frames: int | None = None,
+    required_slots: Sequence[int] | None = None,
 ) -> np.ndarray:
     """
-    Per-frame mask: True iff both hands/arms have valid xyz + open/gripper.
+    Per-frame mask: True iff required slots have valid xyz + open/gripper.
 
-    Rotation validity is intentionally ignored (pose training drops rot6d).
-    Each validity array is expected as [T, 2] (left, right).
+    - ``required_slots`` defaults to both hands/arms ``(0, 1)``.
+      Pass ``(0,)`` or ``(1,)`` for single-hand / single-arm demos.
+    - Orientation / ``valid_rot`` is never consulted.
+    - Each validity array is expected as [T, 2] (left=0, right=1).
     """
     arrays = [a for a in (valid_pos, valid_open) if a is not None]
     if not arrays:
@@ -139,6 +145,13 @@ def xyz_gripper_valid_mask(
     if n_frames is not None and int(n_frames) != t:
         raise ValueError(f"n_frames={n_frames} != validity length {t}")
 
+    slots = tuple(int(s) for s in (required_slots if required_slots is not None else (0, 1)))
+    if not slots:
+        raise ValueError("required_slots must be non-empty")
+    for s in slots:
+        if s not in (0, 1):
+            raise ValueError(f"required_slots entries must be 0 or 1, got {slots}")
+
     ok = np.ones((t,), dtype=bool)
     for name, arr in (("valid_pos", valid_pos), ("valid_open", valid_open)):
         if arr is None:
@@ -148,7 +161,7 @@ def xyz_gripper_valid_mask(
             raise ValueError(f"{name} must have shape [T, 2], got {a.shape}")
         if a.shape[0] != t:
             raise ValueError(f"{name} length {a.shape[0]} != {t}")
-        ok &= a.all(axis=1)
+        ok &= a[:, list(slots)].all(axis=1)
     return ok
 
 
@@ -159,10 +172,16 @@ def full_hand_pose_valid_mask(
     valid_rot: np.ndarray | None = None,
     valid_open: np.ndarray | None = None,
     n_frames: int | None = None,
+    required_slots: Sequence[int] | None = None,
 ) -> np.ndarray:
     """Deprecated alias: ignores valid_rot; requires xyz + gripper only."""
-    del valid_rot  # unused; rotation not supervised
-    return xyz_gripper_valid_mask(valid_pos=valid_pos, valid_open=valid_open, n_frames=n_frames)
+    del valid_rot  # unused; orientation never gates validity
+    return xyz_gripper_valid_mask(
+        valid_pos=valid_pos,
+        valid_open=valid_open,
+        n_frames=n_frames,
+        required_slots=required_slots,
+    )
 
 
 def _validate_index_column(df: pd.DataFrame, col: str, length: int, *, label: str) -> None:
@@ -199,7 +218,11 @@ def synchronize_robot_bimanual(
     Index columns:
       left_joint_index, right_joint_index, left_index, right_index,
       bird_index, front_index, eef_pose_index
+
+    When require_full_eef_pose is True, keep rows whose EEF index has valid
+    xyz + gripper for both arms. Orientation / valid_rot is ignored.
     """
+    del valid_rot  # orientation never gates sync validity
     left_j = _assert_finite_1d("left_joint", left_joint_ts)
     right_j = _assert_finite_1d("right_joint", right_joint_ts)
     left_c = _assert_finite_1d("left_cam", left_cam_ts)
@@ -257,8 +280,6 @@ def synchronize_robot_bimanual(
         df["eef_pose_index"] = []
 
     if require_full_eef_pose and len(df) > 0:
-        # Rotation validity ignored: training drops rot6d and only uses xyz+gripper.
-        del valid_rot
         missing = [name for name, arr in (("valid_pos", valid_pos), ("valid_open", valid_open)) if arr is None]
         if missing:
             raise ValueError(
@@ -269,6 +290,7 @@ def synchronize_robot_bimanual(
             valid_pos=valid_pos,
             valid_open=valid_open,
             n_frames=len(eef_raw),
+            required_slots=(0, 1),
         )
         eef_idx = df["eef_pose_index"].to_numpy(dtype=np.int64)
         in_range = (eef_idx >= 0) & (eef_idx < len(frame_ok))
@@ -279,7 +301,7 @@ def synchronize_robot_bimanual(
             df["master_index"] = np.arange(len(df), dtype=np.int64)
         print(
             f"  filtered incomplete EEF poses: kept {len(df)}/{n_before} "
-            f"(dropped {n_before - len(df)}, require xyz+gripper for both arms)"
+            f"(dropped {n_before - len(df)}, require xyz+gripper for both arms; orient ignored)"
         )
 
     # Validate index ranges against original stream lengths.
@@ -336,12 +358,13 @@ def synchronize_human_hands(
     increasing timeline and write pose_index into the *original* NPZ array.
 
     When require_full_pose is True (default), rows whose pose_index lacks
-    valid xyz + open/close for both hands are dropped. Rotation validity is
-    ignored. Pass valid_pos / valid_open from the NPZ.
+    valid xyz + open/close for both hands are dropped. Orientation / valid_rot
+    is ignored. Pass valid_pos / valid_open from the NPZ.
 
     Index columns:
       bird_index, front_index, pose_index
     """
+    del valid_rot  # orientation never gates sync validity
     bird = _assert_finite_1d("bird_cam", bird_ts)
     front = _assert_finite_1d("front_cam", front_ts)
     pose_raw = _assert_finite_1d("pose", pose_ts)
@@ -371,7 +394,6 @@ def synchronize_human_hands(
         df["pose_index"] = []
 
     if require_full_pose and len(df) > 0:
-        del valid_rot  # unused; rotation not supervised
         missing = [name for name, arr in (("valid_pos", valid_pos), ("valid_open", valid_open)) if arr is None]
         if missing:
             raise ValueError(
@@ -382,6 +404,7 @@ def synchronize_human_hands(
             valid_pos=valid_pos,
             valid_open=valid_open,
             n_frames=len(pose_raw),
+            required_slots=(0, 1),
         )
         pose_idx = df["pose_index"].to_numpy(dtype=np.int64)
         in_range = (pose_idx >= 0) & (pose_idx < len(frame_ok))
@@ -393,7 +416,7 @@ def synchronize_human_hands(
         n_dropped = n_before - len(df)
         print(
             f"  filtered incomplete poses: kept {len(df)}/{n_before} "
-            f"(dropped {n_dropped}, require xyz+open for both hands)"
+            f"(dropped {n_dropped}, require xyz+open for both hands; orient ignored)"
         )
 
     _validate_index_column(df, "bird_index", len(bird), label="human sync")
