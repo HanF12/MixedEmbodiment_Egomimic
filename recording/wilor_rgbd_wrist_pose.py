@@ -286,7 +286,9 @@ def _assign_detections_to_slots(
     slot_mode:
       - "is_right": trust WiLoR's `is_right` field (right->slot1, left->slot0)
       - "xpos": assign by image x position (leftmost->slot0, rightmost->slot1)
-      - "auto": try `is_right` first; if it collapses/conflicts, fall back to xpos.
+      - "auto" (default): trust `is_right` so left/right stay in fixed slots even
+        with a single hand. Fall back to xpos only if `is_right` is missing, or
+        if two detections collapse onto the same handedness label.
     """
     chosen: dict[int, dict | None] = {0: None, 1: None}
     if not dets:
@@ -318,9 +320,10 @@ def _assign_detections_to_slots(
 
     cand_sorted = sorted(cand, key=lambda t: area(t[0]), reverse=True)[:2]
 
-    # Path 1: assign by is_right
+    # Path 1: assign by is_right (keeps left=slot0 / right=slot1)
     if slot_mode in ("is_right", "auto"):
         tmp = {0: None, 1: None}
+        n_labeled = 0
         for d, u, xc in cand_sorted:
             try:
                 is_r = float(d.get("is_right", np.nan))
@@ -328,16 +331,18 @@ def _assign_detections_to_slots(
                 is_r = np.nan
             if not np.isfinite(is_r):
                 continue
+            n_labeled += 1
             slot = 1 if is_r > 0.5 else 0
             if tmp[slot] is None:
                 tmp[slot] = d
-        # If this cleanly fills both slots, accept.
-        if tmp[0] is not None and tmp[1] is not None:
-            return tmp
-        # If user explicitly requested is_right, return even if partial.
+        n_filled = int(tmp[0] is not None) + int(tmp[1] is not None)
         if slot_mode == "is_right":
             return tmp
-        # auto: fall through to xpos assignment if is_right didn't disambiguate
+        # auto: keep labeled slots (incl. single right hand -> slot1).
+        # Fall through only when labels are missing, or two dets share one label.
+        collapsed = len(cand_sorted) >= 2 and n_labeled >= 2 and n_filled < 2
+        if n_labeled > 0 and not collapsed:
+            return tmp
 
     if prev_u is not None and np.isfinite(prev_u).any() and len(cand_sorted) == 2:
         # Match each detection to closest previous slot u
@@ -1037,7 +1042,12 @@ def main():
         type=str,
         default="auto",
         choices=["auto", "is_right", "xpos"],
-        help="How to assign detections to (left,right) slots.",
+        help=(
+            "How to assign detections to (left,right) slots. "
+            "Default auto uses WiLoR is_right (left=slot0, right=slot1), "
+            "including single-hand videos; falls back to xpos only on missing/"
+            "conflicting labels."
+        ),
     )
     parser.add_argument(
         "--debug-overlay-video",

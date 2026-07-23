@@ -19,13 +19,13 @@ This script is designed to match the key / array schema of:
   - open_threshold:    scalar
   - pose_timeline:     scalar string (e.g. "bag")
 
-For single-arm mode (left OR right), the same keys are emitted but without the arm axis:
-  - pose:              (T, 10)
-  - valid_pos:         (T,)
-  - pose_xyz_raw:      (T, 3)
-  - R_raw:             (T, 3, 3)
-  - open_score_*:      (T,)
-etc.
+Single-arm mode (left OR right) still emits the **same bimanual schema** as hands:
+  - pose:              (T, 2, 10)  — unused arm slot is NaN with valid_*=False
+  - valid_pos:         (T, 2)
+  - pose_xyz_raw:      (T, 2, 3)
+  - R_raw:             (T, 2, 3, 3)
+  - open_score_*:      (T, 2)
+  Slot 0 = left, slot 1 = right (matches WiLoR / hand npz convention).
 
 Pose vector convention used here (length 10), matching `recording/test_plot_combined_pose.py`:
   [x, y, z, rot6d(6), open_flag]
@@ -213,7 +213,17 @@ def _build_single_arm_npz(
     open_threshold: float,
     pose_timeline: str,
     T_target_base: Optional[np.ndarray],
+    *,
+    arm: str,
 ) -> Dict[str, np.ndarray]:
+    """
+    Pack a single arm into the shared bimanual schema (T,2,...).
+    Unused slot is NaN / valid=False so hand and robot npzs match.
+    """
+    if arm not in ("left", "right"):
+        raise ValueError(f"arm must be 'left' or 'right', got {arm!r}")
+    slot = 0 if arm == "left" else 1
+
     timestamps = np.asarray(timestamps, dtype=np.float64).reshape(-1)
     T = timestamps.shape[0]
 
@@ -225,19 +235,29 @@ def _build_single_arm_npz(
     if T_target_base is not None:
         xyz = _apply_T(T_target_base, xyz)
 
-    valid_pos = np.ones((T,), dtype=bool)
-    valid_rot = np.ones((T,), dtype=bool)
-    valid_open = np.ones((T,), dtype=bool)
+    open_flag = open_signal > float(open_threshold)
 
-    open_score_raw = open_signal.astype(np.float64)
-    open_score_filled = open_score_raw.copy()
-    open_score_valid = np.ones((T,), dtype=bool)
-    open_flag = (open_score_filled > float(open_threshold)) & open_score_valid
+    pose = np.full((T, 2, 10), np.nan, dtype=np.float64)
+    pose_xyz_raw = np.full((T, 2, 3), np.nan, dtype=np.float64)
+    R_raw = np.full((T, 2, 3, 3), np.nan, dtype=np.float64)
+    open_score_raw = np.full((T, 2), np.nan, dtype=np.float64)
+    open_score_filled = np.full((T, 2), np.nan, dtype=np.float64)
+    open_score_valid = np.zeros((T, 2), dtype=bool)
+    valid_pos = np.zeros((T, 2), dtype=bool)
+    valid_rot = np.zeros((T, 2), dtype=bool)
+    valid_open = np.zeros((T, 2), dtype=bool)
 
-    pose = np.zeros((T, 10), dtype=np.float64)
-    pose[:, 0:3] = xyz
-    pose[:, 3:9] = rot6d
-    pose[:, 9] = open_flag.astype(np.float64)
+    pose[:, slot, 0:3] = xyz
+    pose[:, slot, 3:9] = rot6d
+    pose[:, slot, 9] = open_flag.astype(np.float64)
+    pose_xyz_raw[:, slot] = xyz
+    R_raw[:, slot] = R
+    open_score_raw[:, slot] = open_signal
+    open_score_filled[:, slot] = open_signal
+    open_score_valid[:, slot] = True
+    valid_pos[:, slot] = True
+    valid_rot[:, slot] = True
+    valid_open[:, slot] = True
 
     return {
         "timestamps": timestamps,
@@ -245,9 +265,9 @@ def _build_single_arm_npz(
         "valid_pos": valid_pos,
         "valid_rot": valid_rot,
         "valid_open": valid_open,
-        "pose_xyz_raw": xyz,
+        "pose_xyz_raw": pose_xyz_raw,
         "valid_pos_raw": valid_pos.copy(),
-        "R_raw": R,
+        "R_raw": R_raw,
         "valid_rot_raw": valid_rot.copy(),
         "open_score_raw": open_score_raw,
         "open_score_filled": open_score_filled,
@@ -410,8 +430,8 @@ def main() -> None:
     ap.add_argument(
         "--open_threshold",
         type=float,
-        default=1.1,
-        help="Stored in output for schema-compatibility (default matches reference files).",
+        default=0.7,
+        help="Binarize gripper joint (qpos[:,6]) as open when score > threshold. Default: 0.7.",
     )
     ap.add_argument(
         "--pose_timeline",
@@ -495,12 +515,18 @@ def main() -> None:
         if not args.dry_run:
             out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Gather candidate stamps from left positions by default.
-        stamps = sorted(set(_iter_stamps(joint_data_dir / "left" / "position")))
+        # Gather stamps from the arm(s) required by --mode.
+        stamp_dirs = []
+        if args.mode in ("left", "both"):
+            stamp_dirs.append(joint_data_dir / "left" / "position")
+        if args.mode in ("right", "both"):
+            stamp_dirs.append(joint_data_dir / "right" / "position")
+        stamps = sorted(set(s for d in stamp_dirs for s in _iter_stamps(d)))
         if args.stamp is not None:
             stamps = [args.stamp]
         if len(stamps) == 0:
-            raise FileNotFoundError(f"No joint_position_*.npy found under {joint_data_dir/'left/position'}")
+            searched = ", ".join(str(d) for d in stamp_dirs)
+            raise FileNotFoundError(f"No joint_position_*.npy found under: {searched}")
 
         for stamp in stamps:
             lp, lt, rp, rt = _resolve_files(joint_data_dir, stamp)
@@ -533,6 +559,7 @@ def main() -> None:
                     open_threshold=args.open_threshold,
                     pose_timeline=args.pose_timeline,
                     T_target_base=T_left,
+                    arm="left",
                 )
                 np.savez(out_path, **payload)
                 continue
@@ -552,6 +579,7 @@ def main() -> None:
                     open_threshold=args.open_threshold,
                     pose_timeline=args.pose_timeline,
                     T_target_base=T_right,
+                    arm="right",
                 )
                 np.savez(out_path, **payload)
                 continue
@@ -621,6 +649,7 @@ def main() -> None:
             open_threshold=args.open_threshold,
             pose_timeline=args.pose_timeline,
             T_target_base=T_left,
+            arm="left",
         )
         np.savez(out_path, **payload)
         return
@@ -638,6 +667,7 @@ def main() -> None:
             open_threshold=args.open_threshold,
             pose_timeline=args.pose_timeline,
             T_target_base=T_right,
+            arm="right",
         )
         np.savez(out_path, **payload)
         return
