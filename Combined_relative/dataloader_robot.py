@@ -13,9 +13,11 @@ from Combined_relative.config import (
     DEFAULT_NUM_QUERIES,
     EMBODIMENT_ROBOT,
     POSE_DIM,
+    ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD,
     ROBOT_JOINT_DIM,
     ROBOT_SYNC_INDEX_COLUMNS,
     ROBOT_TEMP_CUT_INDEX_COLUMNS,
+    binarize_flat_pose_grippers,
     camera_mask_tensor,
     concat_bimanual_joints,
     flatten_bimanual_pose,
@@ -33,6 +35,7 @@ from Combined_relative.dataloader_utils import (
     normalize_future_chunk,
     relative_pose_chunk,
     resolve_path,
+    zero_rgb_like,
 )
 
 
@@ -74,6 +77,7 @@ class RobotEpisodeDataset(Dataset):
         resize_factor: float = 1.0,
         max_sync_rows: int | None = None,
         require_valid_eef: bool = True,
+        disable_front_camera: bool = False,
     ) -> None:
         super().__init__()
         self.num_queries = int(num_queries)
@@ -81,6 +85,7 @@ class RobotEpisodeDataset(Dataset):
         self.resize_factor = float(resize_factor)
         self.max_sync_rows = int(max_sync_rows) if max_sync_rows is not None else None
         self.require_valid_eef = bool(require_valid_eef)
+        self.disable_front_camera = bool(disable_front_camera)
         self.image_transform = build_image_transform(transform)
 
         bird_vids = sorted(resolve_path(bird_vids_dir).glob("*.mp4"))
@@ -103,6 +108,8 @@ class RobotEpisodeDataset(Dataset):
         left_j_by = index_paths_by_demo_id(left_joints, demo_id_from_joint_npy)
         right_j_by = index_paths_by_demo_id(right_joints, demo_id_from_joint_npy)
         eef_by = index_paths_by_demo_id(eef_files, demo_id_from_robot_eef_npz)
+        if self.disable_front_camera:
+            print("Robot dataset: --no_front_camera → front images zeroed + masked out")
 
         self.bird_frames: list[np.ndarray] = []
         self.front_frames: list[np.ndarray] = []
@@ -121,13 +128,14 @@ class RobotEpisodeDataset(Dataset):
             rec_id = csv_path.stem
             needed = {
                 "bird": bird_by,
-                "front": front_by,
                 "left": left_by,
                 "right": right_by,
                 "left_joint": left_j_by,
                 "right_joint": right_j_by,
                 "eef_pose": eef_by,
             }
+            if not self.disable_front_camera:
+                needed["front"] = front_by
             missing = [k for k, m in needed.items() if rec_id not in m]
             if missing:
                 print(f"WARNING: skip robot {rec_id} missing {missing}")
@@ -188,9 +196,11 @@ class RobotEpisodeDataset(Dataset):
             bird_f = load_video_frames(bird_by[rec_id], resize_factor=self.resize_factor, label=f"bird({rec_id})")[
                 self.temp_cut :
             ]
-            front_f = load_video_frames(front_by[rec_id], resize_factor=self.resize_factor, label=f"front({rec_id})")[
-                self.temp_cut :
-            ]
+            front_f = None
+            if not self.disable_front_camera:
+                front_f = load_video_frames(
+                    front_by[rec_id], resize_factor=self.resize_factor, label=f"front({rec_id})"
+                )[self.temp_cut :]
             left_f = load_video_frames(left_by[rec_id], resize_factor=self.resize_factor, label=f"left({rec_id})")[
                 self.temp_cut :
             ]
@@ -207,7 +217,8 @@ class RobotEpisodeDataset(Dataset):
 
             for i in range(n_i):
                 self.bird_frames.append(bird_f[int(df.loc[i, "bird_index"])])
-                self.front_frames.append(front_f[int(df.loc[i, "front_index"])])
+                if front_f is not None:
+                    self.front_frames.append(front_f[int(df.loc[i, "front_index"])])
                 self.left_frames.append(left_f[int(df.loc[i, "left_index"])])
                 self.right_frames.append(right_f[int(df.loc[i, "right_index"])])
                 self.joint_data.append(
@@ -219,6 +230,10 @@ class RobotEpisodeDataset(Dataset):
                 )
                 eidx = int(df.loc[i, "eef_pose_index"])
                 flat = flatten_bimanual_pose(eef_arr[eidx], rec_id=rec_id)
+                # Binarize EEF gripper dims only (joint grippers untouched).
+                flat = binarize_flat_pose_grippers(
+                    flat, threshold=ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD
+                )
                 self.eef_pose_data.append(flat)
                 self.sample_demo_idx.append(demo_idx)
 
@@ -264,9 +279,14 @@ class RobotEpisodeDataset(Dataset):
         sample_idx = ep_start + start_in_ep
         demo_end = ep_start + ep_len
 
+        bird_t = self.image_transform(self.bird_frames[sample_idx])
+        if self.disable_front_camera:
+            front_t = self.image_transform(zero_rgb_like(self.bird_frames[sample_idx]))
+        else:
+            front_t = self.image_transform(self.front_frames[sample_idx])
         images = stack_camera_tensors(
-            self.image_transform(self.bird_frames[sample_idx]),
-            self.image_transform(self.front_frames[sample_idx]),
+            bird_t,
+            front_t,
             self.image_transform(self.left_frames[sample_idx]),
             self.image_transform(self.right_frames[sample_idx]),
         )
@@ -296,7 +316,9 @@ class RobotEpisodeDataset(Dataset):
         return {
             "embodiment": EMBODIMENT_ROBOT,
             "images": images,
-            "camera_mask": camera_mask_tensor(EMBODIMENT_ROBOT),
+            "camera_mask": camera_mask_tensor(
+                EMBODIMENT_ROBOT, disable_front=self.disable_front_camera
+            ),
             "pose_state": pose_state,
             "pose_actions": pose_actions,
             "joint_state": joint_state,

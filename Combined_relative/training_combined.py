@@ -8,7 +8,8 @@ Mixed human + robot ACT training with relative pose actions (EgoMimic-aligned).
 - Joint actions remain absolute
 - Shared pose head (human primary + robot aux); robot-only joint head
 - Modality routing (no embodiment embedding)
-- EgoMimic schedule/hyperparams: epochs x steps, batch 16, lr 5e-5, L1, kl=20, hand_lambda
+- Schedule: each epoch = one full pass over the longer modality's demo loader
+  (shorter modality recycled); batch 8, lr 1e-5, L1, kl=10, hand_lambda
 - Horizon K kept at 45
 """
 
@@ -38,7 +39,6 @@ if str(REPO_ROOT) not in sys.path:
 
 from Combined_relative.config import (  # noqa: E402
     DEFAULT_BATCH_SIZE,
-    DEFAULT_EPOCH_EVERY_N_STEPS,
     DEFAULT_HAND_LAMBDA,
     DEFAULT_HUMAN_DATA_ROOT,
     DEFAULT_KL_WEIGHT,
@@ -111,13 +111,11 @@ def parse_args() -> argparse.Namespace:
         "--epochs",
         type=int,
         default=DEFAULT_NUM_EPOCHS,
-        help=f"EgoMimic-style epochs (default {DEFAULT_NUM_EPOCHS}); each epoch runs epoch_every_n_steps updates.",
-    )
-    p.add_argument(
-        "--epoch_every_n_steps",
-        type=int,
-        default=DEFAULT_EPOCH_EVERY_N_STEPS,
-        help=f"Optimizer steps per epoch (default {DEFAULT_EPOCH_EVERY_N_STEPS}, EgoMimic).",
+        help=(
+            f"Number of epochs (default {DEFAULT_NUM_EPOCHS}). "
+            "Each epoch is one full pass over the longer modality's demo loader "
+            "(max batches); the shorter modality is recycled."
+        ),
     )
     p.add_argument("-b", "--batch", type=int, default=DEFAULT_BATCH_SIZE)
     p.add_argument("-q", "--num_queries", type=int, default=DEFAULT_NUM_QUERIES)
@@ -171,6 +169,12 @@ def parse_args() -> argparse.Namespace:
         help="Accumulate human+robot losses then one optimizer step (default, EgoMimic). "
         "Shorter modality demos are recycled so both sides contribute every step. "
         "Use --no-joint_modality_update for alternating single-modality steps.",
+    )
+    p.add_argument(
+        "--no_front_camera",
+        action="store_true",
+        help="Disable front camera for training: zero front RGB slot and set camera_mask[front]=0 "
+        "(bird+wrists for robot; bird-only for human). Front is still used only for sync CSVs.",
     )
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb_project", type=str, default="combined-mixed-act")
@@ -233,8 +237,6 @@ def apply_smoke_defaults(cli: argparse.Namespace) -> argparse.Namespace:
         cli.resize_factor = 0.25
     if cli.max_sync_rows is None:
         cli.max_sync_rows = 32
-    if cli.epoch_every_n_steps > 2:
-        cli.epoch_every_n_steps = 2
     if cli.epochs > 1 and not cli.dry_run:
         cli.epochs = 1
     if cli.robot_data_root is None:
@@ -588,6 +590,18 @@ def next_batch_recycling(loader_iter, loader):
         return next(loader_iter), loader_iter
 
 
+def steps_per_epoch_from_loaders(robot_loader, human_loader) -> int:
+    """One epoch = one full demo-set pass over the longer modality loader."""
+    lengths = []
+    if robot_loader is not None:
+        lengths.append(len(robot_loader))
+    if human_loader is not None:
+        lengths.append(len(human_loader))
+    if not lengths:
+        return 1
+    return max(1, max(lengths))
+
+
 def main() -> None:
     cli = parse_args()
     if cli.smoke:
@@ -663,6 +677,7 @@ def main() -> None:
             max_demos=cli.robot_demo_cap,
             resize_factor=cli.resize_factor,
             max_sync_rows=cli.max_sync_rows,
+            disable_front_camera=cli.no_front_camera,
         )
         np.savez(
             output_dir / "normalization_stats_robot.npz",
@@ -697,6 +712,7 @@ def main() -> None:
             max_demos=cli.human_demo_cap,
             resize_factor=cli.resize_factor,
             max_sync_rows=cli.max_sync_rows,
+            disable_front_camera=cli.no_front_camera,
         )
         np.savez(
             output_dir / "normalization_stats_human.npz",
@@ -725,14 +741,13 @@ def main() -> None:
         reconstruction_loss=cli.reconstruction_loss,
         joint_modality_update=cli.joint_modality_update,
         hand_lambda=cli.hand_lambda,
-        epoch_every_n_steps=cli.epoch_every_n_steps,
         num_epochs=cli.epochs,
         batch_size=cli.batch,
         lr=cli.lr,
+        disable_front_camera=cli.no_front_camera,
     )
     if human_pose_dir is not None:
         meta["human_pose_dir"] = str(human_pose_dir)
-    save_run_metadata(output_dir, meta)
 
     device = torch.device("cpu" if cli.cpu or not torch.cuda.is_available() else f"cuda:{cli.gpu_number}")
     print(f"Using device: {device}")
@@ -743,6 +758,17 @@ def main() -> None:
 
     robot_loader = make_loader(robot_ds, cli.batch, cli.num_workers, shuffle=True) if robot_ds is not None else None
     human_loader = make_loader(human_ds, cli.batch, cli.num_workers, shuffle=True) if human_ds is not None else None
+    steps_per_epoch = steps_per_epoch_from_loaders(robot_loader, human_loader)
+    if cli.smoke:
+        steps_per_epoch = min(steps_per_epoch, 2)
+    meta["steps_per_epoch"] = int(steps_per_epoch)
+    if robot_loader is not None:
+        meta["robot_loader_batches"] = len(robot_loader)
+        meta["robot_num_demos"] = len(robot_ds) if robot_ds is not None else None
+    if human_loader is not None:
+        meta["human_loader_batches"] = len(human_loader)
+        meta["human_num_demos"] = len(human_ds) if human_ds is not None else None
+    save_run_metadata(output_dir, meta)
 
     if cli.dry_run:
         print("--- Combined-relative dry run ---")
@@ -788,10 +814,10 @@ def main() -> None:
 
     best = float("inf")
     step = 0
-    # EgoMimic: each "epoch" = epoch_every_n_steps optimizer updates (not a full dataset pass).
-    steps_per_epoch = max(1, int(cli.epoch_every_n_steps))
     print(
-        f"Training schedule (EgoMimic-style): {cli.epochs} epochs x {steps_per_epoch} steps/epoch, "
+        f"Training schedule: {cli.epochs} epochs x {steps_per_epoch} steps/epoch "
+        f"(= max(robot_batches={len(robot_loader)}, human_batches={len(human_loader)}); "
+        f"shorter modality recycled), "
         f"batch={cli.batch}, lr={cli.lr}, recon={cli.reconstruction_loss}, "
         f"kl_weight={cli.kl_weight}, hand_lambda={cli.hand_lambda}, K={cli.num_queries}"
     )

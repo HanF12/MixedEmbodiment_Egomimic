@@ -32,11 +32,12 @@ DEFAULT_NUM_QUERIES = 45  # keep Combined horizon (EgoMimic uses 100)
 
 # EgoMimic-matched training defaults
 DEFAULT_NUM_EPOCHS = 10000
-DEFAULT_EPOCH_EVERY_N_STEPS = 100
-DEFAULT_BATCH_SIZE = 16
-DEFAULT_LR = 5e-5
+# One epoch = one full pass over the longer modality's demo loader
+# (max(len(robot_loader), len(human_loader))); shorter modality is recycled.
+DEFAULT_BATCH_SIZE = 8
+DEFAULT_LR = 1e-5
 DEFAULT_WEIGHT_DECAY = 1e-4
-DEFAULT_KL_WEIGHT = 20.0
+DEFAULT_KL_WEIGHT = 10.0
 DEFAULT_HAND_LAMBDA = 1.0
 DEFAULT_RECON_LOSS = "l1"
 
@@ -59,6 +60,10 @@ RAW_GRIP_INDEX = 9
 # --- Shared pose used in training (xyz + gripper only) ---
 POSE_DIM_PER_SIDE = 4  # xyz(3) + grip(1)
 POSE_DIM = 8  # left 4 + right 4
+# Gripper dims in flattened [8] pose: left grip, right grip
+POSE_GRIP_INDICES = (POSE_DIM_PER_SIDE - 1, POSE_DIM - 1)  # (3, 7)
+# Robot EEF NPZ grippers only (not joint-state grippers; not human pose)
+ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD = 0.8
 HUMAN_STATE_DIM = POSE_DIM
 HUMAN_PROPRIO_DIM = POSE_DIM
 ROBOT_PROPRIO_DIM = ROBOT_JOINT_DIM  # EgoMimic: joints only
@@ -67,6 +72,7 @@ ROBOT_PROPRIO_DIM = ROBOT_JOINT_DIM  # EgoMimic: joints only
 CAMERA_ORDER = ("bird", "front", "left_wrist", "right_wrist")
 MODEL_CAMERA_NAMES = ("cam0", "cam1", "cam2", "cam3")
 NUM_CAMERAS = 4
+FRONT_CAMERA_INDEX = CAMERA_ORDER.index("front")  # 1
 
 ROBOT_CAMERA_MASK = (1, 1, 1, 1)
 HUMAN_CAMERA_MASK = (1, 1, 0, 0)
@@ -168,6 +174,25 @@ def flatten_bimanual_pose(pose_t: np.ndarray | torch.Tensor, *, rec_id: str = ""
     return flat
 
 
+def binarize_flat_pose_grippers(
+    flat_pose: torch.Tensor | np.ndarray,
+    *,
+    threshold: float = ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD,
+) -> torch.Tensor:
+    """
+    Binarize left/right gripper dims in a flattened [8] pose.
+
+    grip -> 1.0 if grip >= threshold else 0.0. XYZ dims unchanged.
+    """
+    flat = torch.as_tensor(flat_pose, dtype=torch.float32).clone()
+    if flat.numel() != POSE_DIM:
+        raise ValueError(f"Expected flat pose dim {POSE_DIM}, got {flat.numel()}")
+    thr = float(threshold)
+    for idx in POSE_GRIP_INDICES:
+        flat[idx] = 1.0 if float(flat[idx]) >= thr else 0.0
+    return flat
+
+
 # Backward-compatible alias
 flatten_hand_pose = flatten_bimanual_pose
 
@@ -182,12 +207,16 @@ def stack_camera_tensors(
     return torch.stack([bird_frame, front_frame, left_frame, right_frame], dim=0)
 
 
-def camera_mask_tensor(embodiment: int) -> torch.Tensor:
+def camera_mask_tensor(embodiment: int, *, disable_front: bool = False) -> torch.Tensor:
     if int(embodiment) == EMBODIMENT_ROBOT:
-        return torch.tensor(ROBOT_CAMERA_MASK, dtype=torch.float32)
-    if int(embodiment) == EMBODIMENT_HUMAN:
-        return torch.tensor(HUMAN_CAMERA_MASK, dtype=torch.float32)
-    raise ValueError(f"Unknown embodiment id {embodiment}")
+        mask = list(ROBOT_CAMERA_MASK)
+    elif int(embodiment) == EMBODIMENT_HUMAN:
+        mask = list(HUMAN_CAMERA_MASK)
+    else:
+        raise ValueError(f"Unknown embodiment id {embodiment}")
+    if disable_front:
+        mask[FRONT_CAMERA_INDEX] = 0
+    return torch.tensor(mask, dtype=torch.float32)
 
 
 def build_run_metadata(
@@ -206,11 +235,17 @@ def build_run_metadata(
     reconstruction_loss: str = DEFAULT_RECON_LOSS,
     joint_modality_update: bool = True,
     hand_lambda: float = DEFAULT_HAND_LAMBDA,
-    epoch_every_n_steps: int = DEFAULT_EPOCH_EVERY_N_STEPS,
+    steps_per_epoch: int | None = None,
     num_epochs: int = DEFAULT_NUM_EPOCHS,
     batch_size: int = DEFAULT_BATCH_SIZE,
     lr: float = DEFAULT_LR,
+    disable_front_camera: bool = False,
 ) -> dict[str, Any]:
+    robot_mask = list(ROBOT_CAMERA_MASK)
+    human_mask = list(HUMAN_CAMERA_MASK)
+    if disable_front_camera:
+        robot_mask[FRONT_CAMERA_INDEX] = 0
+        human_mask[FRONT_CAMERA_INDEX] = 0
     return {
         "variant": "combined-egomimic-style",
         "pose_layout": "xyz+gripper only (8D); rot6d dropped at load",
@@ -221,8 +256,9 @@ def build_run_metadata(
         "robot_joint_dim": ROBOT_JOINT_DIM,
         "robot_proprio_dim": ROBOT_PROPRIO_DIM,
         "human_proprio_dim": HUMAN_PROPRIO_DIM,
-        "robot_camera_mask": list(ROBOT_CAMERA_MASK),
-        "human_camera_mask": list(HUMAN_CAMERA_MASK),
+        "disable_front_camera": bool(disable_front_camera),
+        "robot_camera_mask": robot_mask,
+        "human_camera_mask": human_mask,
         "num_queries": int(num_queries),
         "action_chunk_starts_at_current": bool(action_chunk_starts_at_current),
         "action_chunk_convention": (
@@ -241,8 +277,10 @@ def build_run_metadata(
         "human_pose_reldir": str(HUMAN_POSE_RELDIR),
         "gripper_semantics": (
             "shared last per-side dim: human open/close (typically binary); "
-            "robot gripper retained as-recorded"
+            f"robot EEF NPZ gripper binarized at load with threshold "
+            f"{ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD} (joint-state grippers unchanged)"
         ),
+        "robot_eef_gripper_binarize_threshold": float(ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD),
         "max_skew_s": float(max_skew_s),
         "pose_loss_weight": float(pose_loss_weight),
         "joint_loss_weight": float(joint_loss_weight),
@@ -251,7 +289,8 @@ def build_run_metadata(
         "reconstruction_loss": str(reconstruction_loss),
         "joint_modality_update": bool(joint_modality_update),
         "num_epochs": int(num_epochs),
-        "epoch_every_n_steps": int(epoch_every_n_steps),
+        "epoch_length": "max(len(robot_loader), len(human_loader)); shorter modality recycled",
+        "steps_per_epoch": int(steps_per_epoch) if steps_per_epoch is not None else None,
         "batch_size": int(batch_size),
         "lr": float(lr),
     }
