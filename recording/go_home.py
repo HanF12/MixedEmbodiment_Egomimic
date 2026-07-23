@@ -16,6 +16,9 @@ Typical usage (bimanual tabletop, dual.launch running):
   # Return to saved home later:
   python3 go_home.py --yes
 
+  # Open both grippers to stroke=1, hold arms still:
+  python3 go_home.py --yes --grippers-only --gripper-stroke 1
+
 Ctrl+C stops motion immediately.
 """
 
@@ -193,32 +196,64 @@ def go_home_arm(
     gripper_max: Optional[float],
     max_speed_rad_s: float,
     at_home_tol: float,
+    grippers_only: bool = False,
 ) -> None:
     import rospy
 
-    home_pose = clamp_home_joints(home_pose)
+    if grippers_only:
+        # Hold measured arm joints; home_pose[6] is the target published stroke
+        # (caller should pass gripper_scale=1.0 so raw==stroke).
+        goal_stroke_target = float(home_pose[6])
+        home_pose = start_pose.copy()
+        home_pose[6] = goal_stroke_target
+    else:
+        home_pose = clamp_home_joints(home_pose)
+
     delta = float(np.linalg.norm(shortest_joint_delta(start_pose[:6], home_pose[:6])))
-    if delta < at_home_tol:
-        rospy.loginfo(f"[{label}] Already at home (delta={delta:.4f} rad). Skipping.")
+    start_stroke = float(
+        apply_gripper_command(
+            start_pose, gripper_scale=gripper_scale, gripper_max=gripper_max
+        )[6]
+    )
+    goal_stroke = float(
+        apply_gripper_command(
+            home_pose, gripper_scale=gripper_scale, gripper_max=gripper_max
+        )[6]
+    )
+    grip_delta = abs(goal_stroke - start_stroke)
+    if (not grippers_only) and delta < at_home_tol and grip_delta < 0.5:
+        rospy.loginfo(
+            f"[{label}] Already at home (delta={delta:.4f} rad, grip={grip_delta:.2f}). Skipping."
+        )
+        return
+    if grippers_only and grip_delta < 1e-3:
+        rospy.loginfo(f"[{label}] Gripper already at target stroke={goal_stroke:.3f}. Skipping.")
         return
 
-    log_travel_warnings(label, start_pose, home_pose)
+    if not grippers_only:
+        log_travel_warnings(label, start_pose, home_pose)
 
-    speed = max_joint_speed(start_pose, home_pose, duration_sec)
-    if speed > max_speed_rad_s:
-        suggested = float(np.max(per_joint_travel(start_pose, home_pose))) / max_speed_rad_s
-        rospy.logwarn(
-            f"[{label}] Requested move may be fast ({speed:.2f} rad/s). "
-            f"Consider --duration-sec {suggested:.1f} or higher."
-        )
+        speed = max_joint_speed(start_pose, home_pose, duration_sec)
+        if speed > max_speed_rad_s:
+            suggested = float(np.max(per_joint_travel(start_pose, home_pose))) / max_speed_rad_s
+            rospy.logwarn(
+                f"[{label}] Requested move may be fast ({speed:.2f} rad/s). "
+                f"Consider --duration-sec {suggested:.1f} or higher."
+            )
 
     steps = max(1, int(round(duration_sec * rate_hz)))
-    rospy.loginfo(
-        f"[{label}] Homing over {steps} steps ({duration_sec:.1f}s @ {rate_hz:g} Hz), "
-        f"joint travel={delta:.3f} rad (shortest path)"
-    )
-    rospy.loginfo(f"[{label}] start arm = {np.round(start_pose[:6], 4).tolist()}")
-    rospy.loginfo(f"[{label}] goal  arm = {np.round(home_pose[:6], 4).tolist()}")
+    if grippers_only:
+        rospy.loginfo(
+            f"[{label}] Grippers-only over {steps} steps ({duration_sec:.1f}s @ {rate_hz:g} Hz), "
+            f"stroke {start_stroke:.3f} -> {goal_stroke:.3f}"
+        )
+    else:
+        rospy.loginfo(
+            f"[{label}] Homing over {steps} steps ({duration_sec:.1f}s @ {rate_hz:g} Hz), "
+            f"joint travel={delta:.3f} rad (shortest path)"
+        )
+        rospy.loginfo(f"[{label}] start arm = {np.round(start_pose[:6], 4).tolist()}")
+        rospy.loginfo(f"[{label}] goal  arm = {np.round(home_pose[:6], 4).tolist()}")
 
     rate = rospy.Rate(rate_hz)
     for step in range(steps):
@@ -258,7 +293,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--left-only", action="store_true", help="Home left slave arm only.")
     parser.add_argument("--right-only", action="store_true", help="Home right slave arm only.")
 
-    parser.add_argument("--duration-sec", type=float, default=20.0)
+    parser.add_argument("--duration-sec", type=float, default=12.0)
     parser.add_argument("--rate-hz", type=float, default=50.0)
     parser.add_argument("--hold-sec", type=float, default=2.0)
     parser.add_argument("--warmup-sec", type=float, default=2.0)
@@ -270,6 +305,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gripper-scale", type=float, default=30.2)
     parser.add_argument("--gripper-max", type=float, default=60.0)
     parser.add_argument("--gripper-raw", type=float, default=0.051)
+    parser.add_argument(
+        "--grippers-only",
+        action="store_true",
+        help="Hold current arm joints; only move both grippers to --gripper-stroke.",
+    )
+    parser.add_argument(
+        "--gripper-stroke",
+        type=float,
+        default=1.0,
+        help="Published gripper_stroke target used with --grippers-only (default: 1.0).",
+    )
 
     parser.add_argument("--home-joints", type=str, default=None)
     parser.add_argument("--home-joints-left", type=str, default=None)
@@ -390,7 +436,11 @@ def main() -> None:
 
     if do_left:
         start = read_current_pose(args.left_joint_states_topic, args.joint_state_timeout, "left")
-        home = resolve_home_pose(args, "left", saved_home)
+        if args.grippers_only:
+            home = start.copy()
+            home[6] = float(args.gripper_stroke)
+        else:
+            home = resolve_home_pose(args, "left", saved_home)
         replayer = JointReplayer(
             "left",
             args.left_arm_topic,
@@ -403,7 +453,11 @@ def main() -> None:
 
     if do_right:
         start = read_current_pose(args.right_joint_states_topic, args.joint_state_timeout, "right")
-        home = resolve_home_pose(args, "right", saved_home)
+        if args.grippers_only:
+            home = start.copy()
+            home[6] = float(args.gripper_stroke)
+        else:
+            home = resolve_home_pose(args, "right", saved_home)
         replayer = JointReplayer(
             "right",
             args.right_arm_topic,
@@ -417,19 +471,37 @@ def main() -> None:
     if not arms_plan:
         raise SystemExit("Nothing to home.")
 
-    gripper_max = None if args.gripper_max < 0 else args.gripper_max
+    # With --grippers-only, --gripper-stroke is the published command (no extra scale).
+    if args.grippers_only:
+        gripper_scale = 1.0
+        gripper_max = None if args.gripper_max < 0 else args.gripper_max
+    else:
+        gripper_scale = float(args.gripper_scale)
+        gripper_max = None if args.gripper_max < 0 else args.gripper_max
 
     for label, replayer, start, home in arms_plan:
         replayer.wait_for_subscribers(args.subscriber_timeout)
-        delta = float(np.linalg.norm(shortest_joint_delta(start[:6], home[:6])))
-        rospy.loginfo(f"[{label}] delta to home: {delta:.4f} rad (shortest path)")
+        if args.grippers_only:
+            rospy.loginfo(
+                f"[{label}] grippers-only: stroke -> {float(args.gripper_stroke):.3f} "
+                f"(arms held at current joints)"
+            )
+        else:
+            delta = float(np.linalg.norm(shortest_joint_delta(start[:6], home[:6])))
+            rospy.loginfo(f"[{label}] delta to home: {delta:.4f} rad (shortest path)")
 
     if not args.yes:
         labels = ", ".join(x[0] for x in arms_plan)
-        print(f"\nAbout to home: {labels}")
+        if args.grippers_only:
+            print(f"\nAbout to open grippers only: {labels} -> stroke={args.gripper_stroke:g}")
+        else:
+            print(f"\nAbout to home: {labels}")
         print(f"Duration: {args.duration_sec:.1f}s   Ctrl+C to abort during motion.")
         for label, _, start, home in arms_plan:
-            print(f"  {label} wrist: {start[5]:.3f} -> {home[5]:.3f} rad")
+            if args.grippers_only:
+                print(f"  {label} gripper raw={start[6]:.3f} -> stroke={home[6]:.3f}")
+            else:
+                print(f"  {label} wrist: {start[5]:.3f} -> {home[5]:.3f} rad")
         try:
             answer = input("Proceed? [y/N]: ").strip().lower()
         except EOFError:
@@ -448,10 +520,11 @@ def main() -> None:
                 duration_sec=args.duration_sec,
                 rate_hz=args.rate_hz,
                 hold_sec=args.hold_sec,
-                gripper_scale=args.gripper_scale,
+                gripper_scale=gripper_scale,
                 gripper_max=gripper_max,
                 max_speed_rad_s=args.max_speed_rad_s,
                 at_home_tol=args.at_home_tol,
+                grippers_only=bool(args.grippers_only),
             )
     except rospy.ROSInterruptException:
         rospy.loginfo("Homing interrupted (Ctrl+C).")
