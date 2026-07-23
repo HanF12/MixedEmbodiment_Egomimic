@@ -132,11 +132,12 @@ class HumanEpisodeDataset(Dataset):
                         k for k, v in (("valid_pos", valid_pos), ("valid_open", valid_open)) if v is None
                     ]
                     raise KeyError(f"{pose_by[rec_id].name} missing required validity keys: {missing_keys}")
-                # Rotation validity ignored; pose uses xyz+gripper only.
+                # Orientation / valid_rot ignored; pose uses xyz+gripper only.
                 frame_ok = xyz_gripper_valid_mask(
                     valid_pos=valid_pos,
                     valid_open=valid_open,
                     n_frames=len(pose_arr),
+                    required_slots=(0, 1),
                 )
 
             mask = (df["bird_index"].to_numpy() >= self.temp_cut) & (df["front_index"].to_numpy() >= self.temp_cut)
