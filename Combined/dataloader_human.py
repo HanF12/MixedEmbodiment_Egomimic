@@ -63,6 +63,7 @@ class HumanEpisodeDataset(Dataset):
         resize_factor: float = 1.0,
         max_sync_rows: int | None = None,
         require_valid_pos: bool = True,
+        disable_front_camera: bool = False,
     ) -> None:
         super().__init__()
         self.num_queries = int(num_queries)
@@ -70,6 +71,7 @@ class HumanEpisodeDataset(Dataset):
         self.resize_factor = float(resize_factor)
         self.max_sync_rows = int(max_sync_rows) if max_sync_rows is not None else None
         self.require_valid_pos = bool(require_valid_pos)
+        self.disable_front_camera = bool(disable_front_camera)
         self.image_transform = build_image_transform(transform)
 
         bird_vids = sorted(resolve_path(bird_vids_dir).glob("*.mp4"))
@@ -84,6 +86,8 @@ class HumanEpisodeDataset(Dataset):
         bird_by = index_paths_by_demo_id(bird_vids, demo_id_from_hash_filename)
         front_by = index_paths_by_demo_id(front_vids, demo_id_from_hash_filename)
         pose_by = index_paths_by_demo_id(pose_files, demo_id_from_pose_npz)
+        if self.disable_front_camera:
+            print("Human dataset: --no_front_camera → front images zeroed + masked out (bird only)")
 
         self.bird_frames: list[np.ndarray] = []
         self.front_frames: list[np.ndarray] = []
@@ -100,7 +104,7 @@ class HumanEpisodeDataset(Dataset):
             missing = []
             if rec_id not in bird_by:
                 missing.append("bird")
-            if rec_id not in front_by:
+            if (not self.disable_front_camera) and rec_id not in front_by:
                 missing.append("front")
             if rec_id not in pose_by:
                 missing.append("pose_npz")
@@ -134,11 +138,14 @@ class HumanEpisodeDataset(Dataset):
                     required_slots=(0, 1),
                 )
 
-            mask = (df["bird_index"].to_numpy() >= self.temp_cut) & (df["front_index"].to_numpy() >= self.temp_cut)
+            mask = df["bird_index"].to_numpy() >= self.temp_cut
+            if not self.disable_front_camera:
+                mask = mask & (df["front_index"].to_numpy() >= self.temp_cut)
             # pose_index indexes the original NPZ; do not temp_cut the pose timeline.
             df = df[mask].reset_index(drop=True)
             df["bird_index"] = df["bird_index"] - self.temp_cut
-            df["front_index"] = df["front_index"] - self.temp_cut
+            if not self.disable_front_camera:
+                df["front_index"] = df["front_index"] - self.temp_cut
             if df.empty:
                 continue
 
@@ -160,9 +167,11 @@ class HumanEpisodeDataset(Dataset):
             bird_f = load_video_frames(bird_by[rec_id], resize_factor=self.resize_factor, label=f"bird({rec_id})")[
                 self.temp_cut :
             ]
-            front_f = load_video_frames(front_by[rec_id], resize_factor=self.resize_factor, label=f"front({rec_id})")[
-                self.temp_cut :
-            ]
+            front_f = None
+            if not self.disable_front_camera:
+                front_f = load_video_frames(
+                    front_by[rec_id], resize_factor=self.resize_factor, label=f"front({rec_id})"
+                )[self.temp_cut :]
 
             demo_idx = self.num_demos
             self.demo_start_idx.append(len(self.pose_data))
@@ -171,10 +180,10 @@ class HumanEpisodeDataset(Dataset):
 
             for i in range(n_i):
                 bidx = int(df.loc[i, "bird_index"])
-                fidx = int(df.loc[i, "front_index"])
                 pidx = int(df.loc[i, "pose_index"])
                 self.bird_frames.append(bird_f[bidx])
-                self.front_frames.append(front_f[fidx])
+                if front_f is not None:
+                    self.front_frames.append(front_f[int(df.loc[i, "front_index"])])
                 self.pose_data.append(flatten_bimanual_pose(pose_arr[pidx], rec_id=rec_id))  # [20]
                 self.sample_demo_idx.append(demo_idx)
 
@@ -205,8 +214,11 @@ class HumanEpisodeDataset(Dataset):
         demo_end = ep_start + ep_len
 
         bird_t = self.image_transform(self.bird_frames[sample_idx])  # [3,H,W]
-        front_t = self.image_transform(self.front_frames[sample_idx])
         zero_np = zero_rgb_like(self.bird_frames[sample_idx])
+        if self.disable_front_camera:
+            front_t = self.image_transform(zero_np)
+        else:
+            front_t = self.image_transform(self.front_frames[sample_idx])
         left_t = self.image_transform(zero_np)
         right_t = self.image_transform(zero_np)
         images = stack_camera_tensors(bird_t, front_t, left_t, right_t)  # [4,3,H,W]
@@ -224,7 +236,9 @@ class HumanEpisodeDataset(Dataset):
         return {
             "embodiment": EMBODIMENT_HUMAN,
             "images": images,
-            "camera_mask": camera_mask_tensor(EMBODIMENT_HUMAN),
+            "camera_mask": camera_mask_tensor(
+                EMBODIMENT_HUMAN, disable_front=self.disable_front_camera
+            ),
             "pose_state": pose_state,
             "pose_actions": pose_actions,
             "joint_state": torch.zeros(ROBOT_JOINT_DIM, dtype=torch.float32),
