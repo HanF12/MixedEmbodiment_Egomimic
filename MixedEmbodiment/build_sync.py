@@ -28,8 +28,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from Combined.config import HUMAN_POSE_RELDIR, ROBOT_EEF_RELDIR
-from Combined.dataloader_utils import (
+from MixedEmbodiment.config import HUMAN_POSE_RELDIR, ROBOT_EEF_RELDIR
+from MixedEmbodiment.dataloader_utils import (
     demo_id_from_hash_filename,
     demo_id_from_joint_npy,
     demo_id_from_pose_npz,
