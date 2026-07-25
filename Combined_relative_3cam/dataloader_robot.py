@@ -246,7 +246,7 @@ class RobotEpisodeDataset(Dataset):
                 )
                 eidx = int(df.loc[i, "eef_pose_index"])
                 flat = flatten_bimanual_pose(eef_arr[eidx], rec_id=rec_id)
-                # Binarize EEF gripper dims only (joint grippers untouched).
+                # Binarize EEF pose grippers (joint grippers binarized in concat_bimanual_joints).
                 flat = binarize_flat_pose_grippers(
                     flat, threshold=ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD
                 )

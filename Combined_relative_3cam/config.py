@@ -15,6 +15,8 @@ Shared pose (human hands / robot EEF), EgoMimic-style shared head:
 
 Robot joints:
   14D = left 7 + right 7  (still absolute)
+  Gripper joint channels (indices 6 and 13) are binarized at load with the
+  same threshold as EEF pose grippers (ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD).
 
 Robot proprio for the model (EgoMimic-style): joints only [14]
 Human proprio: absolute pose [8]
@@ -69,7 +71,8 @@ POSE_DIM_PER_SIDE = 4  # xyz(3) + grip(1)
 POSE_DIM = 8  # left 4 + right 4
 # Gripper dims in flattened [8] pose: left grip, right grip
 POSE_GRIP_INDICES = (POSE_DIM_PER_SIDE - 1, POSE_DIM - 1)  # (3, 7)
-# Robot EEF NPZ grippers only (not joint-state grippers; not human pose)
+# Shared binarize threshold for robot EEF pose grippers and joint-state grippers.
+# Human pose open/close is left as-is (typically already binary).
 ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD = 0.8
 HUMAN_STATE_DIM = POSE_DIM
 HUMAN_PROPRIO_DIM = POSE_DIM
@@ -145,8 +148,15 @@ def concat_bimanual_joints(
     right_step: np.ndarray | torch.Tensor,
     *,
     rec_id: str = "",
+    binarize_grippers: bool = True,
+    gripper_threshold: float = ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD,
 ) -> torch.Tensor:
-    """Robot qpos: [7 left, 7 right] -> [14]."""
+    """
+    Robot qpos: [7 left, 7 right] -> [14].
+
+    By default, gripper joints (last channel per arm; flattened indices 6 and 13)
+    are binarized with the same threshold as EEF pose grippers.
+    """
     left_tensor = torch.as_tensor(left_step, dtype=torch.float32).reshape(-1)
     right_tensor = torch.as_tensor(right_step, dtype=torch.float32).reshape(-1)
     if left_tensor.numel() < JOINT_DIM_PER_ARM or right_tensor.numel() < JOINT_DIM_PER_ARM:
@@ -154,7 +164,12 @@ def concat_bimanual_joints(
             f"Expected >= {JOINT_DIM_PER_ARM} joints/arm for {rec_id or 'sample'}, "
             f"got left={left_tensor.numel()} right={right_tensor.numel()}"
         )
-    return torch.cat([left_tensor[:JOINT_DIM_PER_ARM], right_tensor[:JOINT_DIM_PER_ARM]], dim=0)
+    out = torch.cat([left_tensor[:JOINT_DIM_PER_ARM], right_tensor[:JOINT_DIM_PER_ARM]], dim=0)
+    if binarize_grippers:
+        thr = float(gripper_threshold)
+        for idx in GRIPPER_INDICES:
+            out[idx] = 1.0 if float(out[idx]) >= thr else 0.0
+    return out
 
 
 def flatten_bimanual_pose(pose_t: np.ndarray | torch.Tensor, *, rec_id: str = "") -> torch.Tensor:
@@ -281,11 +296,12 @@ def build_run_metadata(
         "human_pose_reldir": str(HUMAN_POSE_RELDIR),
         "gripper_semantics": (
             "shared last per-side dim: human open/close (typically binary); "
-            f"robot EEF NPZ gripper binarized at load with threshold "
-            f"{ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD} (joint-state grippers unchanged); "
+            f"robot EEF NPZ gripper and joint-state grippers binarized at load with "
+            f"threshold {ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD}; "
             "relative pose deltas include gripper dims"
         ),
         "robot_eef_gripper_binarize_threshold": float(ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD),
+        "robot_joint_gripper_binarize_threshold": float(ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD),
         "max_skew_s": float(max_skew_s),
         "pose_loss_weight": float(pose_loss_weight),
         "joint_loss_weight": float(joint_loss_weight),
