@@ -235,10 +235,44 @@ parser.add_argument("--topic_arm_left", type=str, default="/arm_joint_target_pos
 parser.add_argument("--topic_gripper_left", type=str, default="/gripper_position_control_slave_left")
 parser.add_argument("--topic_arm_right", type=str, default="/arm_joint_target_position_slave_right")
 parser.add_argument("--topic_gripper_right", type=str, default="/gripper_position_control_slave_right")
-parser.add_argument("--gripper_scale", type=float, default=48)
-parser.add_argument("--gripper_max", type=float, default=80)
+parser.add_argument(
+    "--gripper_mode",
+    choices=("binary", "continuous"),
+    default="binary",
+    help="binary: threshold denorm preds to 0/70; continuous: scale*pred then clamp to --gripper_max",
+)
+parser.add_argument(
+    "--gripper_threshold_left",
+    type=float,
+    default=0.7,
+    help="[binary] Left gripper: denormalized pred < threshold → 0, else 70",
+)
+parser.add_argument(
+    "--gripper_threshold_right",
+    type=float,
+    default=0.5,
+    help="[binary] Right gripper: denormalized pred < threshold → 0, else 70",
+)
+parser.add_argument(
+    "--gripper_scale_left",
+    type=float,
+    default=48.0,
+    help="[continuous] Multiply left denormalized gripper pred by this before publishing",
+)
+parser.add_argument(
+    "--gripper_scale_right",
+    type=float,
+    default=65.0,
+    help="[continuous] Multiply right denormalized gripper pred by this before publishing",
+)
+parser.add_argument(
+    "--gripper_max",
+    type=float,
+    default=80.0,
+    help="[continuous] Clamp scaled gripper cmd to this (set <0 to disable)",
+)
 parser.add_argument("--max_joint_speed", type=float, default=0.35)
-parser.add_argument("--max_gripper_speed", type=float, default=100)
+parser.add_argument("--max_gripper_speed", type=float, default=70)
 parser.add_argument("--bird_role", choices=("left", "right", "center", "front"), default="center")
 parser.add_argument("--bird_serial", type=str, default=None)
 parser.add_argument("--bird_color_fps", type=int, default=15)
@@ -379,24 +413,39 @@ try:
         else:
             positions_to_publish = predicted_trajectory_np[0].astype(np.float32)
 
-        positions_to_publish[list(GRIPPER_INDICES)] *= float(cli.gripper_scale)
-        if float(cli.gripper_max) >= 0:
-            positions_to_publish[GRIPPER_INDICES[0]] = min(float(positions_to_publish[GRIPPER_INDICES[0]]), float(cli.gripper_max))
-            positions_to_publish[GRIPPER_INDICES[1]] = min(float(positions_to_publish[GRIPPER_INDICES[1]]), float(cli.gripper_max))
+        raw_grip_l = float(positions_to_publish[GRIPPER_INDICES[0]])
+        raw_grip_r = float(positions_to_publish[GRIPPER_INDICES[1]])
+        thr_l = float(cli.gripper_threshold_left)
+        thr_r = float(cli.gripper_threshold_right)
+        if cli.gripper_mode == "binary":
+            cmd_l = 70.0 if raw_grip_l >= thr_l else 0.0
+            cmd_r = 70.0 if raw_grip_r >= thr_r else 0.0
+        else:
+            cmd_l = raw_grip_l * float(cli.gripper_scale_left)
+            cmd_r = raw_grip_r * float(cli.gripper_scale_right)
+            if float(cli.gripper_max) >= 0:
+                cmd_l = min(cmd_l, float(cli.gripper_max))
+                cmd_r = min(cmd_r, float(cli.gripper_max))
+        positions_to_publish[GRIPPER_INDICES[0]] = cmd_l
+        positions_to_publish[GRIPPER_INDICES[1]] = cmd_r
 
         desired = positions_to_publish.astype(np.float32)
         now_t = time.monotonic()
         if last_cmd is None or last_cmd_t is None:
-            # Seed in the same units as `desired` (gripper already scaled/clamped above).
             last_cmd = qpos_np.astype(np.float32).copy()
-            last_cmd[list(GRIPPER_INDICES)] *= float(cli.gripper_scale)
-            if float(cli.gripper_max) >= 0:
-                last_cmd[GRIPPER_INDICES[0]] = min(
-                    float(last_cmd[GRIPPER_INDICES[0]]), float(cli.gripper_max)
-                )
-                last_cmd[GRIPPER_INDICES[1]] = min(
-                    float(last_cmd[GRIPPER_INDICES[1]]), float(cli.gripper_max)
-                )
+            if cli.gripper_mode == "binary":
+                last_cmd[GRIPPER_INDICES[0]] = 70.0 if float(last_cmd[GRIPPER_INDICES[0]]) >= thr_l else 0.0
+                last_cmd[GRIPPER_INDICES[1]] = 70.0 if float(last_cmd[GRIPPER_INDICES[1]]) >= thr_r else 0.0
+            else:
+                last_cmd[GRIPPER_INDICES[0]] *= float(cli.gripper_scale_left)
+                last_cmd[GRIPPER_INDICES[1]] *= float(cli.gripper_scale_right)
+                if float(cli.gripper_max) >= 0:
+                    last_cmd[GRIPPER_INDICES[0]] = min(
+                        float(last_cmd[GRIPPER_INDICES[0]]), float(cli.gripper_max)
+                    )
+                    last_cmd[GRIPPER_INDICES[1]] = min(
+                        float(last_cmd[GRIPPER_INDICES[1]]), float(cli.gripper_max)
+                    )
             last_cmd_t = now_t
             # Hold measured pose on the seed step; first chase happens next cycle.
         else:
@@ -425,8 +474,21 @@ try:
             min_dt = 1.0 / max(1e-3, float(cli.display_max_fps))
             if wall - last_preview_t >= min_dt:
                 last_preview_t = wall
+                if cli.gripper_mode == "binary":
+                    mode_note = f"binary thr L/R={thr_l:g}/{thr_r:g}"
+                else:
+                    mode_note = (
+                        f"continuous scale L/R={cli.gripper_scale_left:g}/{cli.gripper_scale_right:g} "
+                        f"max={cli.gripper_max:g}"
+                    )
+                grip_overlay = (
+                    f"raw L/R={raw_grip_l:.3f}/{raw_grip_r:.3f} "
+                    f"-> cmd {desired[GRIPPER_INDICES[0]]:.1f}/{desired[GRIPPER_INDICES[1]]:.1f} "
+                    f"({mode_note})"
+                )
+                print(f"gripper {grip_overlay}", flush=True)
                 shown = [
-                    annotate(frame, [f"cam{idx} {label} ({serial})"])
+                    annotate(frame, [f"cam{idx} {label} ({serial})", grip_overlay])
                     for idx, (frame, (label, serial, _)) in enumerate(zip(frames, pipelines))
                 ]
                 shown = [maybe_resize(frame, float(cli.display_scale)) for frame in shown]

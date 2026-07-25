@@ -7,6 +7,7 @@ but drives Combined_relative.MixedDETRVAE with:
   - embodiment = robot
   - proprio = joint_state [14]  (robot_input_proj)
   - camera slots [bird, front, left_wrist, right_wrist], mask all ones
+    (use --no_front_camera for policies trained without front: zero front RGB + mask[front]=0)
   - control from joint_action_head only
 
 Relative vs absolute
@@ -274,10 +275,44 @@ parser.add_argument("--topic_arm_left", type=str, default="/arm_joint_target_pos
 parser.add_argument("--topic_gripper_left", type=str, default="/gripper_position_control_slave_left")
 parser.add_argument("--topic_arm_right", type=str, default="/arm_joint_target_position_slave_right")
 parser.add_argument("--topic_gripper_right", type=str, default="/gripper_position_control_slave_right")
-parser.add_argument("--gripper_scale", type=float, default=48)
-parser.add_argument("--gripper_max", type=float, default=80)
+parser.add_argument(
+    "--gripper_mode",
+    choices=("binary", "continuous"),
+    default="binary",
+    help="binary: threshold denorm preds to 0/70; continuous: scale*pred then clamp to --gripper_max",
+)
+parser.add_argument(
+    "--gripper_threshold_left",
+    type=float,
+    default=0.35,
+    help="[binary] Left gripper: denormalized pred < threshold → 0, else 70",
+)
+parser.add_argument(
+    "--gripper_threshold_right",
+    type=float,
+    default=0.35,
+    help="[binary] Right gripper: denormalized pred < threshold → 0, else 70",
+)
+parser.add_argument(
+    "--gripper_scale_left",
+    type=float,
+    default=65.0,
+    help="[continuous] Multiply left denormalized gripper pred by this before publishing",
+)
+parser.add_argument(
+    "--gripper_scale_right",
+    type=float,
+    default=65.0,
+    help="[continuous] Multiply right denormalized gripper pred by this before publishing",
+)
+parser.add_argument(
+    "--gripper_max",
+    type=float,
+    default=80.0,
+    help="[continuous] Clamp scaled gripper cmd to this (set <0 to disable)",
+)
 parser.add_argument("--max_joint_speed", type=float, default=0.35)
-parser.add_argument("--max_gripper_speed", type=float, default=100)
+parser.add_argument("--max_gripper_speed", type=float, default=70)
 parser.add_argument("--bird_role", choices=("left", "right", "center", "front"), default="center")
 parser.add_argument("--bird_serial", type=str, default=None)
 parser.add_argument("--bird_color_fps", type=int, default=15)
@@ -290,6 +325,13 @@ parser.add_argument("--left_wrist_color_fps", type=int, default=15)
 parser.add_argument("--right_wrist_role", choices=("left", "right", "center", "front"), default="right")
 parser.add_argument("--right_wrist_serial", type=str, default=None)
 parser.add_argument("--right_wrist_color_fps", type=int, default=15)
+parser.add_argument(
+    "--no_front_camera",
+    action="store_true",
+    help="Match training --no_front_camera: do not open the front RealSense, feed a zeroed "
+    "front RGB slot, and set camera_mask[front]=0. Also auto-enabled when checkpoint "
+    "run_metadata has disable_front_camera=true.",
+)
 cli = parser.parse_args(rospy.myargv(argv=sys.argv)[1:])
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -297,6 +339,8 @@ print(f"device={device} cuda_available={torch.cuda.is_available()}")
 
 checkpoint_path = resolve_path(cli.checkpoint)
 metadata = load_run_metadata(checkpoint_path.parent)
+meta_disable_front = bool(metadata.get("disable_front_camera", False)) if metadata else False
+disable_front_camera = bool(cli.no_front_camera) or meta_disable_front
 if metadata is not None:
     try:
         validate_run_metadata(metadata, num_queries=cli.num_queries)
@@ -306,6 +350,13 @@ if metadata is not None:
         )
     except ValueError as exc:
         print(f"Warning: skipping run_metadata validation: {exc}")
+    if meta_disable_front and not cli.no_front_camera:
+        print("run_metadata.disable_front_camera=true → enabling --no_front_camera")
+    if cli.no_front_camera and metadata.get("disable_front_camera") is False:
+        print(
+            "Warning: --no_front_camera set but checkpoint run_metadata has "
+            "disable_front_camera=false (trained with front camera)."
+        )
 
 model = build(Args(cli.num_queries)).to(device)
 state_dict = torch.load(str(checkpoint_path), map_location=device)
@@ -334,7 +385,13 @@ if human_norm_path.is_file():
 else:
     print(f"Warning: human normalization file not found: {human_norm_path}")
 
-robot_cam_mask = camera_mask_tensor(EMBODIMENT_ROBOT).unsqueeze(0).to(device)  # [1,4]
+robot_cam_mask = (
+    camera_mask_tensor(EMBODIMENT_ROBOT, disable_front=disable_front_camera)
+    .unsqueeze(0)
+    .to(device)
+)  # [1,4]
+if disable_front_camera:
+    print(f"Front camera disabled: camera_mask={robot_cam_mask.detach().cpu().numpy().tolist()}")
 # Dummy pose_state for API; robot path uses joint_state only.
 dummy_pose_state = torch.zeros(1, POSE_DIM, dtype=torch.float32, device=device)
 
@@ -348,10 +405,17 @@ color_width = int(cli.width)
 color_height = int(cli.height)
 camera_specs = [
     (CAMERA_ORDER[0], str(cli.bird_role), cli.bird_serial, int(cli.bird_color_fps)),
-    (CAMERA_ORDER[1], str(cli.front_role), cli.front_serial, int(cli.front_color_fps)),
-    (CAMERA_ORDER[2], str(cli.left_wrist_role), cli.left_wrist_serial, int(cli.left_wrist_color_fps)),
-    (CAMERA_ORDER[3], str(cli.right_wrist_role), cli.right_wrist_serial, int(cli.right_wrist_color_fps)),
 ]
+if not disable_front_camera:
+    camera_specs.append(
+        (CAMERA_ORDER[1], str(cli.front_role), cli.front_serial, int(cli.front_color_fps))
+    )
+camera_specs.extend(
+    [
+        (CAMERA_ORDER[2], str(cli.left_wrist_role), cli.left_wrist_serial, int(cli.left_wrist_color_fps)),
+        (CAMERA_ORDER[3], str(cli.right_wrist_role), cli.right_wrist_serial, int(cli.right_wrist_color_fps)),
+    ]
+)
 
 pipelines: list[tuple[str, str, rs.pipeline]] = []
 for label, role, serial_arg, fps in camera_specs:
@@ -393,11 +457,22 @@ try:
         if float(cli.resize_factor) != 1.0:
             frames = [maybe_resize(frame, float(cli.resize_factor)) for frame in frames]
 
+        frame_by_label = {
+            label: frame for (label, _, _), frame in zip(pipelines, frames)
+        }
+        bird_bgr = frame_by_label[CAMERA_ORDER[0]]
+        if disable_front_camera:
+            front_bgr = np.zeros_like(bird_bgr)
+        else:
+            front_bgr = frame_by_label[CAMERA_ORDER[1]]
+        left_bgr = frame_by_label[CAMERA_ORDER[2]]
+        right_bgr = frame_by_label[CAMERA_ORDER[3]]
+
         stacked_images = stack_camera_tensors(
-            to_resnet_norm_rgb_tensor(frames[0]),
-            to_resnet_norm_rgb_tensor(frames[1]),
-            to_resnet_norm_rgb_tensor(frames[2]),
-            to_resnet_norm_rgb_tensor(frames[3]),
+            to_resnet_norm_rgb_tensor(bird_bgr),
+            to_resnet_norm_rgb_tensor(front_bgr),
+            to_resnet_norm_rgb_tensor(left_bgr),
+            to_resnet_norm_rgb_tensor(right_bgr),
         ).unsqueeze(0).to(device)
 
         with torch.no_grad():
@@ -433,27 +508,40 @@ try:
         else:
             positions_to_publish = predicted_trajectory_np[0].astype(np.float32)
 
-        positions_to_publish[list(GRIPPER_INDICES)] *= float(cli.gripper_scale)
-        if float(cli.gripper_max) >= 0:
-            positions_to_publish[GRIPPER_INDICES[0]] = min(
-                float(positions_to_publish[GRIPPER_INDICES[0]]), float(cli.gripper_max)
-            )
-            positions_to_publish[GRIPPER_INDICES[1]] = min(
-                float(positions_to_publish[GRIPPER_INDICES[1]]), float(cli.gripper_max)
-            )
+        # Raw denormalized gripper preds, then map via --gripper_mode.
+        raw_grip_l = float(positions_to_publish[GRIPPER_INDICES[0]])
+        raw_grip_r = float(positions_to_publish[GRIPPER_INDICES[1]])
+        thr_l = float(cli.gripper_threshold_left)
+        thr_r = float(cli.gripper_threshold_right)
+        if cli.gripper_mode == "binary":
+            cmd_l = 70.0 if raw_grip_l >= thr_l else 0.0
+            cmd_r = 70.0 if raw_grip_r >= thr_r else 0.0
+        else:
+            cmd_l = raw_grip_l * float(cli.gripper_scale_left)
+            cmd_r = raw_grip_r * float(cli.gripper_scale_right)
+            if float(cli.gripper_max) >= 0:
+                cmd_l = min(cmd_l, float(cli.gripper_max))
+                cmd_r = min(cmd_r, float(cli.gripper_max))
+        positions_to_publish[GRIPPER_INDICES[0]] = cmd_l
+        positions_to_publish[GRIPPER_INDICES[1]] = cmd_r
 
         desired = positions_to_publish.astype(np.float32)
         now_t = time.monotonic()
         if last_cmd is None or last_cmd_t is None:
             last_cmd = qpos_np.astype(np.float32).copy()
-            last_cmd[list(GRIPPER_INDICES)] *= float(cli.gripper_scale)
-            if float(cli.gripper_max) >= 0:
-                last_cmd[GRIPPER_INDICES[0]] = min(
-                    float(last_cmd[GRIPPER_INDICES[0]]), float(cli.gripper_max)
-                )
-                last_cmd[GRIPPER_INDICES[1]] = min(
-                    float(last_cmd[GRIPPER_INDICES[1]]), float(cli.gripper_max)
-                )
+            if cli.gripper_mode == "binary":
+                last_cmd[GRIPPER_INDICES[0]] = 70.0 if float(last_cmd[GRIPPER_INDICES[0]]) >= thr_l else 0.0
+                last_cmd[GRIPPER_INDICES[1]] = 70.0 if float(last_cmd[GRIPPER_INDICES[1]]) >= thr_r else 0.0
+            else:
+                last_cmd[GRIPPER_INDICES[0]] *= float(cli.gripper_scale_left)
+                last_cmd[GRIPPER_INDICES[1]] *= float(cli.gripper_scale_right)
+                if float(cli.gripper_max) >= 0:
+                    last_cmd[GRIPPER_INDICES[0]] = min(
+                        float(last_cmd[GRIPPER_INDICES[0]]), float(cli.gripper_max)
+                    )
+                    last_cmd[GRIPPER_INDICES[1]] = min(
+                        float(last_cmd[GRIPPER_INDICES[1]]), float(cli.gripper_max)
+                    )
             last_cmd_t = now_t
         else:
             dt_nom = 1.0 / max(1e-3, float(cli.inference_fps))
@@ -480,9 +568,32 @@ try:
             min_dt = 1.0 / max(1e-3, float(cli.display_max_fps))
             if wall - last_preview_t >= min_dt:
                 last_preview_t = wall
+                if cli.gripper_mode == "binary":
+                    mode_note = f"binary thr L/R={thr_l:g}/{thr_r:g}"
+                else:
+                    mode_note = (
+                        f"continuous scale L/R={cli.gripper_scale_left:g}/{cli.gripper_scale_right:g} "
+                        f"max={cli.gripper_max:g}"
+                    )
+                grip_overlay = (
+                    f"raw L/R={raw_grip_l:.3f}/{raw_grip_r:.3f} "
+                    f"-> cmd {desired[GRIPPER_INDICES[0]]:.1f}/{desired[GRIPPER_INDICES[1]]:.1f} "
+                    f"({mode_note})"
+                )
+                print(f"gripper {grip_overlay}", flush=True)
+                preview_frames = [
+                    (CAMERA_ORDER[0], bird_bgr, "live"),
+                    (
+                        CAMERA_ORDER[1],
+                        front_bgr,
+                        "disabled/zeros" if disable_front_camera else "live",
+                    ),
+                    (CAMERA_ORDER[2], left_bgr, "live"),
+                    (CAMERA_ORDER[3], right_bgr, "live"),
+                ]
                 shown = [
-                    annotate(frame, [f"cam{idx} {label} ({serial})"])
-                    for idx, (frame, (label, serial, _)) in enumerate(zip(frames, pipelines))
+                    annotate(frame, [f"{label} ({note})", grip_overlay])
+                    for label, frame, note in preview_frames
                 ]
                 shown = [maybe_resize(frame, float(cli.display_scale)) for frame in shown]
                 h = min(frame.shape[0] for frame in shown)
