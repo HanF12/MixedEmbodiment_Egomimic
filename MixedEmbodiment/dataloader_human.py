@@ -1,4 +1,4 @@
-"""Human hand episode dataset for Combined-relative ACT (2 cameras + 8D hand pose)."""
+"""Human hand episode dataset for MixedEmbodiment ACT (bird + 8D hand pose)."""
 
 from __future__ import annotations
 
@@ -17,7 +17,6 @@ from MixedEmbodiment.config import (
     HUMAN_SYNC_INDEX_COLUMNS,
     camera_mask_tensor,
     flatten_bimanual_pose,
-    joint_loss_mask_for_side,
     stack_camera_tensors,
 )
 from MixedEmbodiment.data_synchronization import xyz_gripper_valid_mask
@@ -42,9 +41,10 @@ class HumanEpisodeDataset(Dataset):
     """
     One item = one human episode (random start inside episode).
 
-    Camera slots are always 4:
-      [bird, front, left_wrist=zeros, right_wrist=zeros]
-    camera_mask = [1,1,0,0]
+    Camera slots are always 3:
+      [bird, left_wrist=zeros, right_wrist=zeros]
+    camera_mask = [1,0,0]
+    Front is used only for sync CSVs, not as a model input.
 
     Hand pose from NPZ key `pose` with shape [T, 2, 10] -> xyz+gripper flattened [8]
     (rot6d dropped).
@@ -73,7 +73,6 @@ class HumanEpisodeDataset(Dataset):
         resize_factor: float = 1.0,
         max_sync_rows: int | None = None,
         require_valid_pos: bool = True,
-        disable_front_camera: bool = False,
         jpeg_in_ram: bool = False,
         jpeg_quality: int = 90,
     ) -> None:
@@ -83,7 +82,6 @@ class HumanEpisodeDataset(Dataset):
         self.resize_factor = float(resize_factor)
         self.max_sync_rows = int(max_sync_rows) if max_sync_rows is not None else None
         self.require_valid_pos = bool(require_valid_pos)
-        self.disable_front_camera = bool(disable_front_camera)
         self.jpeg_in_ram = bool(jpeg_in_ram)
         self.jpeg_quality = int(jpeg_quality)
         self.image_transform = build_image_transform(transform)
@@ -100,13 +98,11 @@ class HumanEpisodeDataset(Dataset):
         bird_by = index_paths_by_demo_id(bird_vids, demo_id_from_hash_filename)
         front_by = index_paths_by_demo_id(front_vids, demo_id_from_hash_filename)
         pose_by = index_paths_by_demo_id(pose_files, demo_id_from_pose_npz)
-        if self.disable_front_camera:
-            print("Human dataset: --no_front_camera → front images zeroed + masked out (bird only)")
+        print("Human dataset: 3-cam slots [bird, left_wrist=0, right_wrist=0]; front for sync only")
         if self.jpeg_in_ram:
             print(f"Human dataset: JPEG-in-RAM enabled (quality={self.jpeg_quality})")
 
         self.bird_frames: list = []
-        self.front_frames: list = []
         self.pose_data: list[torch.Tensor] = []
         self.sample_demo_idx: List[int] = []
         self.demo_start_idx: List[int] = []
@@ -114,14 +110,12 @@ class HumanEpisodeDataset(Dataset):
         self.num_demos = 0
         self.num_samples = 0
 
-        print("Loading human Combined-relative demos...")
+        print("Loading human MixedEmbodiment demos...")
         for csv_path in sync_csvs:
             rec_id = csv_path.stem
             missing = []
             if rec_id not in bird_by:
                 missing.append("bird")
-            if (not self.disable_front_camera) and rec_id not in front_by:
-                missing.append("front")
             if rec_id not in pose_by:
                 missing.append("pose_npz")
             if missing:
@@ -155,13 +149,12 @@ class HumanEpisodeDataset(Dataset):
                 )
 
             mask = df["bird_index"].to_numpy() >= self.temp_cut
-            if not self.disable_front_camera:
-                mask = mask & (df["front_index"].to_numpy() >= self.temp_cut)
+            mask = mask & (df["front_index"].to_numpy() >= self.temp_cut)
             # pose_index indexes the original NPZ; do not temp_cut the pose timeline.
+            # front_index only used for sync filtering (not loaded as a model camera).
             df = df[mask].reset_index(drop=True)
             df["bird_index"] = df["bird_index"] - self.temp_cut
-            if not self.disable_front_camera:
-                df["front_index"] = df["front_index"] - self.temp_cut
+            df["front_index"] = df["front_index"] - self.temp_cut
             if df.empty:
                 continue
 
@@ -183,12 +176,6 @@ class HumanEpisodeDataset(Dataset):
             bird_f = load_video_frames(bird_by[rec_id], resize_factor=self.resize_factor, label=f"bird({rec_id})")[
                 self.temp_cut :
             ]
-            front_f = None
-            if not self.disable_front_camera:
-                front_f = load_video_frames(
-                    front_by[rec_id], resize_factor=self.resize_factor, label=f"front({rec_id})"
-                )[self.temp_cut :]
-
             demo_idx = self.num_demos
             self.demo_start_idx.append(len(self.pose_data))
             n_i = len(df)
@@ -204,14 +191,6 @@ class HumanEpisodeDataset(Dataset):
                         jpeg_quality=self.jpeg_quality,
                     )
                 )
-                if front_f is not None:
-                    self.front_frames.append(
-                        store_frame(
-                            front_f[int(df.loc[i, "front_index"])],
-                            jpeg_in_ram=self.jpeg_in_ram,
-                            jpeg_quality=self.jpeg_quality,
-                        )
-                    )
                 self.pose_data.append(flatten_bimanual_pose(pose_arr[pidx], rec_id=rec_id))  # [8]
                 self.sample_demo_idx.append(demo_idx)
 
@@ -220,7 +199,7 @@ class HumanEpisodeDataset(Dataset):
             print(f"    -> human {rec_id}: {n_i} samples")
 
         if self.num_demos == 0:
-            raise FileNotFoundError("No complete human demos found for Combined-relative.")
+            raise FileNotFoundError("No complete human demos found for MixedEmbodiment.")
 
         all_p = torch.stack(self.pose_data, dim=0)  # [N, 8]
         # Absolute pose stats for proprio (pose_state)
@@ -238,9 +217,7 @@ class HumanEpisodeDataset(Dataset):
         # Backward-compatible aliases (state = absolute pose for human)
         self.state_mean = self.pose_abs_mean
         self.state_std = self.pose_abs_std
-        frame_bytes = sum(frame_nbytes(f) for f in self.bird_frames) + sum(
-            frame_nbytes(f) for f in self.front_frames
-        )
+        frame_bytes = sum(frame_nbytes(f) for f in self.bird_frames)
         print(
             f"Human dataset ready: demos={self.num_demos} samples={self.num_samples} "
             f"(pose actions relative to chunk-anchor; "
@@ -262,13 +239,9 @@ class HumanEpisodeDataset(Dataset):
         bird_np = load_frame(self.bird_frames[sample_idx])
         bird_t = self.image_transform(bird_np)  # [3,H,W]
         zero_np = zero_rgb_like(bird_np)
-        if self.disable_front_camera:
-            front_t = self.image_transform(zero_np)
-        else:
-            front_t = self.image_transform(load_frame(self.front_frames[sample_idx]))
         left_t = self.image_transform(zero_np)
         right_t = self.image_transform(zero_np)
-        images = stack_camera_tensors(bird_t, front_t, left_t, right_t)  # [4,3,H,W]
+        images = stack_camera_tensors(bird_t, left_t, right_t)  # [3,3,H,W]
 
         pose_raw = self.pose_data[sample_idx]  # [8] absolute, chunk anchor
         pose_state = (pose_raw - self.pose_abs_mean) / self.pose_abs_std
@@ -283,14 +256,11 @@ class HumanEpisodeDataset(Dataset):
         return {
             "embodiment": EMBODIMENT_HUMAN,
             "images": images,
-            "camera_mask": camera_mask_tensor(
-                EMBODIMENT_HUMAN, disable_front=self.disable_front_camera
-            ),
+            "camera_mask": camera_mask_tensor(EMBODIMENT_HUMAN),
             "pose_state": pose_state,
             "pose_actions": pose_actions,
             "joint_state": torch.zeros(ROBOT_JOINT_DIM, dtype=torch.float32),
             "joint_actions": torch.zeros(self.num_queries, ROBOT_JOINT_DIM, dtype=torch.float32),
-            "joint_loss_mask": torch.zeros(ROBOT_JOINT_DIM, dtype=torch.float32),
             "has_joint_target": False,
             "is_pad": is_pad,
         }
@@ -304,18 +274,17 @@ def collate_homogeneous(batch: list[dict]) -> dict:
         raise ValueError("collate_homogeneous requires a single embodiment per batch")
     if any(bool(b["has_joint_target"]) != has_joint for b in batch):
         raise ValueError("collate_homogeneous requires uniform has_joint_target")
-    return {
+    out = {
         "embodiment": emb,
-        "images": torch.stack([b["images"] for b in batch], dim=0),  # [B,4,3,H,W]
-        "camera_mask": torch.stack([b["camera_mask"] for b in batch], dim=0),  # [B,4]
+        "images": torch.stack([b["images"] for b in batch], dim=0),  # [B,3,3,H,W]
+        "camera_mask": torch.stack([b["camera_mask"] for b in batch], dim=0),  # [B,3]
         "pose_state": torch.stack([b["pose_state"] for b in batch], dim=0),  # [B,8]
         "pose_actions": torch.stack([b["pose_actions"] for b in batch], dim=0),  # [B,K,8]
         "joint_state": torch.stack([b["joint_state"] for b in batch], dim=0),  # [B,14]
         "joint_actions": torch.stack([b["joint_actions"] for b in batch], dim=0),  # [B,K,14]
-        "joint_loss_mask": torch.stack(
-            [b.get("joint_loss_mask", joint_loss_mask_for_side(full=has_joint)) for b in batch],
-            dim=0,
-        ),  # [B,14]
         "has_joint_target": has_joint,
         "is_pad": torch.stack([b["is_pad"] for b in batch], dim=0),  # [B,K]
     }
+    if "joint_loss_mask" in batch[0]:
+        out["joint_loss_mask"] = torch.stack([b["joint_loss_mask"] for b in batch], dim=0)
+    return out

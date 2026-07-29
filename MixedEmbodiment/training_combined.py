@@ -1,14 +1,16 @@
 """
-MixedEmbodiment ACT training (robot + human + optional mixed hand/arm).
+MixedEmbodiment ACT training (robot + human + mixed hand/arm).
 
-Fork of Combined_relative Method A:
+Architecture aligned with Combined_relative_3cam (true 3-cam):
 - Pose = xyz+gripper only (8D); rot6d dropped at load
 - Pose actions relative to chunk anchor; joint actions absolute
-- Third modality (mixed): one hand + one robot arm
+- Cams = [bird, left_wrist, right_wrist]; front for sync only
+- Third modality (mixed): Concat(left_robot_right_hand, right_robot_left_hand)
 - Joint modality update averages available modality losses:
     L = mean(L_robot, L_human, L_mixed)
 - Mixed uses robot proprio/CVAE; joint loss masked to active arm
 - Schedule: epoch = max loader lengths; shorter modalities recycled
+- hand_lambda / mixed_lambda scale human / mixed losses (CLI or config defaults)
 """
 
 from __future__ import annotations
@@ -47,21 +49,26 @@ from MixedEmbodiment.config import (  # noqa: E402
     DEFAULT_HUMAN_DATA_ROOT,
     DEFAULT_KL_WEIGHT,
     DEFAULT_LR,
+    DEFAULT_MIXED_DATA_ROOTS,
+    DEFAULT_MIXED_LAMBDA,
     DEFAULT_NUM_EPOCHS,
     DEFAULT_NUM_QUERIES,
     DEFAULT_RECON_LOSS,
     DEFAULT_ROBOT_DATA_ROOT,
+    DEFAULT_SESSIONS_ROOT,
     DEFAULT_WEIGHT_DECAY,
     EMBODIMENT_HUMAN,
     EMBODIMENT_MIXED,
     EMBODIMENT_ROBOT,
     HUMAN_POSE_RELDIR,
     MODEL_CAMERA_NAMES,
+    NUM_CAMERAS,
     POSE_DIM,
     ROBOT_EEF_RELDIR,
     ROBOT_JOINT_DIM,
     build_run_metadata,
     default_run_name,
+    discover_sessions_roots,
     joint_loss_mask_for_side,
     save_run_metadata,
 )
@@ -71,7 +78,10 @@ from MixedEmbodiment.data_synchronization import (  # noqa: E402
     synchronize_robot_bimanual,
 )
 from MixedEmbodiment.dataloader_human import HumanEpisodeDataset, collate_homogeneous  # noqa: E402
-from MixedEmbodiment.dataloader_mixed import MixedEpisodeDataset  # noqa: E402
+from MixedEmbodiment.dataloader_mixed import (  # noqa: E402
+    ConcatMixedEpisodeDataset,
+    MixedEpisodeDataset,
+)
 from MixedEmbodiment.dataloader_robot import RobotEpisodeDataset  # noqa: E402
 from MixedEmbodiment.dataloader_utils import (  # noqa: E402
     demo_id_from_hash_filename,
@@ -83,27 +93,51 @@ from MixedEmbodiment.dataloader_utils import (  # noqa: E402
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="MixedEmbodiment ACT training (robot + human + optional mixed)"
+        description="MixedEmbodiment ACT training (robot + human + mixed 3-cam)"
+    )
+    p.add_argument(
+        "--sessions_root",
+        type=str,
+        default=str(DEFAULT_SESSIONS_ROOT),
+        help=(
+            f"Top-level sessions tree (default: {DEFAULT_SESSIONS_ROOT}). "
+            "Discovers teleop_bimanual/<date>, human_hands_bimanual_raw/<date>, "
+            "and mixed left_robot_right_hand|right_robot_left_hand/<date> automatically. "
+            "Explicit --robot_data_root / --human_data_root / --mixed_data_root override."
+        ),
     )
     p.add_argument(
         "--robot_data_root",
         type=str,
-        default=str(DEFAULT_ROBOT_DATA_ROOT),
-        help=f"Robot teleop root (default: {DEFAULT_ROBOT_DATA_ROOT})",
+        default=None,
+        help=f"Robot teleop date root override (default: latest under "
+        f"<sessions_root>/teleop_bimanual, e.g. {DEFAULT_ROBOT_DATA_ROOT})",
     )
     p.add_argument(
         "--human_data_root",
         type=str,
-        default=str(DEFAULT_HUMAN_DATA_ROOT),
-        help=f"Human hands root (default: {DEFAULT_HUMAN_DATA_ROOT})",
+        default=None,
+        help=f"Human hands date root override (default: latest under "
+        f"<sessions_root>/human_hands_bimanual_raw, e.g. {DEFAULT_HUMAN_DATA_ROOT})",
     )
     p.add_argument("--robot_sync_dir", type=str, default=None)
     p.add_argument("--human_sync_dir", type=str, default=None)
     p.add_argument(
         "--mixed_data_root",
         type=str,
+        action="append",
         default=None,
-        help="Mixed one-hand+one-arm session root (e.g. recording/sessions/left_robot_right_hand/0720)",
+        help=(
+            "Mixed session date root override (repeatable). Default: all date folders under "
+            f"{DEFAULT_MIXED_DATA_ROOTS[0].parent.name}/ and "
+            f"{DEFAULT_MIXED_DATA_ROOTS[1].parent.name}/ inside --sessions_root, "
+            "concatenated as one modality."
+        ),
+    )
+    p.add_argument(
+        "--no_mixed",
+        action="store_true",
+        help="Disable mixed modality even if mixed session folders exist.",
     )
     p.add_argument("--mixed_sync_dir", type=str, default=None)
     p.add_argument("--mixed_hand_pose_dir", type=str, default=None)
@@ -193,6 +227,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--kl_weight", type=float, default=DEFAULT_KL_WEIGHT)
     p.add_argument("--hand_lambda", type=float, default=DEFAULT_HAND_LAMBDA, help="EgoMimic human loss scale")
     p.add_argument(
+        "--mixed_lambda",
+        type=float,
+        default=DEFAULT_MIXED_LAMBDA,
+        help=(
+            f"Mixed modality loss scale (default {DEFAULT_MIXED_LAMBDA}). "
+            "Applied as L_mixed = mixed_lambda * (pose + joint + KL) before the "
+            "equal mean over modalities. To approximate not recycling mixed demos, "
+            "use len(mixed_loader)/steps_per_epoch (= mixed_batches / max batches)."
+        ),
+    )
+    p.add_argument(
         "--reconstruction_loss",
         type=str,
         choices=("mse", "l1"),
@@ -206,14 +251,8 @@ def parse_args() -> argparse.Namespace:
         "Shorter modality demos are recycled. "
         "Use --no-joint_modality_update for alternating single-modality steps.",
     )
-    p.add_argument(
-        "--no_front_camera",
-        action="store_true",
-        help="Disable front camera for training: zero front RGB slot and set camera_mask[front]=0 "
-        "(bird+wrists for robot; bird-only for human). Front is still used only for sync CSVs.",
-    )
     p.add_argument("--wandb", action="store_true")
-    p.add_argument("--wandb_project", type=str, default="combined-mixed-act")
+    p.add_argument("--wandb_project", type=str, default="mixed-embodiment-3cam-act")
     p.add_argument("--wandb_entity", type=str, default=None)
     p.add_argument("--wandb_run_name", type=str, default=None)
     p.add_argument("--wandb_mode", type=str, default="online")
@@ -282,8 +321,11 @@ def apply_smoke_defaults(cli: argparse.Namespace) -> argparse.Namespace:
         cli.max_sync_rows = 32
     if cli.epochs > 1 and not cli.dry_run:
         cli.epochs = 1
+    # Only fall back to synthetic robot if sessions discovery also finds nothing.
     if cli.robot_data_root is None:
-        cli.synthetic_robot = True
+        discovered = discover_sessions_roots(Path(cli.sessions_root).expanduser().resolve())
+        if discovered["robot_data_root"] is None:
+            cli.synthetic_robot = True
     cli = resolve_demo_caps(cli)
     print(
         "SMOKE MODE: "
@@ -457,8 +499,8 @@ def synthetic_robot_batch(batch_size: int, num_queries: int, h: int = 120, w: in
     device = device or torch.device("cpu")
     return {
         "embodiment": EMBODIMENT_ROBOT,
-        "images": torch.randn(batch_size, 4, 3, h, w, device=device),
-        "camera_mask": torch.ones(batch_size, 4, device=device),
+        "images": torch.randn(batch_size, NUM_CAMERAS, 3, h, w, device=device),
+        "camera_mask": torch.ones(batch_size, NUM_CAMERAS, device=device),
         "pose_state": torch.randn(batch_size, POSE_DIM, device=device),
         "pose_actions": torch.randn(batch_size, num_queries, POSE_DIM, device=device),
         "joint_state": torch.randn(batch_size, ROBOT_JOINT_DIM, device=device),
@@ -473,8 +515,8 @@ def synthetic_human_batch(batch_size: int, num_queries: int, h: int = 120, w: in
     device = device or torch.device("cpu")
     return {
         "embodiment": EMBODIMENT_HUMAN,
-        "images": torch.randn(batch_size, 4, 3, h, w, device=device),
-        "camera_mask": torch.tensor([1.0, 1.0, 0.0, 0.0], device=device).expand(batch_size, -1).clone(),
+        "images": torch.randn(batch_size, NUM_CAMERAS, 3, h, w, device=device),
+        "camera_mask": torch.tensor([1.0, 0.0, 0.0], device=device).expand(batch_size, -1).clone(),
         "pose_state": torch.randn(batch_size, POSE_DIM, device=device),
         "pose_actions": torch.randn(batch_size, num_queries, POSE_DIM, device=device),
         "joint_state": torch.zeros(batch_size, ROBOT_JOINT_DIM, device=device),
@@ -490,8 +532,8 @@ def synthetic_mixed_batch(batch_size: int, num_queries: int, h: int = 120, w: in
     mask = joint_loss_mask_for_side("left").to(device).unsqueeze(0).expand(batch_size, -1).clone()
     return {
         "embodiment": EMBODIMENT_MIXED,
-        "images": torch.randn(batch_size, 4, 3, h, w, device=device),
-        "camera_mask": torch.tensor([1.0, 1.0, 1.0, 0.0], device=device).expand(batch_size, -1).clone(),
+        "images": torch.randn(batch_size, NUM_CAMERAS, 3, h, w, device=device),
+        "camera_mask": torch.tensor([1.0, 1.0, 0.0], device=device).expand(batch_size, -1).clone(),
         "pose_state": torch.randn(batch_size, POSE_DIM, device=device),
         "pose_actions": torch.randn(batch_size, num_queries, POSE_DIM, device=device),
         "joint_state": torch.randn(batch_size, ROBOT_JOINT_DIM, device=device),
@@ -540,11 +582,13 @@ def compute_batch_losses(
     kl_w,
     recon_kind,
     hand_lambda,
+    mixed_lambda,
 ) -> dict:
     """
     EgoMimic-style losses:
       human: hand_lambda * (pose_recon + kl)
-      robot / mixed: pose_recon + joint_recon(+dim mask) + kl
+      mixed: mixed_lambda * (pose_recon + joint_recon(+dim mask) + kl)
+      robot: pose_recon + joint_recon + kl
     """
     pose_state = batch["pose_state"].to(device)
     joint_state = batch["joint_state"].to(device)
@@ -583,7 +627,11 @@ def compute_batch_losses(
         joint_loss = masked_recon_loss(
             joint_pred, joint_actions, is_pad, kind=recon_kind, dim_mask=joint_dim_mask
         )
-        loss = pose_w * pose_loss + joint_w * joint_loss + kl_w * kld
+        base = pose_w * pose_loss + joint_w * joint_loss + kl_w * kld
+        if embodiment == EMBODIMENT_MIXED:
+            loss = float(mixed_lambda) * base
+        else:
+            loss = base
         joint_pred_shape = tuple(joint_pred.shape)
     else:
         joint_loss = pose_pred.new_zeros(())
@@ -713,16 +761,37 @@ def main() -> None:
 
     robot_root = Path(cli.robot_data_root).expanduser().resolve() if cli.robot_data_root else None
     human_root = Path(cli.human_data_root).expanduser().resolve() if cli.human_data_root else None
-    mixed_root = (
-        Path(cli.mixed_data_root).expanduser().resolve()
-        if getattr(cli, "mixed_data_root", None)
-        else None
-    )
 
-    if robot_root is None and human_root is None and mixed_root is None and not cli.synthetic_robot:
+    sessions_root = Path(cli.sessions_root).expanduser().resolve()
+    discovered = discover_sessions_roots(sessions_root)
+    if robot_root is None:
+        robot_root = discovered["robot_data_root"]  # type: ignore[assignment]
+    if human_root is None:
+        human_root = discovered["human_data_root"]  # type: ignore[assignment]
+
+    if getattr(cli, "no_mixed", False):
+        mixed_roots: list[Path] = []
+    elif cli.mixed_data_root:
+        mixed_roots = [Path(p).expanduser().resolve() for p in cli.mixed_data_root]
+    else:
+        mixed_roots = list(discovered["mixed_data_roots"])  # type: ignore[arg-type]
+        if mixed_roots:
+            print(
+                f"Discovered mixed roots under {sessions_root} "
+                f"({len(mixed_roots)}): {[str(p) for p in mixed_roots]}"
+            )
+
+    if robot_root is not None:
+        print(f"Robot data root: {robot_root}")
+    if human_root is not None:
+        print(f"Human data root: {human_root}")
+
+    if robot_root is None and human_root is None and not mixed_roots and not cli.synthetic_robot:
         raise ValueError(
-            "Provide --robot_data_root and/or --human_data_root and/or --mixed_data_root "
-            "(or --smoke/--synthetic_robot)."
+            f"No data found under --sessions_root={sessions_root}. "
+            "Expected teleop_bimanual/<date>, human_hands_bimanual_raw/<date>, "
+            "and/or left_robot_right_hand|right_robot_left_hand/<date>, "
+            "or pass explicit --robot_data_root / --human_data_root / --mixed_data_root."
         )
 
     robot_sync = (
@@ -734,11 +803,6 @@ def main() -> None:
         Path(cli.human_sync_dir).expanduser().resolve()
         if cli.human_sync_dir
         else (pkg / "m-synced-csvs" / f"{human_root.name if human_root else 'none'}_human")
-    )
-    mixed_sync = (
-        Path(cli.mixed_sync_dir).expanduser().resolve()
-        if getattr(cli, "mixed_sync_dir", None)
-        else (pkg / "m-synced-csvs" / f"{mixed_root.name if mixed_root else 'none'}_mixed")
     )
 
     robot_eef_dir = resolve_robot_eef_dir(robot_root, cli.robot_eef_dir) if robot_root else None
@@ -755,17 +819,21 @@ def main() -> None:
     output_dir = weights_root / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # mixed_lambda: CLI overrides DEFAULT_MIXED_LAMBDA in config.py
+    mixed_lambda = float(cli.mixed_lambda)
     loss_cfg = {
         "pose_w": float(cli.pose_loss_weight),
         "joint_w": float(cli.joint_loss_weight),
         "kl_w": float(cli.kl_weight),
         "recon_kind": str(cli.reconstruction_loss),
         "hand_lambda": float(cli.hand_lambda),
+        "mixed_lambda": mixed_lambda,
     }
 
     robot_ds = None
     human_ds = None
     mixed_ds = None
+    mixed_sync_dirs: list[Path] = []
 
     if robot_root is not None:
         if not robot_root.exists():
@@ -786,7 +854,6 @@ def main() -> None:
             max_demos=cli.robot_demo_cap,
             resize_factor=cli.resize_factor,
             max_sync_rows=cli.max_sync_rows,
-            disable_front_camera=cli.no_front_camera,
             jpeg_in_ram=cli.jpeg_in_ram,
             jpeg_quality=cli.jpeg_quality,
         )
@@ -823,7 +890,6 @@ def main() -> None:
             max_demos=cli.human_demo_cap,
             resize_factor=cli.resize_factor,
             max_sync_rows=cli.max_sync_rows,
-            disable_front_camera=cli.no_front_camera,
             jpeg_in_ram=cli.jpeg_in_ram,
             jpeg_quality=cli.jpeg_quality,
         )
@@ -840,53 +906,80 @@ def main() -> None:
             pose_action_space=np.asarray("relative_to_chunk_anchor"),
         )
 
-    if mixed_root is not None:
-        if not mixed_root.exists():
-            raise FileNotFoundError(mixed_root)
-        preset = _infer_preset(mixed_root)
-        robot_side = cli.mixed_robot_side or (preset["robot_side"] if preset else None)
-        hand_side = cli.mixed_hand_side or (preset["hand_side"] if preset else None)
-        if robot_side is None or hand_side is None:
-            raise ValueError(
-                "Could not infer mixed robot_side/hand_side. Pass --mixed_robot_side and "
-                "--mixed_hand_side, or use a session path containing left_robot_right_hand / "
-                "right_robot_left_hand."
+    if mixed_roots:
+        mixed_children: list[MixedEpisodeDataset] = []
+        # --mixed_robot_side / --mixed_hand_side only apply when a single root is given
+        # without an inferable preset; multi-root always uses path presets.
+        for i, mixed_root in enumerate(mixed_roots):
+            if not mixed_root.exists():
+                raise FileNotFoundError(mixed_root)
+            preset = _infer_preset(mixed_root)
+            if len(mixed_roots) == 1:
+                robot_side = cli.mixed_robot_side or (preset["robot_side"] if preset else None)
+                hand_side = cli.mixed_hand_side or (preset["hand_side"] if preset else None)
+            else:
+                if preset is None:
+                    raise ValueError(
+                        f"Could not infer robot/hand sides for mixed root {mixed_root}. "
+                        "Folder path should contain left_robot_right_hand or right_robot_left_hand."
+                    )
+                robot_side = preset["robot_side"]
+                hand_side = preset["hand_side"]
+            if robot_side is None or hand_side is None:
+                raise ValueError(
+                    "Could not infer mixed robot_side/hand_side. Pass --mixed_robot_side and "
+                    "--mixed_hand_side, or use a session path containing left_robot_right_hand / "
+                    "right_robot_left_hand."
+                )
+            if robot_side == hand_side:
+                raise ValueError("mixed embodiment expects opposite robot_side and hand_side")
+
+            if cli.mixed_sync_dir and len(mixed_roots) == 1:
+                mixed_sync = Path(cli.mixed_sync_dir).expanduser().resolve()
+            else:
+                mixed_sync = pkg / "m-synced-csvs" / f"{mixed_root.parent.name}_{mixed_root.name}_mixed"
+            mixed_sync_dirs.append(mixed_sync)
+
+            pose_override = cli.mixed_hand_pose_dir if len(mixed_roots) == 1 else None
+            eef_override = cli.mixed_robot_eef_dir if len(mixed_roots) == 1 else None
+            mixed_pose_dir = _resolve_pose_dir(mixed_root, pose_override)
+            mixed_eef_dir = _resolve_eef_dir(mixed_root, eef_override)
+            print(
+                f"Mixed child[{i}]: root={mixed_root} robot_side={robot_side} "
+                f"hand_side={hand_side} pose_dir={mixed_pose_dir} eef_dir={mixed_eef_dir}"
             )
-        if robot_side == hand_side:
-            raise ValueError("mixed embodiment expects opposite robot_side and hand_side")
-        mixed_pose_dir = _resolve_pose_dir(mixed_root, cli.mixed_hand_pose_dir)
-        mixed_eef_dir = _resolve_eef_dir(mixed_root, cli.mixed_robot_eef_dir)
-        print(
-            f"Mixed session: robot_side={robot_side} hand_side={hand_side} "
-            f"pose_dir={mixed_pose_dir} eef_dir={mixed_eef_dir}"
-        )
-        build_mixed_sync_csvs(
-            mixed_root,
-            mixed_sync,
-            robot_side=robot_side,
-            hand_side=hand_side,
-            pose_dir=mixed_pose_dir,
-            eef_dir=mixed_eef_dir,
-            max_skew_s=cli.max_skew_s,
-            max_demos=cli.mixed_demo_cap,
-        )
-        mixed_ds = MixedEpisodeDataset(
-            bird_vids_dir=mixed_root / "bird-realsense-data" / "mp4",
-            front_vids_dir=mixed_root / "front-realsense-data" / "mp4",
-            wrist_vids_dir=mixed_root / "aloha-data" / robot_side / "mp4",
-            joint_data_dir=mixed_root / "joint-data" / robot_side / "position",
-            hand_pose_npz_dir=mixed_pose_dir,
-            eef_pose_data_dir=mixed_eef_dir,
-            sync_csv_dir=mixed_sync,
-            robot_side=robot_side,
-            hand_side=hand_side,
-            num_queries=cli.num_queries,
-            max_demos=cli.mixed_demo_cap,
-            resize_factor=cli.resize_factor,
-            max_sync_rows=cli.max_sync_rows,
-            disable_front_camera=cli.no_front_camera,
-            jpeg_in_ram=cli.jpeg_in_ram,
-            jpeg_quality=cli.jpeg_quality,
+            build_mixed_sync_csvs(
+                mixed_root,
+                mixed_sync,
+                robot_side=robot_side,
+                hand_side=hand_side,
+                pose_dir=mixed_pose_dir,
+                eef_dir=mixed_eef_dir,
+                max_skew_s=cli.max_skew_s,
+                max_demos=cli.mixed_demo_cap,
+            )
+            child = MixedEpisodeDataset(
+                bird_vids_dir=mixed_root / "bird-realsense-data" / "mp4",
+                wrist_vids_dir=mixed_root / "aloha-data" / robot_side / "mp4",
+                joint_data_dir=mixed_root / "joint-data" / robot_side / "position",
+                hand_pose_npz_dir=mixed_pose_dir,
+                eef_pose_data_dir=mixed_eef_dir,
+                sync_csv_dir=mixed_sync,
+                robot_side=robot_side,
+                hand_side=hand_side,
+                num_queries=cli.num_queries,
+                max_demos=cli.mixed_demo_cap,
+                resize_factor=cli.resize_factor,
+                max_sync_rows=cli.max_sync_rows,
+                jpeg_in_ram=cli.jpeg_in_ram,
+                jpeg_quality=cli.jpeg_quality,
+            )
+            mixed_children.append(child)
+
+        mixed_ds = (
+            mixed_children[0]
+            if len(mixed_children) == 1
+            else ConcatMixedEpisodeDataset(mixed_children)
         )
         np.savez(
             output_dir / "normalization_stats_mixed.npz",
@@ -898,18 +991,17 @@ def main() -> None:
             pose_rel_std=mixed_ds.pose_rel_std.numpy(),
             pose_abs_mean=mixed_ds.pose_abs_mean.numpy(),
             pose_abs_std=mixed_ds.pose_abs_std.numpy(),
-            robot_side=np.asarray(robot_side),
-            hand_side=np.asarray(hand_side),
+            mixed_roots=np.asarray([str(p) for p in mixed_roots]),
             pose_action_space=np.asarray("relative_to_chunk_anchor"),
         )
 
     meta = build_run_metadata(
         robot_data_root=robot_root,
         human_data_root=human_root,
-        mixed_data_root=mixed_root,
+        mixed_data_roots=mixed_roots,
         robot_sync_dir=robot_sync if robot_root else None,
         human_sync_dir=human_sync if human_root else None,
-        mixed_sync_dir=mixed_sync if mixed_root else None,
+        mixed_sync_dirs=mixed_sync_dirs,
         num_queries=cli.num_queries,
         max_skew_s=cli.max_skew_s,
         robot_eef_dir=robot_eef_dir,
@@ -919,10 +1011,10 @@ def main() -> None:
         reconstruction_loss=cli.reconstruction_loss,
         joint_modality_update=cli.joint_modality_update,
         hand_lambda=cli.hand_lambda,
+        mixed_lambda=mixed_lambda,
         num_epochs=cli.epochs,
         batch_size=cli.batch,
         lr=cli.lr,
-        disable_front_camera=cli.no_front_camera,
     )
     meta["jpeg_in_ram"] = bool(cli.jpeg_in_ram)
     meta["jpeg_quality"] = int(cli.jpeg_quality) if cli.jpeg_in_ram else None
@@ -990,8 +1082,9 @@ def main() -> None:
 
     if robot_loader is None or human_loader is None:
         raise RuntimeError(
-            "Full training requires both --robot_data_root and --human_data_root "
-            "(--mixed_data_root is optional but recommended)."
+            "Full training requires both --robot_data_root and --human_data_root. "
+            "Mixed modality loads by default from DEFAULT_MIXED_DATA_ROOTS when present "
+            "(disable with --no_mixed)."
         )
 
     wandb_run = None
@@ -1016,7 +1109,8 @@ def main() -> None:
         f"(= max(robot_batches={n_robot}, human_batches={n_human}, mixed_batches={n_mixed}); "
         f"shorter modalities recycled), "
         f"batch={cli.batch}, lr={cli.lr}, recon={cli.reconstruction_loss}, "
-        f"kl_weight={cli.kl_weight}, hand_lambda={cli.hand_lambda}, K={cli.num_queries}"
+        f"kl_weight={cli.kl_weight}, hand_lambda={cli.hand_lambda}, "
+        f"mixed_lambda={mixed_lambda}, K={cli.num_queries}"
     )
     for epoch in range(cli.epochs):
         model.train()

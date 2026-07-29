@@ -220,7 +220,7 @@ class MixedDETRVAE(nn.Module):
             if camera_mask.ndim == 1:
                 camera_mask = camera_mask.unsqueeze(0).expand(bs, -1)
             if camera_mask.shape != (bs, NUM_CAMERAS):
-                raise ValueError(f"camera_mask must be [B,4], got {tuple(camera_mask.shape)}")
+                raise ValueError(f"camera_mask must be [B,{NUM_CAMERAS}], got {tuple(camera_mask.shape)}")
 
         all_cam_features = []
         all_cam_pos = []

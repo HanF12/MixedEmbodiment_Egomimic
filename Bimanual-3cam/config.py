@@ -9,6 +9,12 @@ import numpy as np
 import torch
 
 DEFAULT_NUM_QUERIES = 45
+DEFAULT_NUM_EPOCHS = 40000
+DEFAULT_BATCH_SIZE = 8
+DEFAULT_LR = 1e-5
+DEFAULT_WEIGHT_DECAY = 1e-4  # AdamW L2 regularization strength
+DEFAULT_SAVE_EVERY_EPOCHS = 10000
+
 JOINT_DIM_PER_ARM = 7
 STATE_DIM = 14
 
@@ -25,6 +31,8 @@ JOINT_ORDER = ("left", "right")
 LEFT_ARM_SLICE = slice(0, JOINT_DIM_PER_ARM)
 RIGHT_ARM_SLICE = slice(JOINT_DIM_PER_ARM, STATE_DIM)
 GRIPPER_INDICES = (JOINT_DIM_PER_ARM - 1, STATE_DIM - 1)
+# Match Combined_relative_3cam: binarize joint grippers at load.
+ROBOT_JOINT_GRIPPER_BINARIZE_THRESHOLD = 0.7
 
 
 def default_run_name() -> str:
@@ -49,7 +57,16 @@ def concat_bimanual_joints(
     right_step: np.ndarray | torch.Tensor,
     *,
     rec_id: str = "",
+    binarize_grippers: bool = True,
+    gripper_threshold: float = ROBOT_JOINT_GRIPPER_BINARIZE_THRESHOLD,
 ) -> torch.Tensor:
+    """
+    Robot qpos: [7 left, 7 right] -> [14].
+
+    By default, gripper joints (last channel per arm; flattened indices 6 and 13)
+    are binarized identically to Combined_relative_3cam:
+      grip -> 1.0 if grip >= threshold else 0.0
+    """
     left_tensor = torch.as_tensor(left_step, dtype=torch.float32).reshape(-1)
     right_tensor = torch.as_tensor(right_step, dtype=torch.float32).reshape(-1)
     if left_tensor.numel() < JOINT_DIM_PER_ARM or right_tensor.numel() < JOINT_DIM_PER_ARM:
@@ -57,10 +74,15 @@ def concat_bimanual_joints(
             f"Expected at least {JOINT_DIM_PER_ARM} joints per arm for {rec_id or 'sample'}, "
             f"got left={left_tensor.numel()} right={right_tensor.numel()}"
         )
-    return torch.cat(
+    out = torch.cat(
         [left_tensor[LEFT_ARM_SLICE], right_tensor[LEFT_ARM_SLICE]],
         dim=0,
     )
+    if binarize_grippers:
+        thr = float(gripper_threshold)
+        for idx in GRIPPER_INDICES:
+            out[idx] = 1.0 if float(out[idx]) >= thr else 0.0
+    return out
 
 
 def stack_camera_tensors(
@@ -89,6 +111,11 @@ def build_run_metadata(
         "sync_dir": str(Path(sync_dir)),
         "max_skew_s": float(max_skew_s),
         "variant": "bimanual-3cam",
+        "robot_joint_gripper_binarize_threshold": float(ROBOT_JOINT_GRIPPER_BINARIZE_THRESHOLD),
+        "gripper_semantics": (
+            f"joint-state grippers (indices {GRIPPER_INDICES}) binarized at load with "
+            f"threshold {ROBOT_JOINT_GRIPPER_BINARIZE_THRESHOLD}"
+        ),
     }
 
 

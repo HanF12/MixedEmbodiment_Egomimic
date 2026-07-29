@@ -73,7 +73,7 @@ POSE_DIM = 8  # left 4 + right 4
 POSE_GRIP_INDICES = (POSE_DIM_PER_SIDE - 1, POSE_DIM - 1)  # (3, 7)
 # Shared binarize threshold for robot EEF pose grippers and joint-state grippers.
 # Human pose open/close is left as-is (typically already binary).
-ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD = 0.8
+ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD = 0.7
 HUMAN_STATE_DIM = POSE_DIM
 HUMAN_PROPRIO_DIM = POSE_DIM
 ROBOT_PROPRIO_DIM = ROBOT_JOINT_DIM  # EgoMimic: joints only

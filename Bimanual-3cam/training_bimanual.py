@@ -24,7 +24,11 @@ if str(REPO_ROOT) not in sys.path:
 sys.path.insert(0, str(_PKG_DIR))
 
 from config import (  # noqa: E402
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_NUM_EPOCHS,
     DEFAULT_NUM_QUERIES,
+    DEFAULT_SAVE_EVERY_EPOCHS,
+    DEFAULT_WEIGHT_DECAY,
     MODEL_CAMERA_NAMES,
     STATE_DIM,
     build_run_metadata,
@@ -48,17 +52,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--normalization_path", type=str, default=None, help="Path to save qpos mean/std (.npz).")
     parser.add_argument("--output_dir", type=str, default=None, help="Root directory under which a timestamped run folder will be created.")
     parser.add_argument("--run_name", type=str, default=None, help="Optional run folder name (default: current timestamp).")
-    parser.add_argument("-e", "--epochs", type=int, default=500)
-    parser.add_argument("-b", "--batch", type=int, default=6)
+    parser.add_argument("-e", "--epochs", type=int, default=DEFAULT_NUM_EPOCHS)
+    parser.add_argument("-b", "--batch", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("-q", "--num_queries", type=int, default=DEFAULT_NUM_QUERIES)
     parser.add_argument("-g", "--gpu_number", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=DEFAULT_WEIGHT_DECAY,
+        help="AdamW weight decay (L2 regularization); default 1e-4.",
+    )
     parser.add_argument("--max_skew_s", type=float, default=0.050)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_demos", type=int, default=None)
     parser.add_argument("--save_every", type=int, default=50)
-    parser.add_argument("--save_every_epochs", type=int, default=1000, help="Save (and wandb-upload, if enabled) a checkpoint every N epochs.")
+    parser.add_argument(
+        "--save_every_epochs",
+        type=int,
+        default=DEFAULT_SAVE_EVERY_EPOCHS,
+        help="Save (and wandb-upload, if enabled) a checkpoint every N epochs.",
+    )
     parser.add_argument(
         "--save_periodic_checkpoints",
         action=argparse.BooleanOptionalAction,

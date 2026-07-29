@@ -1,11 +1,11 @@
 """
-MixedEmbodiment ACT constants and helpers (fork of Combined_relative).
+MixedEmbodiment ACT constants and helpers.
 
-Same relative-pose layout as Combined_relative, plus a third modality:
-  mixed = one human hand + one robot arm.
+True 3-camera architecture aligned with Combined_relative_3cam — front is NOT a
+model slot (still used for timestamp sync CSVs only).
 
 Camera slot order is fixed as:
-  [bird, front, left_wrist, right_wrist]  -> model cams cam0..cam3
+  [bird, left_wrist, right_wrist]  -> model cams cam0..cam2
 
 Shared pose (human hands / robot EEF / mixed hand+EEF), EgoMimic-style shared head:
   8D = left 4 + right 4
@@ -14,9 +14,16 @@ Shared pose (human hands / robot EEF / mixed hand+EEF), EgoMimic-style shared he
 
 Robot joints:
   14D = left 7 + right 7  (still absolute; mixed zeros the inactive arm)
+  Gripper joint channels (indices 6 and 13) are binarized at load with the
+  same threshold as EEF pose grippers (ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD).
 
 Robot / mixed proprio: joints only [14] (robot_input_proj + robot CVAE)
 Human proprio: absolute pose [8]
+
+Third modality (mixed):
+  left_robot_right_hand + right_robot_left_hand are one modality (ConcatDataset).
+  Needs bird + active wrist + active-arm joints + hand-side pose + robot-side EEF.
+  Bimanual NPZs still store both sides; only the correct side slots are read.
 """
 
 from __future__ import annotations
@@ -31,15 +38,18 @@ import torch
 
 DEFAULT_NUM_QUERIES = 45  # keep Combined horizon (EgoMimic uses 100)
 
-# EgoMimic-matched training defaults
+# EgoMimic-matched training defaults (same as Combined_relative_3cam)
 DEFAULT_NUM_EPOCHS = 10000
-# One epoch = one full pass over the longer modality's demo loader
-# (max(len(robot_loader), len(human_loader))); shorter modality is recycled.
+# One epoch = one full pass over the longest modality loader
+# (max(len(robot), len(human), len(mixed))); shorter modalities are recycled.
 DEFAULT_BATCH_SIZE = 8
 DEFAULT_LR = 1e-5
 DEFAULT_WEIGHT_DECAY = 1e-4
 DEFAULT_KL_WEIGHT = 10.0
 DEFAULT_HAND_LAMBDA = 1.0
+# Tunable mixed modality loss scale (also exposed as --mixed_lambda).
+# L_mixed = mixed_lambda * (pose + joint + KL) before equal mean over modalities.
+DEFAULT_MIXED_LAMBDA = 1.0
 DEFAULT_RECON_LOSS = "l1"
 
 # Temporal convention for action chunks:
@@ -68,29 +78,30 @@ POSE_DIM_PER_SIDE = 4  # xyz(3) + grip(1)
 POSE_DIM = 8  # left 4 + right 4
 # Gripper dims in flattened [8] pose: left grip, right grip
 POSE_GRIP_INDICES = (POSE_DIM_PER_SIDE - 1, POSE_DIM - 1)  # (3, 7)
-# Robot EEF NPZ grippers only (not joint-state grippers; not human pose)
-ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD = 0.8
+# Shared binarize threshold for robot EEF pose grippers and joint-state grippers.
+# Human pose open/close is left as-is (typically already binary).
+ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD = 0.7
 HUMAN_STATE_DIM = POSE_DIM
 HUMAN_PROPRIO_DIM = POSE_DIM
 ROBOT_PROPRIO_DIM = ROBOT_JOINT_DIM  # EgoMimic: joints only
 
-# --- Shared camera layout ---
-CAMERA_ORDER = ("bird", "front", "left_wrist", "right_wrist")
-MODEL_CAMERA_NAMES = ("cam0", "cam1", "cam2", "cam3")
-NUM_CAMERAS = 4
-FRONT_CAMERA_INDEX = CAMERA_ORDER.index("front")  # 1
+# --- Shared camera layout (NO front slot in the model) ---
+CAMERA_ORDER = ("bird", "left_wrist", "right_wrist")
+MODEL_CAMERA_NAMES = ("cam0", "cam1", "cam2")
+NUM_CAMERAS = 3
 
-ROBOT_CAMERA_MASK = (1, 1, 1, 1)
-HUMAN_CAMERA_MASK = (1, 1, 0, 0)
-# Mixed: bird+front+active wrist; inactive wrist masked in camera_mask_tensor.
-MIXED_CAMERA_MASK_LEFT_ROBOT = (1, 1, 1, 0)   # left wrist live
-MIXED_CAMERA_MASK_RIGHT_ROBOT = (1, 1, 0, 1)  # right wrist live
+ROBOT_CAMERA_MASK = (1, 1, 1)  # bird + both wrists
+HUMAN_CAMERA_MASK = (1, 0, 0)  # bird only; wrist slots zeroed
+# Mixed: bird + active wrist; inactive wrist masked / zeroed.
+MIXED_CAMERA_MASK_LEFT_ROBOT = (1, 1, 0)   # bird + left wrist
+MIXED_CAMERA_MASK_RIGHT_ROBOT = (1, 0, 1)  # bird + right wrist
 
 EMBODIMENT_ROBOT = 0
 EMBODIMENT_HUMAN = 1
 EMBODIMENT_MIXED = 2
 EMBODIMENT_NAMES = ("robot", "human", "mixed")
 
+# Sync CSVs still include front_index for timestamp alignment (not a model cam).
 ROBOT_SYNC_INDEX_COLUMNS = (
     "left_joint_index",
     "right_joint_index",
@@ -139,12 +150,68 @@ ROBOT_EEF_COORD_FRAME = (
     "Training uses xyz+gripper only (rotation dropped)."
 )
 
-# Default pose NPZ layouts under each modality root (0714 layout).
+# Default pose NPZ layouts under each modality root (sessions layout).
 HUMAN_POSE_RELDIR = Path("bird-realsense-data") / "combined_npz_targetframe"
-DEFAULT_ROBOT_DATA_ROOT = Path("Combined") / "teleop_bimanual" / "0714"
-DEFAULT_HUMAN_DATA_ROOT = Path("Combined") / "human_hands_bimanual_raw" / "0714"
+
+# Top-level sessions tree. Training can be launched with only --sessions_root.
+DEFAULT_SESSIONS_ROOT = Path("sessions")
+ROBOT_SESSION_KIND = "teleop_bimanual"
+HUMAN_SESSION_KIND = "human_hands_bimanual_raw"
+MIXED_SESSION_KINDS = ("left_robot_right_hand", "right_robot_left_hand")
+
+# Legacy explicit defaults (still used if a date folder exists under sessions/).
+DEFAULT_ROBOT_DATA_ROOT = DEFAULT_SESSIONS_ROOT / ROBOT_SESSION_KIND / "0714"
+DEFAULT_HUMAN_DATA_ROOT = DEFAULT_SESSIONS_ROOT / HUMAN_SESSION_KIND / "0714"
+DEFAULT_MIXED_DATA_ROOTS = (
+    DEFAULT_SESSIONS_ROOT / "left_robot_right_hand" / "0720",
+    DEFAULT_SESSIONS_ROOT / "right_robot_left_hand" / "0720",
+)
 
 MAX_STATE_DIM = max(POSE_DIM, ROBOT_JOINT_DIM)
+
+
+def _looks_like_session_date_root(path: Path) -> bool:
+    """A date folder is usable if it has bird video or joint-data."""
+    if not path.is_dir():
+        return False
+    return (path / "bird-realsense-data").is_dir() or (path / "joint-data").is_dir()
+
+
+def list_session_date_roots(sessions_root: str | Path, kind: str) -> list[Path]:
+    """
+    List date roots under sessions/<kind>/<date> (sorted).
+
+    Example: sessions/left_robot_right_hand/0720
+    """
+    base = Path(sessions_root).expanduser().resolve() / kind
+    if not base.is_dir():
+        return []
+    dates = [p for p in sorted(base.iterdir()) if _looks_like_session_date_root(p)]
+    return dates
+
+
+def discover_sessions_roots(
+    sessions_root: str | Path = DEFAULT_SESSIONS_ROOT,
+) -> dict[str, Path | list[Path] | None]:
+    """
+    Resolve robot / human / mixed date roots from a single sessions/ tree.
+
+    Robot / human: latest date folder under each kind (lexicographic max).
+    Mixed: all date folders under left_robot_right_hand and right_robot_left_hand
+    (one Concat modality).
+    """
+    root = Path(sessions_root).expanduser().resolve()
+    robot_dates = list_session_date_roots(root, ROBOT_SESSION_KIND)
+    human_dates = list_session_date_roots(root, HUMAN_SESSION_KIND)
+    mixed_roots: list[Path] = []
+    for kind in MIXED_SESSION_KINDS:
+        mixed_roots.extend(list_session_date_roots(root, kind))
+    return {
+        "sessions_root": root,
+        "robot_data_root": robot_dates[-1] if robot_dates else None,
+        "human_data_root": human_dates[-1] if human_dates else None,
+        "mixed_data_roots": mixed_roots,
+    }
 
 
 def default_run_name() -> str:
@@ -155,7 +222,7 @@ def validate_camera_names(camera_names: list[str] | tuple[str, ...]) -> None:
     if tuple(camera_names) != MODEL_CAMERA_NAMES:
         raise ValueError(
             f"Expected camera_names={MODEL_CAMERA_NAMES}, got {tuple(camera_names)}. "
-            "Combined uses fixed slots [bird, front, left_wrist, right_wrist]."
+            "MixedEmbodiment uses fixed slots [bird, left_wrist, right_wrist]."
         )
 
 
@@ -164,8 +231,15 @@ def concat_bimanual_joints(
     right_step: np.ndarray | torch.Tensor,
     *,
     rec_id: str = "",
+    binarize_grippers: bool = True,
+    gripper_threshold: float = ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD,
 ) -> torch.Tensor:
-    """Robot qpos: [7 left, 7 right] -> [14]."""
+    """
+    Robot qpos: [7 left, 7 right] -> [14].
+
+    By default, gripper joints (last channel per arm; flattened indices 6 and 13)
+    are binarized with the same threshold as EEF pose grippers.
+    """
     left_tensor = torch.as_tensor(left_step, dtype=torch.float32).reshape(-1)
     right_tensor = torch.as_tensor(right_step, dtype=torch.float32).reshape(-1)
     if left_tensor.numel() < JOINT_DIM_PER_ARM or right_tensor.numel() < JOINT_DIM_PER_ARM:
@@ -173,7 +247,12 @@ def concat_bimanual_joints(
             f"Expected >= {JOINT_DIM_PER_ARM} joints/arm for {rec_id or 'sample'}, "
             f"got left={left_tensor.numel()} right={right_tensor.numel()}"
         )
-    return torch.cat([left_tensor[:JOINT_DIM_PER_ARM], right_tensor[:JOINT_DIM_PER_ARM]], dim=0)
+    out = torch.cat([left_tensor[:JOINT_DIM_PER_ARM], right_tensor[:JOINT_DIM_PER_ARM]], dim=0)
+    if binarize_grippers:
+        thr = float(gripper_threshold)
+        for idx in GRIPPER_INDICES:
+            out[idx] = 1.0 if float(out[idx]) >= thr else 0.0
+    return out
 
 
 def flatten_bimanual_pose(pose_t: np.ndarray | torch.Tensor, *, rec_id: str = "") -> torch.Tensor:
@@ -225,12 +304,11 @@ flatten_hand_pose = flatten_bimanual_pose
 
 def stack_camera_tensors(
     bird_frame: torch.Tensor,
-    front_frame: torch.Tensor,
     left_frame: torch.Tensor,
     right_frame: torch.Tensor,
 ) -> torch.Tensor:
-    """Stack to [4, C, H, W] in CAMERA_ORDER."""
-    return torch.stack([bird_frame, front_frame, left_frame, right_frame], dim=0)
+    """Stack to [3, C, H, W] in CAMERA_ORDER (bird, left_wrist, right_wrist)."""
+    return torch.stack([bird_frame, left_frame, right_frame], dim=0)
 
 
 def extract_side_pose4(pose_t: np.ndarray | torch.Tensor, slot: int, *, rec_id: str = "") -> torch.Tensor:
@@ -263,7 +341,15 @@ def compose_mixed_flat_pose(
     rec_id: str = "",
 ) -> torch.Tensor:
     """
-    Build [8] pose = hand xyz+open in hand_slot + robot EEF xyz+grip in robot_slot.
+    Build [8] pose from two bimanual NPZ timesteps that each store BOTH sides,
+    but only ONE side is valid per file:
+
+      hand NPZ  [2,10]: read hand_slot only (other hand is NaN / invalid)
+      EEF NPZ   [2,10]: read robot_slot only (other arm is NaN / invalid)
+
+    Result fills both halves of the flat [8] (hand side + robot side). There is
+    no leftover "invalid" pose dim in the training target — the invalid NPZ
+    sides are never copied in.
     """
     if int(hand_slot) == int(robot_slot):
         raise ValueError(f"hand_slot and robot_slot must differ, got {hand_slot}")
@@ -284,8 +370,15 @@ def single_arm_joint_vector(
     *,
     robot_side: str,
     rec_id: str = "",
+    binarize_grippers: bool = True,
+    gripper_threshold: float = ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD,
 ) -> torch.Tensor:
-    """Pack one arm's 7 joints into a [14] vector; inactive arm is zeros."""
+    """
+    Pack one arm's joints into a [14] vector; inactive arm is zeros.
+
+    Mixed sessions store joints as one-sided arrays [T, 7] under
+    joint-data/<robot_side>/position (the other arm folder does not exist).
+    """
     arm = torch.as_tensor(arm_qpos, dtype=torch.float32).reshape(-1)
     if arm.numel() < JOINT_DIM_PER_ARM:
         raise ValueError(
@@ -294,10 +387,15 @@ def single_arm_joint_vector(
     out = torch.zeros(ROBOT_JOINT_DIM, dtype=torch.float32)
     if robot_side == "left":
         out[LEFT_ARM_SLICE] = arm[:JOINT_DIM_PER_ARM]
+        grip_idx = GRIPPER_INDICES[0]
     elif robot_side == "right":
         out[RIGHT_ARM_SLICE] = arm[:JOINT_DIM_PER_ARM]
+        grip_idx = GRIPPER_INDICES[1]
     else:
         raise ValueError(f"robot_side must be 'left' or 'right', got {robot_side!r}")
+    if binarize_grippers:
+        thr = float(gripper_threshold)
+        out[grip_idx] = 1.0 if float(out[grip_idx]) >= thr else 0.0
     return out
 
 
@@ -318,7 +416,6 @@ def joint_loss_mask_for_side(robot_side: str | None = None, *, full: bool = Fals
 def camera_mask_tensor(
     embodiment: int,
     *,
-    disable_front: bool = False,
     robot_side: str | None = None,
 ) -> torch.Tensor:
     if int(embodiment) == EMBODIMENT_ROBOT:
@@ -334,8 +431,6 @@ def camera_mask_tensor(
             raise ValueError("EMBODIMENT_MIXED requires robot_side='left' or 'right'")
     else:
         raise ValueError(f"Unknown embodiment id {embodiment}")
-    if disable_front:
-        mask[FRONT_CAMERA_INDEX] = 0
     return torch.tensor(mask, dtype=torch.float32)
 
 
@@ -348,8 +443,8 @@ def build_run_metadata(
     num_queries: int,
     max_skew_s: float,
     robot_eef_dir: str | Path | None = None,
-    mixed_data_root: str | Path | None = None,
-    mixed_sync_dir: str | Path | None = None,
+    mixed_data_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
+    mixed_sync_dirs: list[str | Path] | tuple[str | Path, ...] | None = None,
     action_chunk_starts_at_current: bool = ACTION_CHUNK_STARTS_AT_CURRENT,
     pose_loss_weight: float = 1.0,
     joint_loss_weight: float = 1.0,
@@ -357,43 +452,39 @@ def build_run_metadata(
     reconstruction_loss: str = DEFAULT_RECON_LOSS,
     joint_modality_update: bool = True,
     hand_lambda: float = DEFAULT_HAND_LAMBDA,
+    mixed_lambda: float = DEFAULT_MIXED_LAMBDA,
     steps_per_epoch: int | None = None,
     num_epochs: int = DEFAULT_NUM_EPOCHS,
     batch_size: int = DEFAULT_BATCH_SIZE,
     lr: float = DEFAULT_LR,
-    disable_front_camera: bool = False,
 ) -> dict[str, Any]:
-    robot_mask = list(ROBOT_CAMERA_MASK)
-    human_mask = list(HUMAN_CAMERA_MASK)
-    mixed_left = list(MIXED_CAMERA_MASK_LEFT_ROBOT)
-    mixed_right = list(MIXED_CAMERA_MASK_RIGHT_ROBOT)
-    if disable_front_camera:
-        robot_mask[FRONT_CAMERA_INDEX] = 0
-        human_mask[FRONT_CAMERA_INDEX] = 0
-        mixed_left[FRONT_CAMERA_INDEX] = 0
-        mixed_right[FRONT_CAMERA_INDEX] = 0
+    mixed_roots_list = [str(p) for p in (mixed_data_roots or [])]
+    mixed_sync_list = [str(p) for p in (mixed_sync_dirs or [])]
     return {
-        "variant": "mixed-embodiment-relative-egomimic-style",
+        "variant": "mixed-embodiment-relative-3cam",
         "pose_layout": "xyz+gripper only (8D); rot6d dropped at load",
         "pose_action_space": "relative_to_chunk_anchor",
         "embodiment_cue": "modality routing (separate projs/heads/cams), no embedding token",
         "modalities": ["robot", "human", "mixed"],
         "mixed_policy": (
-            "third modality; proprio/CVAE use robot joint path; "
-            "pose [8]=hand slot + robot EEF slot; joint loss masked to active arm; "
-            "camera_mask keeps bird/front/active wrist"
+            "third modality = Concat(left_robot_right_hand, right_robot_left_hand); "
+            "proprio/CVAE use robot joint path; pose [8]=hand slot + robot EEF slot "
+            "(only correct bimanual NPZ sides loaded); joint loss masked to active arm; "
+            "camera_mask keeps bird + active wrist"
         ),
         "camera_order": list(CAMERA_ORDER),
         "model_camera_names": list(MODEL_CAMERA_NAMES),
+        "num_cameras": NUM_CAMERAS,
+        "front_camera_in_model": False,
+        "front_camera_for_sync_only": True,
         "pose_dim": POSE_DIM,
         "robot_joint_dim": ROBOT_JOINT_DIM,
         "robot_proprio_dim": ROBOT_PROPRIO_DIM,
         "human_proprio_dim": HUMAN_PROPRIO_DIM,
-        "disable_front_camera": bool(disable_front_camera),
-        "robot_camera_mask": robot_mask,
-        "human_camera_mask": human_mask,
-        "mixed_camera_mask_left_robot": mixed_left,
-        "mixed_camera_mask_right_robot": mixed_right,
+        "robot_camera_mask": list(ROBOT_CAMERA_MASK),
+        "human_camera_mask": list(HUMAN_CAMERA_MASK),
+        "mixed_camera_mask_left_robot": list(MIXED_CAMERA_MASK_LEFT_ROBOT),
+        "mixed_camera_mask_right_robot": list(MIXED_CAMERA_MASK_RIGHT_ROBOT),
         "num_queries": int(num_queries),
         "action_chunk_starts_at_current": bool(action_chunk_starts_at_current),
         "pose_action_relative_to_chunk_anchor": bool(POSE_ACTION_RELATIVE_TO_CHUNK_ANCHOR),
@@ -404,10 +495,12 @@ def build_run_metadata(
         ),
         "robot_data_root": str(robot_data_root) if robot_data_root is not None else None,
         "human_data_root": str(human_data_root) if human_data_root is not None else None,
-        "mixed_data_root": str(mixed_data_root) if mixed_data_root is not None else None,
+        "mixed_data_roots": mixed_roots_list,
+        "mixed_data_root": mixed_roots_list[0] if mixed_roots_list else None,
         "robot_sync_dir": str(robot_sync_dir) if robot_sync_dir is not None else None,
         "human_sync_dir": str(human_sync_dir) if human_sync_dir is not None else None,
-        "mixed_sync_dir": str(mixed_sync_dir) if mixed_sync_dir is not None else None,
+        "mixed_sync_dirs": mixed_sync_list,
+        "mixed_sync_dir": mixed_sync_list[0] if mixed_sync_list else None,
         "robot_eef_dir": str(robot_eef_dir) if robot_eef_dir is not None else None,
         "robot_eef_file_format": "npz",
         "robot_eef_pose_dim": POSE_DIM,
@@ -417,16 +510,18 @@ def build_run_metadata(
         "human_pose_reldir": str(HUMAN_POSE_RELDIR),
         "gripper_semantics": (
             "shared last per-side dim: human open/close (typically binary); "
-            f"robot EEF NPZ gripper binarized at load with threshold "
-            f"{ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD} (joint-state grippers unchanged); "
+            f"robot EEF NPZ gripper and joint-state grippers binarized at load with "
+            f"threshold {ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD}; "
             "relative pose deltas include gripper dims"
         ),
         "robot_eef_gripper_binarize_threshold": float(ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD),
+        "robot_joint_gripper_binarize_threshold": float(ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD),
         "max_skew_s": float(max_skew_s),
         "pose_loss_weight": float(pose_loss_weight),
         "joint_loss_weight": float(joint_loss_weight),
         "kl_weight": float(kl_weight),
         "hand_lambda": float(hand_lambda),
+        "mixed_lambda": float(mixed_lambda),
         "reconstruction_loss": str(reconstruction_loss),
         "joint_modality_update": bool(joint_modality_update),
         "num_epochs": int(num_epochs),
@@ -462,7 +557,7 @@ def validate_run_metadata(metadata: dict[str, Any], *, num_queries: int | None =
         )
     if tuple(metadata.get("model_camera_names", [])) != MODEL_CAMERA_NAMES:
         raise ValueError(
-            "Saved model camera names do not match the fixed Combined camera order"
+            "Saved model camera names do not match the fixed MixedEmbodiment camera order"
         )
     saved_joint_dim = metadata.get("robot_joint_dim", metadata.get("robot_state_dim", -1))
     if int(saved_joint_dim) != ROBOT_JOINT_DIM:

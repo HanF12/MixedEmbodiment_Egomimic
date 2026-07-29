@@ -1,4 +1,4 @@
-"""Mixed one-hand + one-robot-arm episode dataset for MixedEmbodiment ACT."""
+"""Mixed one-hand + one-robot-arm episode dataset for MixedEmbodiment ACT (true 3-cam)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import List
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import ConcatDataset, Dataset
 
 from MixedEmbodiment.config import (
     DEFAULT_NUM_QUERIES,
@@ -48,9 +48,11 @@ class MixedEpisodeDataset(Dataset):
     """
     One item = one mixed episode (random start inside episode).
 
-    Pose [8] = hand xyz+open in hand_slot + robot EEF xyz+grip in robot_slot.
-    Joints [14] = active arm qpos; inactive arm zeros.
-    Cameras = bird + front + active wrist; inactive wrist zeroed/masked.
+    Pose [8] = hand xyz+open in hand_slot + robot EEF xyz+grip in robot_slot
+               (only those slots read from bimanual [2,10] NPZs).
+    Joints [14] = active arm qpos (gripper binarized); inactive arm zeros.
+    Cameras [3] = bird + active wrist; inactive wrist zeroed/masked.
+    Front RGB is used only in sync CSV generation (not loaded here).
     Proprio / CVAE follow the robot joint pathway (see core.py).
     """
 
@@ -58,7 +60,6 @@ class MixedEpisodeDataset(Dataset):
         self,
         *,
         bird_vids_dir,
-        front_vids_dir,
         wrist_vids_dir,
         joint_data_dir,
         hand_pose_npz_dir,
@@ -66,13 +67,13 @@ class MixedEpisodeDataset(Dataset):
         sync_csv_dir,
         robot_side: str,
         hand_side: str,
+        front_vids_dir=None,  # kept for API compat; not loaded into model
         num_queries: int = DEFAULT_NUM_QUERIES,
         transform: str = "resnet_normalization",
         max_demos: int | None = None,
         temp_cut: int = 10,
         resize_factor: float = 1.0,
         max_sync_rows: int | None = None,
-        disable_front_camera: bool = False,
         jpeg_in_ram: bool = False,
         jpeg_quality: int = 90,
     ) -> None:
@@ -81,12 +82,12 @@ class MixedEpisodeDataset(Dataset):
             raise ValueError("robot_side and hand_side must be 'left' or 'right'")
         if robot_side == hand_side:
             raise ValueError("mixed embodiment expects opposite robot_side and hand_side")
+        del front_vids_dir  # sync-only; not a model camera
 
         self.num_queries = int(num_queries)
         self.temp_cut = int(temp_cut)
         self.resize_factor = float(resize_factor)
         self.max_sync_rows = int(max_sync_rows) if max_sync_rows is not None else None
-        self.disable_front_camera = bool(disable_front_camera)
         self.jpeg_in_ram = bool(jpeg_in_ram)
         self.jpeg_quality = int(jpeg_quality)
         self.robot_side = robot_side
@@ -97,7 +98,6 @@ class MixedEpisodeDataset(Dataset):
         self.joint_loss_mask = joint_loss_mask_for_side(robot_side)
 
         bird_vids = sorted(resolve_path(bird_vids_dir).glob("*.mp4"))
-        front_vids = sorted(resolve_path(front_vids_dir).glob("*.mp4"))
         wrist_vids = sorted(resolve_path(wrist_vids_dir).glob("*.mp4"))
         joints = sorted(resolve_path(joint_data_dir).glob("*.npy"))
         hand_files = sorted(resolve_path(hand_pose_npz_dir).glob("*.npz"))
@@ -109,19 +109,19 @@ class MixedEpisodeDataset(Dataset):
             raise FileNotFoundError(f"No mixed sync CSVs in {sync_csv_dir}")
 
         bird_by = index_paths_by_demo_id(bird_vids, demo_id_from_hash_filename)
-        front_by = index_paths_by_demo_id(front_vids, demo_id_from_hash_filename)
         wrist_by = index_paths_by_demo_id(wrist_vids, demo_id_from_hash_filename)
         joint_by = index_paths_by_demo_id(joints, demo_id_from_joint_npy)
         hand_by = index_paths_by_demo_id(hand_files, demo_id_from_pose_npz)
         eef_by = index_paths_by_demo_id(eef_files, demo_id_from_robot_eef_npz)
 
-        if self.disable_front_camera:
-            print("Mixed dataset: --no_front_camera → front images zeroed + masked out")
+        print(
+            f"Mixed dataset: 3-cam slots [bird, left_wrist, right_wrist] "
+            f"(robot={robot_side}, hand={hand_side}); front for sync only"
+        )
         if self.jpeg_in_ram:
             print(f"Mixed dataset: JPEG-in-RAM enabled (quality={self.jpeg_quality})")
 
         self.bird_frames: list = []
-        self.front_frames: list = []
         self.wrist_frames: list = []
         self.joint_data: List[torch.Tensor] = []
         self.pose_data: List[torch.Tensor] = []
@@ -140,8 +140,6 @@ class MixedEpisodeDataset(Dataset):
                 "hand": hand_by,
                 "eef": eef_by,
             }
-            if not self.disable_front_camera:
-                needed["front"] = front_by
             missing = [k for k, m in needed.items() if rec_id not in m]
             if missing:
                 print(f"WARNING: skip mixed {rec_id} - missing {missing}")
@@ -155,13 +153,9 @@ class MixedEpisodeDataset(Dataset):
             if self.temp_cut > 0:
                 mask = np.ones(len(df), dtype=bool)
                 for col in MIXED_TEMP_CUT_INDEX_COLUMNS:
-                    if col == "front_index" and self.disable_front_camera:
-                        continue
                     mask &= df[col].to_numpy() >= self.temp_cut
                 df = df.loc[mask].copy()
                 for col in MIXED_TEMP_CUT_INDEX_COLUMNS:
-                    if col == "front_index" and self.disable_front_camera:
-                        continue
                     df[col] = df[col] - self.temp_cut
                 # hand/eef indices are absolute into NPZ — do not temp-cut those columns.
 
@@ -175,11 +169,6 @@ class MixedEpisodeDataset(Dataset):
             bird_f = load_video_frames(
                 bird_by[rec_id], resize_factor=self.resize_factor, label=f"bird({rec_id})"
             )
-            front_f = None
-            if not self.disable_front_camera:
-                front_f = load_video_frames(
-                    front_by[rec_id], resize_factor=self.resize_factor, label=f"front({rec_id})"
-                )
             wrist_f = load_video_frames(
                 wrist_by[rec_id], resize_factor=self.resize_factor, label=f"wrist({rec_id})"
             )
@@ -207,14 +196,6 @@ class MixedEpisodeDataset(Dataset):
                         jpeg_quality=self.jpeg_quality,
                     )
                 )
-                if front_f is not None:
-                    self.front_frames.append(
-                        store_frame(
-                            front_f[int(df.loc[i, "front_index"])],
-                            jpeg_in_ram=self.jpeg_in_ram,
-                            jpeg_quality=self.jpeg_quality,
-                        )
-                    )
                 self.wrist_frames.append(
                     store_frame(
                         wrist_f[int(df.loc[i, "wrist_index"])],
@@ -227,6 +208,8 @@ class MixedEpisodeDataset(Dataset):
                         joint_arr[int(df.loc[i, "joint_index"])],
                         robot_side=self.robot_side,
                         rec_id=rec_id,
+                        binarize_grippers=True,
+                        gripper_threshold=ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD,
                     )
                 )
                 hidx = int(df.loc[i, "hand_pose_index"])
@@ -255,7 +238,11 @@ class MixedEpisodeDataset(Dataset):
         all_p = torch.stack(self.pose_data, dim=0)  # [N, 8]
         self.joint_mean = torch.zeros(ROBOT_JOINT_DIM, dtype=torch.float32)
         self.joint_std = torch.ones(ROBOT_JOINT_DIM, dtype=torch.float32)
-        active = slice(0, JOINT_DIM_PER_ARM) if self.robot_side == "left" else slice(JOINT_DIM_PER_ARM, ROBOT_JOINT_DIM)
+        active = (
+            slice(0, JOINT_DIM_PER_ARM)
+            if self.robot_side == "left"
+            else slice(JOINT_DIM_PER_ARM, ROBOT_JOINT_DIM)
+        )
         self.joint_mean[active] = all_q[:, active].mean(dim=0)
         self.joint_std[active] = all_q[:, active].std(dim=0).clamp(min=1e-2)
 
@@ -272,10 +259,8 @@ class MixedEpisodeDataset(Dataset):
         self.state_mean = self.joint_mean
         self.state_std = self.joint_std
 
-        frame_bytes = (
-            sum(frame_nbytes(f) for f in self.bird_frames)
-            + sum(frame_nbytes(f) for f in self.front_frames)
-            + sum(frame_nbytes(f) for f in self.wrist_frames)
+        frame_bytes = sum(frame_nbytes(f) for f in self.bird_frames) + sum(
+            frame_nbytes(f) for f in self.wrist_frames
         )
         print(
             f"Mixed dataset ready: demos={self.num_demos} samples={self.num_samples} "
@@ -297,18 +282,13 @@ class MixedEpisodeDataset(Dataset):
 
         bird_np = load_frame(self.bird_frames[sample_idx])
         bird_t = self.image_transform(bird_np)
-        zero_np = zero_rgb_like(bird_np)
-        if self.disable_front_camera:
-            front_t = self.image_transform(zero_np)
-        else:
-            front_t = self.image_transform(load_frame(self.front_frames[sample_idx]))
         wrist_t = self.image_transform(load_frame(self.wrist_frames[sample_idx]))
-        inactive_t = self.image_transform(zero_np)
+        inactive_t = self.image_transform(zero_rgb_like(bird_np))
         if self.robot_side == "left":
             left_t, right_t = wrist_t, inactive_t
         else:
             left_t, right_t = inactive_t, wrist_t
-        images = stack_camera_tensors(bird_t, front_t, left_t, right_t)
+        images = stack_camera_tensors(bird_t, left_t, right_t)
 
         pose_raw = self.pose_data[sample_idx]
         joint_raw = self.joint_data[sample_idx]
@@ -331,11 +311,7 @@ class MixedEpisodeDataset(Dataset):
         return {
             "embodiment": EMBODIMENT_MIXED,
             "images": images,
-            "camera_mask": camera_mask_tensor(
-                EMBODIMENT_MIXED,
-                disable_front=self.disable_front_camera,
-                robot_side=self.robot_side,
-            ),
+            "camera_mask": camera_mask_tensor(EMBODIMENT_MIXED, robot_side=self.robot_side),
             "pose_state": pose_state,
             "pose_actions": pose_actions,
             "joint_state": joint_state,
@@ -344,3 +320,52 @@ class MixedEpisodeDataset(Dataset):
             "has_joint_target": True,
             "is_pad": is_pad,
         }
+
+
+class ConcatMixedEpisodeDataset(ConcatDataset):
+    """
+    One mixed modality spanning both session types (LR + RR).
+
+    Each child keeps its own norm stats / side masks; __getitem__ routes correctly.
+    Pooled stats are exposed for checkpointing convenience.
+    """
+
+    def __init__(self, datasets: list[MixedEpisodeDataset]) -> None:
+        if not datasets:
+            raise ValueError("ConcatMixedEpisodeDataset requires at least one dataset")
+        super().__init__(datasets)
+        self.datasets: list[MixedEpisodeDataset] = list(datasets)  # type: ignore[assignment]
+        self.num_demos = sum(int(d.num_demos) for d in self.datasets)
+        self.num_samples = sum(int(d.num_samples) for d in self.datasets)
+        self._pool_stats()
+
+    def _pool_stats(self) -> None:
+        total = float(sum(max(1, int(d.num_samples)) for d in self.datasets))
+        joint_mean = torch.zeros(ROBOT_JOINT_DIM, dtype=torch.float32)
+        joint_var = torch.zeros(ROBOT_JOINT_DIM, dtype=torch.float32)
+        pose_abs_mean = torch.zeros(POSE_DIM, dtype=torch.float32)
+        pose_abs_var = torch.zeros(POSE_DIM, dtype=torch.float32)
+        pose_rel_mean = torch.zeros(POSE_DIM, dtype=torch.float32)
+        pose_rel_var = torch.zeros(POSE_DIM, dtype=torch.float32)
+        for d in self.datasets:
+            w = float(d.num_samples) / total
+            joint_mean += w * d.joint_mean
+            joint_var += w * (d.joint_std ** 2)
+            pose_abs_mean += w * d.pose_abs_mean
+            pose_abs_var += w * (d.pose_abs_std ** 2)
+            pose_rel_mean += w * d.pose_mean
+            pose_rel_var += w * (d.pose_std ** 2)
+        self.joint_mean = joint_mean
+        self.joint_std = joint_var.clamp(min=1e-4).sqrt().clamp(min=1e-2)
+        self.pose_abs_mean = pose_abs_mean
+        self.pose_abs_std = pose_abs_var.clamp(min=1e-4).sqrt().clamp(min=1e-2)
+        self.pose_mean = pose_rel_mean
+        self.pose_std = pose_rel_var.clamp(min=1e-4).sqrt().clamp(min=1e-2)
+        self.pose_rel_mean = self.pose_mean
+        self.pose_rel_std = self.pose_std
+        self.state_mean = self.joint_mean
+        self.state_std = self.joint_std
+        print(
+            f"Concat mixed modality: children={len(self.datasets)} "
+            f"demos={self.num_demos} samples={self.num_samples}"
+        )

@@ -1,4 +1,4 @@
-"""Robot episode dataset for Combined-relative ACT (4 cameras, 8D EEF pose + 14D joints)."""
+"""Robot episode dataset for MixedEmbodiment ACT (3 cameras, 8D EEF pose + 14D joints)."""
 
 from __future__ import annotations
 
@@ -21,7 +21,6 @@ from MixedEmbodiment.config import (
     camera_mask_tensor,
     concat_bimanual_joints,
     flatten_bimanual_pose,
-    joint_loss_mask_for_side,
     stack_camera_tensors,
 )
 from MixedEmbodiment.data_synchronization import xyz_gripper_valid_mask
@@ -59,6 +58,7 @@ class RobotEpisodeDataset(Dataset):
     Returns dict (common batch schema):
       embodiment, images, camera_mask,
       pose_state [8], pose_actions [K,8]  (xyz+gripper; rot dropped),
+      images [3,3,H,W] = bird/left_wrist/right_wrist,
       joint_state [14], joint_actions [K,14],
       has_joint_target True, is_pad [K]
     """
@@ -81,7 +81,6 @@ class RobotEpisodeDataset(Dataset):
         resize_factor: float = 1.0,
         max_sync_rows: int | None = None,
         require_valid_eef: bool = True,
-        disable_front_camera: bool = False,
         jpeg_in_ram: bool = False,
         jpeg_quality: int = 90,
     ) -> None:
@@ -91,7 +90,6 @@ class RobotEpisodeDataset(Dataset):
         self.resize_factor = float(resize_factor)
         self.max_sync_rows = int(max_sync_rows) if max_sync_rows is not None else None
         self.require_valid_eef = bool(require_valid_eef)
-        self.disable_front_camera = bool(disable_front_camera)
         self.jpeg_in_ram = bool(jpeg_in_ram)
         self.jpeg_quality = int(jpeg_quality)
         self.image_transform = build_image_transform(transform)
@@ -116,13 +114,11 @@ class RobotEpisodeDataset(Dataset):
         left_j_by = index_paths_by_demo_id(left_joints, demo_id_from_joint_npy)
         right_j_by = index_paths_by_demo_id(right_joints, demo_id_from_joint_npy)
         eef_by = index_paths_by_demo_id(eef_files, demo_id_from_robot_eef_npz)
-        if self.disable_front_camera:
-            print("Robot dataset: --no_front_camera → front images zeroed + masked out")
+        print("Robot dataset: 3-cam model slots [bird, left_wrist, right_wrist] (front used for sync only)")
         if self.jpeg_in_ram:
             print(f"Robot dataset: JPEG-in-RAM enabled (quality={self.jpeg_quality})")
 
         self.bird_frames: list = []
-        self.front_frames: list = []
         self.left_frames: list = []
         self.right_frames: list = []
         self.joint_data: list[torch.Tensor] = []
@@ -133,7 +129,7 @@ class RobotEpisodeDataset(Dataset):
         self.num_demos = 0
         self.num_samples = 0
 
-        print("Loading robot Combined-relative demos...")
+        print("Loading robot MixedEmbodiment demos...")
         for csv_path in sync_csvs:
             rec_id = csv_path.stem
             needed = {
@@ -144,8 +140,6 @@ class RobotEpisodeDataset(Dataset):
                 "right_joint": right_j_by,
                 "eef_pose": eef_by,
             }
-            if not self.disable_front_camera:
-                needed["front"] = front_by
             missing = [k for k, m in needed.items() if rec_id not in m]
             if missing:
                 print(f"WARNING: skip robot {rec_id} missing {missing}")
@@ -207,11 +201,6 @@ class RobotEpisodeDataset(Dataset):
             bird_f = load_video_frames(bird_by[rec_id], resize_factor=self.resize_factor, label=f"bird({rec_id})")[
                 self.temp_cut :
             ]
-            front_f = None
-            if not self.disable_front_camera:
-                front_f = load_video_frames(
-                    front_by[rec_id], resize_factor=self.resize_factor, label=f"front({rec_id})"
-                )[self.temp_cut :]
             left_f = load_video_frames(left_by[rec_id], resize_factor=self.resize_factor, label=f"left({rec_id})")[
                 self.temp_cut :
             ]
@@ -234,14 +223,6 @@ class RobotEpisodeDataset(Dataset):
                         jpeg_quality=self.jpeg_quality,
                     )
                 )
-                if front_f is not None:
-                    self.front_frames.append(
-                        store_frame(
-                            front_f[int(df.loc[i, "front_index"])],
-                            jpeg_in_ram=self.jpeg_in_ram,
-                            jpeg_quality=self.jpeg_quality,
-                        )
-                    )
                 self.left_frames.append(
                     store_frame(
                         left_f[int(df.loc[i, "left_index"])],
@@ -265,7 +246,7 @@ class RobotEpisodeDataset(Dataset):
                 )
                 eidx = int(df.loc[i, "eef_pose_index"])
                 flat = flatten_bimanual_pose(eef_arr[eidx], rec_id=rec_id)
-                # Binarize EEF gripper dims only (joint grippers untouched).
+                # Binarize EEF pose grippers (joint grippers binarized in concat_bimanual_joints).
                 flat = binarize_flat_pose_grippers(
                     flat, threshold=ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD
                 )
@@ -277,7 +258,7 @@ class RobotEpisodeDataset(Dataset):
             print(f"    -> robot {rec_id}: {n_i} samples")
 
         if self.num_demos == 0:
-            raise FileNotFoundError("No complete robot demos found for Combined-relative.")
+            raise FileNotFoundError("No complete robot demos found for MixedEmbodiment.")
 
         all_q = torch.stack(self.joint_data, dim=0)  # [N, 14]
         all_e = torch.stack(self.eef_pose_data, dim=0)  # [N, 8]
@@ -300,7 +281,7 @@ class RobotEpisodeDataset(Dataset):
         self.state_std = self.joint_std
         frame_bytes = sum(
             frame_nbytes(f)
-            for frames in (self.bird_frames, self.front_frames, self.left_frames, self.right_frames)
+            for frames in (self.bird_frames, self.left_frames, self.right_frames)
             for f in frames
         )
         print(
@@ -323,13 +304,8 @@ class RobotEpisodeDataset(Dataset):
 
         bird_np = load_frame(self.bird_frames[sample_idx])
         bird_t = self.image_transform(bird_np)
-        if self.disable_front_camera:
-            front_t = self.image_transform(zero_rgb_like(bird_np))
-        else:
-            front_t = self.image_transform(load_frame(self.front_frames[sample_idx]))
         images = stack_camera_tensors(
             bird_t,
-            front_t,
             self.image_transform(load_frame(self.left_frames[sample_idx])),
             self.image_transform(load_frame(self.right_frames[sample_idx])),
         )
@@ -359,14 +335,11 @@ class RobotEpisodeDataset(Dataset):
         return {
             "embodiment": EMBODIMENT_ROBOT,
             "images": images,
-            "camera_mask": camera_mask_tensor(
-                EMBODIMENT_ROBOT, disable_front=self.disable_front_camera
-            ),
+            "camera_mask": camera_mask_tensor(EMBODIMENT_ROBOT),
             "pose_state": pose_state,
             "pose_actions": pose_actions,
             "joint_state": joint_state,
             "joint_actions": joint_actions,
-            "joint_loss_mask": joint_loss_mask_for_side(full=True),
             "has_joint_target": True,
             "is_pad": is_pad,
         }
