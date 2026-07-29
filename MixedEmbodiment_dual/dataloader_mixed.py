@@ -1,4 +1,4 @@
-"""Mixed one-hand + one-robot-arm episode dataset for MixedEmbodiment ACT (true 3-cam)."""
+"""Mixed one-hand + one-robot-arm episode dataset for MixedEmbodiment_dual ACT (true 3-cam)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import pandas as pd
 import torch
 from torch.utils.data import ConcatDataset, Dataset
 
-from MixedEmbodiment.config import (
+from MixedEmbodiment_dual.config import (
     DEFAULT_NUM_QUERIES,
     EMBODIMENT_MIXED,
     JOINT_DIM_PER_ARM,
@@ -24,8 +24,8 @@ from MixedEmbodiment.config import (
     single_arm_joint_vector,
     stack_camera_tensors,
 )
-from MixedEmbodiment.data_synchronization import side_to_slot, xyz_gripper_valid_mask
-from MixedEmbodiment.dataloader_utils import (
+from MixedEmbodiment_dual.data_synchronization import side_to_slot, xyz_gripper_valid_mask
+from MixedEmbodiment_dual.dataloader_utils import (
     build_image_transform,
     compute_relative_pose_stats,
     demo_id_from_hash_filename,
@@ -263,7 +263,7 @@ class MixedEpisodeDataset(Dataset):
             print(f"    -> mixed {rec_id}: {n_i} samples (robot={self.robot_side}, hand={self.hand_side})")
 
         if self.num_demos == 0:
-            raise FileNotFoundError("No complete mixed demos found for MixedEmbodiment.")
+            raise FileNotFoundError("No complete mixed demos found for MixedEmbodiment_dual.")
 
         all_q = torch.stack(self.joint_data, dim=0)  # [N, 14]
         all_p = torch.stack(self.pose_data, dim=0)  # [N, 8]
