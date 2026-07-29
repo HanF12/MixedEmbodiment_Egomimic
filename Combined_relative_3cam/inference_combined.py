@@ -6,8 +6,8 @@ I/O closely follows Bimanual-3cam/inference_bimanual.py (RealSense + ROS joints)
 but drives Combined_relative_3cam.MixedDETRVAE with:
   - embodiment = robot
   - proprio = joint_state [14]  (robot_input_proj)
-  - camera slots [bird, front, left_wrist, right_wrist], mask all ones
-  - control from joint_action_head only
+  - camera slots [bird, left_wrist, right_wrist] (3-cam; no front)
+  - shared pose head is xyz+gripper (8D); control from joint_action_head only
 
 Relative vs absolute
 --------------------
@@ -76,9 +76,9 @@ from joint_lisener import (  # type: ignore  # noqa: E402
 RESNET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 RESNET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
-DEFAULT_CHECKPOINT = "combined_act_latest_no_ori.pth"
-DEFAULT_ROBOT_NORM = "normalization_stats_robot_no_ori.npz"
-DEFAULT_HUMAN_NORM = "normalization_stats_human_no_ori.npz"
+DEFAULT_CHECKPOINT = "combined_act_best_3cam.pth"
+DEFAULT_ROBOT_NORM = "normalization_stats_robot_3cam.npz"
+DEFAULT_HUMAN_NORM = "normalization_stats_human_3cam.npz"
 
 
 def resolve_path(path_like: str) -> Path:
@@ -169,9 +169,11 @@ def annotate(img_bgr: np.ndarray, lines: list[str]) -> np.ndarray:
     return out
 
 
-def stack_preview(a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray) -> np.ndarray:
+def stack_preview_3cam(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
+    """bird | left_wrist on top row; right_wrist alone on bottom (letterboxed left)."""
     top = np.concatenate([a, b], axis=1)
-    bottom = np.concatenate([c, d], axis=1)
+    pad = np.zeros_like(c)
+    bottom = np.concatenate([c, pad], axis=1)
     return np.concatenate([top, bottom], axis=0)
 
 
@@ -274,10 +276,44 @@ parser.add_argument("--topic_arm_left", type=str, default="/arm_joint_target_pos
 parser.add_argument("--topic_gripper_left", type=str, default="/gripper_position_control_slave_left")
 parser.add_argument("--topic_arm_right", type=str, default="/arm_joint_target_position_slave_right")
 parser.add_argument("--topic_gripper_right", type=str, default="/gripper_position_control_slave_right")
-parser.add_argument("--gripper_scale", type=float, default=48)
-parser.add_argument("--gripper_max", type=float, default=80)
+parser.add_argument(
+    "--gripper_mode",
+    choices=("binary", "continuous"),
+    default="binary",
+    help="binary: threshold denorm preds to 0/70; continuous: scale*pred then clamp to --gripper_max",
+)
+parser.add_argument(
+    "--gripper_threshold_left",
+    type=float,
+    default=0.35,
+    help="[binary] Left gripper: denormalized pred < threshold → 0, else 70",
+)
+parser.add_argument(
+    "--gripper_threshold_right",
+    type=float,
+    default=0.35,
+    help="[binary] Right gripper: denormalized pred < threshold → 0, else 70",
+)
+parser.add_argument(
+    "--gripper_scale_left",
+    type=float,
+    default=65.0,
+    help="[continuous] Multiply left denormalized gripper pred by this before publishing",
+)
+parser.add_argument(
+    "--gripper_scale_right",
+    type=float,
+    default=65.0,
+    help="[continuous] Multiply right denormalized gripper pred by this before publishing",
+)
+parser.add_argument(
+    "--gripper_max",
+    type=float,
+    default=80.0,
+    help="[continuous] Clamp scaled gripper cmd to this (set <0 to disable)",
+)
 parser.add_argument("--max_joint_speed", type=float, default=0.35)
-parser.add_argument("--max_gripper_speed", type=float, default=100)
+parser.add_argument("--max_gripper_speed", type=float, default=70)
 parser.add_argument("--bird_role", choices=("left", "right", "center", "front"), default="center")
 parser.add_argument("--bird_serial", type=str, default=None)
 parser.add_argument("--bird_color_fps", type=int, default=15)
@@ -428,27 +464,40 @@ try:
         else:
             positions_to_publish = predicted_trajectory_np[0].astype(np.float32)
 
-        positions_to_publish[list(GRIPPER_INDICES)] *= float(cli.gripper_scale)
-        if float(cli.gripper_max) >= 0:
-            positions_to_publish[GRIPPER_INDICES[0]] = min(
-                float(positions_to_publish[GRIPPER_INDICES[0]]), float(cli.gripper_max)
-            )
-            positions_to_publish[GRIPPER_INDICES[1]] = min(
-                float(positions_to_publish[GRIPPER_INDICES[1]]), float(cli.gripper_max)
-            )
+        # Raw denormalized gripper preds, then map via --gripper_mode.
+        raw_grip_l = float(positions_to_publish[GRIPPER_INDICES[0]])
+        raw_grip_r = float(positions_to_publish[GRIPPER_INDICES[1]])
+        thr_l = float(cli.gripper_threshold_left)
+        thr_r = float(cli.gripper_threshold_right)
+        if cli.gripper_mode == "binary":
+            cmd_l = 70.0 if raw_grip_l >= thr_l else 0.0
+            cmd_r = 70.0 if raw_grip_r >= thr_r else 0.0
+        else:
+            cmd_l = raw_grip_l * float(cli.gripper_scale_left)
+            cmd_r = raw_grip_r * float(cli.gripper_scale_right)
+            if float(cli.gripper_max) >= 0:
+                cmd_l = min(cmd_l, float(cli.gripper_max))
+                cmd_r = min(cmd_r, float(cli.gripper_max))
+        positions_to_publish[GRIPPER_INDICES[0]] = cmd_l
+        positions_to_publish[GRIPPER_INDICES[1]] = cmd_r
 
         desired = positions_to_publish.astype(np.float32)
         now_t = time.monotonic()
         if last_cmd is None or last_cmd_t is None:
             last_cmd = qpos_np.astype(np.float32).copy()
-            last_cmd[list(GRIPPER_INDICES)] *= float(cli.gripper_scale)
-            if float(cli.gripper_max) >= 0:
-                last_cmd[GRIPPER_INDICES[0]] = min(
-                    float(last_cmd[GRIPPER_INDICES[0]]), float(cli.gripper_max)
-                )
-                last_cmd[GRIPPER_INDICES[1]] = min(
-                    float(last_cmd[GRIPPER_INDICES[1]]), float(cli.gripper_max)
-                )
+            if cli.gripper_mode == "binary":
+                last_cmd[GRIPPER_INDICES[0]] = 70.0 if float(last_cmd[GRIPPER_INDICES[0]]) >= thr_l else 0.0
+                last_cmd[GRIPPER_INDICES[1]] = 70.0 if float(last_cmd[GRIPPER_INDICES[1]]) >= thr_r else 0.0
+            else:
+                last_cmd[GRIPPER_INDICES[0]] *= float(cli.gripper_scale_left)
+                last_cmd[GRIPPER_INDICES[1]] *= float(cli.gripper_scale_right)
+                if float(cli.gripper_max) >= 0:
+                    last_cmd[GRIPPER_INDICES[0]] = min(
+                        float(last_cmd[GRIPPER_INDICES[0]]), float(cli.gripper_max)
+                    )
+                    last_cmd[GRIPPER_INDICES[1]] = min(
+                        float(last_cmd[GRIPPER_INDICES[1]]), float(cli.gripper_max)
+                    )
             last_cmd_t = now_t
         else:
             dt_nom = 1.0 / max(1e-3, float(cli.inference_fps))
@@ -475,18 +524,30 @@ try:
             min_dt = 1.0 / max(1e-3, float(cli.display_max_fps))
             if wall - last_preview_t >= min_dt:
                 last_preview_t = wall
+                if cli.gripper_mode == "binary":
+                    mode_note = f"binary thr L/R={thr_l:g}/{thr_r:g}"
+                else:
+                    mode_note = (
+                        f"continuous scale L/R={cli.gripper_scale_left:g}/{cli.gripper_scale_right:g} "
+                        f"max={cli.gripper_max:g}"
+                    )
+                grip_overlay = (
+                    f"raw L/R={raw_grip_l:.3f}/{raw_grip_r:.3f} "
+                    f"-> cmd {desired[GRIPPER_INDICES[0]]:.1f}/{desired[GRIPPER_INDICES[1]]:.1f} "
+                    f"({mode_note})"
+                )
+                print(f"gripper {grip_overlay}", flush=True)
                 shown = [
-                    annotate(frame, [f"cam{idx} {label} ({serial})"])
+                    annotate(frame, [f"cam{idx} {label} ({serial})", grip_overlay])
                     for idx, (frame, (label, serial, _)) in enumerate(zip(frames, pipelines))
                 ]
                 shown = [maybe_resize(frame, float(cli.display_scale)) for frame in shown]
                 h = min(frame.shape[0] for frame in shown)
                 w = min(frame.shape[1] for frame in shown)
-                preview = stack_preview(
+                preview = stack_preview_3cam(
                     shown[0][:h, :w],
                     shown[1][:h, :w],
                     shown[2][:h, :w],
-                    shown[3][:h, :w],
                 )
                 cv2.imshow("Combined-relative-3cam ACT Inference (robot)", preview)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
