@@ -90,6 +90,7 @@ from MixedEmbodiment_dual.dataloader_utils import (  # noqa: E402
     demo_id_from_joint_npy,
     demo_id_from_pose_npz,
     demo_id_from_robot_eef_npz,
+    prune_orphan_sync_csvs,
 )
 
 
@@ -206,7 +207,12 @@ def parse_args() -> argparse.Namespace:
         "--mixed_first_n",
         type=int,
         default=None,
-        help="Use only the first N mixed demos (sorted demo IDs). Overrides --first_n/--max_demos for mixed.",
+        help=(
+            "Use only the first N mixed demos per mixed session root (sorted demo IDs). "
+            "With both left_robot_right_hand and right_robot_left_hand, N applies to each "
+            "(e.g. --mixed_first_n 10 -> 10+10=20 demos). "
+            "Overrides --first_n/--max_demos for mixed."
+        ),
     )
     p.add_argument("--resize_factor", type=float, default=1.0)
     p.add_argument(
@@ -453,6 +459,7 @@ def build_robot_sync_csvs(
             valid_open=eef_npz["valid_open"],
             require_full_eef_pose=True,
         )
+    prune_orphan_sync_csvs(sync_dir, ids)
 
 
 def build_human_sync_csvs(
@@ -491,6 +498,7 @@ def build_human_sync_csvs(
             valid_open=pose_npz["valid_open"],
             require_full_pose=True,
         )
+    prune_orphan_sync_csvs(sync_dir, ids)
 
 
 def make_loader(dataset, batch_size: int, num_workers: int, shuffle: bool) -> DataLoader:
@@ -956,7 +964,8 @@ def main() -> None:
     ):
         print(
             f"Demo caps: robot_first_n={cli.robot_demo_cap} human_first_n={cli.human_demo_cap} "
-            f"mixed_first_n={cli.mixed_demo_cap} (sorted demo IDs; None = all)"
+            f"mixed_first_n={cli.mixed_demo_cap} "
+            f"(sorted IDs; mixed N is per session root, e.g. LR+RR; None = all)"
         )
 
     robot_root = Path(cli.robot_data_root).expanduser().resolve() if cli.robot_data_root else None
@@ -994,15 +1003,24 @@ def main() -> None:
             "or pass explicit --robot_data_root / --human_data_root / --mixed_data_root."
         )
 
+    weights_root = Path(cli.output_dir).expanduser().resolve() if cli.output_dir else (pkg / "weights")
+    run_name = cli.run_name or default_run_name()
+    if cli.smoke and cli.run_name is None:
+        run_name = f"{run_name}_smoke"
+    output_dir = weights_root / run_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Per-run sync tree avoids mushing CSVs across sessions_root / prior runs.
+    sync_root = pkg / "m-synced-csvs" / run_name
     robot_sync = (
         Path(cli.robot_sync_dir).expanduser().resolve()
         if cli.robot_sync_dir
-        else (pkg / "m-synced-csvs" / f"{robot_root.name if robot_root else 'none'}_robot")
+        else (sync_root / f"{sessions_root.name}_{robot_root.name if robot_root else 'none'}_robot")
     )
     human_sync = (
         Path(cli.human_sync_dir).expanduser().resolve()
         if cli.human_sync_dir
-        else (pkg / "m-synced-csvs" / f"{human_root.name if human_root else 'none'}_human")
+        else (sync_root / f"{sessions_root.name}_{human_root.name if human_root else 'none'}_human")
     )
 
     robot_eef_dir = resolve_robot_eef_dir(robot_root, cli.robot_eef_dir) if robot_root else None
@@ -1011,13 +1029,7 @@ def main() -> None:
         print(f"Robot EEF NPZ dir (default {ROBOT_EEF_RELDIR}): {robot_eef_dir}")
     if human_pose_dir is not None:
         print(f"Human pose NPZ dir (default {HUMAN_POSE_RELDIR}): {human_pose_dir}")
-
-    weights_root = Path(cli.output_dir).expanduser().resolve() if cli.output_dir else (pkg / "weights")
-    run_name = cli.run_name or default_run_name()
-    if cli.smoke and cli.run_name is None:
-        run_name = f"{run_name}_smoke"
-    output_dir = weights_root / run_name
-    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Sync CSV root (per-run): {sync_root}")
 
     # mixed_lambda / mixed_human_pose: dual-route bridge settings
     mixed_lambda = float(cli.mixed_lambda)
@@ -1143,7 +1155,10 @@ def main() -> None:
             if cli.mixed_sync_dir and len(mixed_roots) == 1:
                 mixed_sync = Path(cli.mixed_sync_dir).expanduser().resolve()
             else:
-                mixed_sync = pkg / "m-synced-csvs" / f"{mixed_root.parent.name}_{mixed_root.name}_mixed"
+                mixed_sync = (
+                    sync_root
+                    / f"{sessions_root.name}_{mixed_root.parent.name}_{mixed_root.name}_mixed"
+                )
             mixed_sync_dirs.append(mixed_sync)
 
             pose_override = cli.mixed_hand_pose_dir if len(mixed_roots) == 1 else None

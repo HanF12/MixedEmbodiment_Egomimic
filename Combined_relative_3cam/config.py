@@ -35,7 +35,7 @@ import torch
 DEFAULT_NUM_QUERIES = 45  # keep Combined horizon (EgoMimic uses 100)
 
 # EgoMimic-matched training defaults
-DEFAULT_NUM_EPOCHS = 10000
+DEFAULT_NUM_EPOCHS = 8500
 # One epoch = one full pass over the longer modality's demo loader
 # (max(len(robot_loader), len(human_loader))); shorter modality is recycled.
 DEFAULT_BATCH_SIZE = 8
@@ -73,7 +73,7 @@ POSE_DIM = 8  # left 4 + right 4
 POSE_GRIP_INDICES = (POSE_DIM_PER_SIDE - 1, POSE_DIM - 1)  # (3, 7)
 # Shared binarize threshold for robot EEF pose grippers and joint-state grippers.
 # Human pose open/close is left as-is (typically already binary).
-ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD = 0.7
+ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD = 0.2
 HUMAN_STATE_DIM = POSE_DIM
 HUMAN_PROPRIO_DIM = POSE_DIM
 ROBOT_PROPRIO_DIM = ROBOT_JOINT_DIM  # EgoMimic: joints only

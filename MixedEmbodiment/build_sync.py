@@ -34,6 +34,7 @@ from MixedEmbodiment.dataloader_utils import (
     demo_id_from_joint_npy,
     demo_id_from_pose_npz,
     demo_id_from_robot_eef_npz,
+    prune_orphan_sync_csvs,
 )
 from MixedEmbodiment.data_synchronization import (
     EMBODIMENT_PRESETS,
@@ -154,6 +155,7 @@ def build_mixed_sync_csvs(
             require_valid_active_slots=True,
         )
         wrote.append(demo_id)
+    prune_orphan_sync_csvs(sync_dir, wrote)
     print(f"Done. Wrote {len(wrote)} mixed sync CSVs -> {sync_dir}")
     return wrote
 

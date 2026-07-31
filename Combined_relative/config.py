@@ -69,7 +69,7 @@ POSE_DIM = 8  # left 4 + right 4
 # Gripper dims in flattened [8] pose: left grip, right grip
 POSE_GRIP_INDICES = (POSE_DIM_PER_SIDE - 1, POSE_DIM - 1)  # (3, 7)
 # Robot EEF NPZ grippers only (not joint-state grippers; not human pose)
-ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD = 0.7
+ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD = 0.2
 HUMAN_STATE_DIM = POSE_DIM
 HUMAN_PROPRIO_DIM = POSE_DIM
 ROBOT_PROPRIO_DIM = ROBOT_JOINT_DIM  # EgoMimic: joints only

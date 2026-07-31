@@ -17,6 +17,21 @@ def resolve_path(path_like: str | Path) -> Path:
     return path
 
 
+def prune_orphan_sync_csvs(sync_dir: Path, keep_ids: set[str] | list[str]) -> int:
+    """Remove CSVs whose stems are not in keep_ids (stale leftovers from another data tree)."""
+    if not sync_dir.is_dir():
+        return 0
+    keep = set(keep_ids)
+    removed = 0
+    for p in sync_dir.glob("*.csv"):
+        if p.stem not in keep:
+            p.unlink()
+            removed += 1
+    if removed:
+        print(f"Pruned {removed} orphan sync CSV(s) from {sync_dir}")
+    return removed
+
+
 def demo_id_from_hash_filename(path: str | Path) -> str:
     """video_recording_...#demo_id.ext -> demo_id"""
     name = Path(path).name

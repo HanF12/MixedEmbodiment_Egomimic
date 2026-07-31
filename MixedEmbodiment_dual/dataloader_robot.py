@@ -13,7 +13,7 @@ from MixedEmbodiment_dual.config import (
     DEFAULT_NUM_QUERIES,
     EMBODIMENT_ROBOT,
     POSE_DIM,
-    ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD,
+    ROBOT_TELEOP_GRIPPER_BINARIZE_THRESHOLD,
     ROBOT_JOINT_DIM,
     ROBOT_SYNC_INDEX_COLUMNS,
     ROBOT_TEMP_CUT_INDEX_COLUMNS,
@@ -242,13 +242,15 @@ class RobotEpisodeDataset(Dataset):
                         left_j[int(df.loc[i, "left_joint_index"])],
                         right_j[int(df.loc[i, "right_joint_index"])],
                         rec_id=rec_id,
+                        binarize_grippers=True,
+                        gripper_threshold=ROBOT_TELEOP_GRIPPER_BINARIZE_THRESHOLD,
                     )
                 )
                 eidx = int(df.loc[i, "eef_pose_index"])
                 flat = flatten_bimanual_pose(eef_arr[eidx], rec_id=rec_id)
-                # Binarize EEF pose grippers (joint grippers binarized in concat_bimanual_joints).
+                # EEF NPZ grippers baked at 0.2; re-apply same thr (no-op on {0,1}).
                 flat = binarize_flat_pose_grippers(
-                    flat, threshold=ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD
+                    flat, threshold=ROBOT_TELEOP_GRIPPER_BINARIZE_THRESHOLD
                 )
                 self.eef_pose_data.append(flat)
                 self.sample_demo_idx.append(demo_idx)

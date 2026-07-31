@@ -270,8 +270,9 @@ class PreloadedBimanualEpisodeDataset(Dataset):
         joint_raw = self.joint_data[sample_idx]
         joint_data = (joint_raw - self.joint_mean) / self.joint_std
 
-        slice_end = min(demo_end_idx, sample_idx - 1 + self.num_queries)
-        future_list = self.joint_data[max(0, sample_idx - 1) : slice_end]
+        # actions[k] = joints[t+k] (chunk starts at current observation t)
+        slice_end = min(demo_end_idx, sample_idx + self.num_queries)
+        future_list = list(self.joint_data[sample_idx:slice_end])
         raw_length = len(future_list)
         pad_length = self.num_queries - raw_length
 

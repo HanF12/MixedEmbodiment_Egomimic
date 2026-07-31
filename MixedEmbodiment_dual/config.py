@@ -15,7 +15,7 @@ Shared pose (human hands / robot EEF / mixed hand+EEF), EgoMimic-style shared he
 Robot joints:
   14D = left 7 + right 7  (still absolute; mixed zeros the inactive arm)
   Gripper joint channels (indices 6 and 13) are binarized at load with the
-  same threshold as EEF pose grippers (ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD).
+  same threshold as EEF pose grippers (ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD = 0.2).
 
 Robot / mixed proprio: joints only [14] (robot_input_proj + robot CVAE)
 Human proprio: absolute pose [8]
@@ -78,9 +78,10 @@ POSE_DIM_PER_SIDE = 4  # xyz(3) + grip(1)
 POSE_DIM = 8  # left 4 + right 4
 # Gripper dims in flattened [8] pose: left grip, right grip
 POSE_GRIP_INDICES = (POSE_DIM_PER_SIDE - 1, POSE_DIM - 1)  # (3, 7)
-# Shared binarize threshold for robot EEF pose grippers and joint-state grippers.
-# Human pose open/close is left as-is (typically already binary).
-ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD = 0.7
+# Teleop + mixed: both use 0.2.
+ROBOT_TELEOP_GRIPPER_BINARIZE_THRESHOLD = 0.2
+ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD = 0.2
+ROBOT_JOINT_GRIPPER_BINARIZE_THRESHOLD = ROBOT_TELEOP_GRIPPER_BINARIZE_THRESHOLD
 HUMAN_STATE_DIM = POSE_DIM
 HUMAN_PROPRIO_DIM = POSE_DIM
 ROBOT_PROPRIO_DIM = ROBOT_JOINT_DIM  # EgoMimic: joints only
@@ -239,7 +240,7 @@ def concat_bimanual_joints(
     *,
     rec_id: str = "",
     binarize_grippers: bool = True,
-    gripper_threshold: float = ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD,
+    gripper_threshold: float = ROBOT_TELEOP_GRIPPER_BINARIZE_THRESHOLD,
 ) -> torch.Tensor:
     """
     Robot qpos: [7 left, 7 right] -> [14].
@@ -289,7 +290,7 @@ def flatten_bimanual_pose(pose_t: np.ndarray | torch.Tensor, *, rec_id: str = ""
 def binarize_flat_pose_grippers(
     flat_pose: torch.Tensor | np.ndarray,
     *,
-    threshold: float = ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD,
+    threshold: float = ROBOT_TELEOP_GRIPPER_BINARIZE_THRESHOLD,
 ) -> torch.Tensor:
     """
     Binarize left/right gripper dims in a flattened [8] pose.
