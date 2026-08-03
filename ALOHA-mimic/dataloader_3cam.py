@@ -27,7 +27,6 @@ class PreloadedMultiVideoJointDatasetNEW(Dataset):
         self.pad = pad  # Whether to pad output action sequence that after demonstration end
         self.demo_lengths = []
         self.transform = transform # any transformation that the data must undergo
-        self.temp_cut = 10 # number of frames to cut (from beginning)
         
         normalize_transform = transforms.Normalize(mean=[0.485, 0.456, 0.406],std =[0.229, 0.224, 0.225])       # preset ResNet normalization values
         base_normalization = transforms.Compose([transforms.ToTensor(), normalize_transform])                   # first apply 0-1 normalization, then apply ResNet normalization
@@ -154,23 +153,13 @@ class PreloadedMultiVideoJointDatasetNEW(Dataset):
                 print(f"WARNING: skipping {rec_id} — sync CSV has 0 rows (streams never aligned)")
                 continue
 
-            mask = (
-                (df_sync["bird_index"] >= self.temp_cut)
-                & (df_sync["left_index"] >= self.temp_cut)
-                & (df_sync["right_index"] >= self.temp_cut)
-                & (df_sync["joint_index"] >= self.temp_cut)
-            )
-            df_sync = df_sync[mask].reset_index(drop=True)
-            for col in ["bird_index", "left_index", "right_index", "joint_index"]:
-                df_sync[col] -= self.temp_cut
-
             required_cols = {"joint_index", "left_index", "right_index", "bird_index"}
             if not required_cols.issubset(df_sync.columns):
                 raise KeyError(f"Sync CSV '{csv_path}' missing columns: {required_cols - set(df_sync.columns)}")
 
             N_i = len(df_sync)
             if N_i == 0:
-                print(f"WARNING: skipping {rec_id} — no synced samples after temp_cut={self.temp_cut}")
+                print(f"WARNING: skipping {rec_id} — no synced samples")
                 continue
 
             demo_idx = self.num_demos
@@ -189,19 +178,11 @@ class PreloadedMultiVideoJointDatasetNEW(Dataset):
             left_arm_frames  = self._load_video_frames([left_arm_vid_path], resize_factor=1, label=f"Left Arm ({rec_id})")
             right_arm_frames = self._load_video_frames([right_arm_vid_path], resize_factor=1, label=f"Right Arm ({rec_id})")
 
-            # 3.1) forcefully cut x frames from beginning of each 
-            bird_frames      = bird_frames[self.temp_cut:]
-            left_arm_frames  = left_arm_frames[self.temp_cut:]
-            right_arm_frames = right_arm_frames[self.temp_cut:]
-
             # 4) Load joint data for this recording
             joint_arr = np.load(joint_npy_path)
             T_i, J_total = joint_arr.shape
             take = min(J_total, 7)
             raw_joint_list = [torch.from_numpy(joint_arr[t, :take].astype(np.float32)) for t in range(T_i)]
-            
-            # 4.1) forcefully cut x joint data from beginning of joint data
-            raw_joint_list = raw_joint_list[self.temp_cut:]
 
             bird_idxs = df_sync["bird_index"].to_numpy(dtype=np.int64)
             left_arm_idxs = df_sync["left_index"].to_numpy(dtype=np.int64)

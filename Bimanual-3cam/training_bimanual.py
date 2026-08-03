@@ -388,10 +388,6 @@ def main() -> None:
                 step=batch_counter,
             )
 
-        latest_path = output_dir / "bimanual_act_latest.pth"
-        torch.save(model.state_dict(), latest_path)
-        if wandb_run is not None:
-            wandb.save(str(latest_path.resolve()))
         if avg_val < best_val:
             best_val = avg_val
             best_path = output_dir / "bimanual_act_best.pth"

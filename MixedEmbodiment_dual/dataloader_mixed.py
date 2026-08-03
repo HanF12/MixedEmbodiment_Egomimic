@@ -14,7 +14,6 @@ from MixedEmbodiment_dual.config import (
     EMBODIMENT_MIXED,
     JOINT_DIM_PER_ARM,
     MIXED_SYNC_INDEX_COLUMNS,
-    MIXED_TEMP_CUT_INDEX_COLUMNS,
     POSE_DIM,
     ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD,
     ROBOT_JOINT_DIM,
@@ -71,7 +70,6 @@ class MixedEpisodeDataset(Dataset):
         num_queries: int = DEFAULT_NUM_QUERIES,
         transform: str = "resnet_normalization",
         max_demos: int | None = None,
-        temp_cut: int = 10,
         resize_factor: float = 1.0,
         max_sync_rows: int | None = None,
         jpeg_in_ram: bool = False,
@@ -85,7 +83,6 @@ class MixedEpisodeDataset(Dataset):
         del front_vids_dir  # sync-only; not a model camera
 
         self.num_queries = int(num_queries)
-        self.temp_cut = int(temp_cut)
         self.resize_factor = float(resize_factor)
         self.max_sync_rows = int(max_sync_rows) if max_sync_rows is not None else None
         self.jpeg_in_ram = bool(jpeg_in_ram)
@@ -160,7 +157,7 @@ class MixedEpisodeDataset(Dataset):
             hand_pose = np.asarray(hand_npz["pose"], dtype=np.float32)
             eef_pose = np.asarray(eef_npz["pose"], dtype=np.float32)
             # Same as robot/human: re-check validity in the dataset (sync already filtered,
-            # but this catches rows that become inconsistent after temp_cut / caps).
+            # but this catches rows that become inconsistent after caps).
             hand_ok = xyz_gripper_valid_mask(
                 valid_pos=hand_npz["valid_pos"],
                 valid_open=hand_npz["valid_open"],
@@ -174,16 +171,6 @@ class MixedEpisodeDataset(Dataset):
                 required_slots=(self.robot_slot,),
             )
 
-            # Match robot/human temp_cut: drop early video/joint rows, remapped indices
-            # into sliced arrays. hand_pose_index / eef_pose_index stay absolute into
-            # the full NPZs (different timelines; must not subtract temp_cut).
-            if self.temp_cut > 0:
-                mask = np.ones(len(df), dtype=bool)
-                for col in MIXED_TEMP_CUT_INDEX_COLUMNS:
-                    mask &= df[col].to_numpy() >= self.temp_cut
-                df = df.loc[mask].copy()
-                for col in MIXED_TEMP_CUT_INDEX_COLUMNS:
-                    df[col] = df[col] - self.temp_cut
 
             if len(df) > 0:
                 keep = []
@@ -208,11 +195,11 @@ class MixedEpisodeDataset(Dataset):
 
             bird_f = load_video_frames(
                 bird_by[rec_id], resize_factor=self.resize_factor, label=f"bird({rec_id})"
-            )[self.temp_cut :]
+            )
             wrist_f = load_video_frames(
                 wrist_by[rec_id], resize_factor=self.resize_factor, label=f"wrist({rec_id})"
-            )[self.temp_cut :]
-            joint_arr = np.load(joint_by[rec_id])[self.temp_cut :]
+            )
+            joint_arr = np.load(joint_by[rec_id])
 
             demo_idx = self.num_demos
             self.demo_start_idx.append(self.num_samples)

@@ -93,13 +93,11 @@ class PreloadedBimanualEpisodeDataset(Dataset):
         pad: bool = True,
         transform: str = "resnet_normalization",
         max_demos: int | None = None,
-        temp_cut: int = 10,
     ) -> None:
         super().__init__()
         self.num_queries = int(num_queries)
         self.pad = bool(pad)
         self.transform = transform
-        self.temp_cut = int(temp_cut)
         self.demo_lengths: list[int] = []
 
         normalize_transform = transforms.Normalize(
@@ -177,32 +175,17 @@ class PreloadedBimanualEpisodeDataset(Dataset):
                 print(f"WARNING: skipping {rec_id} - sync CSV has 0 rows")
                 continue
 
-            mask = (
-                (df_sync["left_joint_index"] >= self.temp_cut)
-                & (df_sync["right_joint_index"] >= self.temp_cut)
-                & (df_sync["left_index"] >= self.temp_cut)
-                & (df_sync["right_index"] >= self.temp_cut)
-                & (df_sync["bird_index"] >= self.temp_cut)
-                & (df_sync["front_index"] >= self.temp_cut)
-            )
-            df_sync = df_sync[mask].reset_index(drop=True)
-            for col in SYNC_INDEX_COLUMNS:
-                df_sync[col] -= self.temp_cut
-            if df_sync.empty:
-                print(f"WARNING: skipping {rec_id} - no synced rows after temp_cut={self.temp_cut}")
-                continue
-
             demo_idx = self.num_demos
             demo_start = len(self.joint_data)
             self.demo_start_idx.append(demo_start)
 
-            left_frames = _load_video_frames(left_arm_vids_by_id[rec_id], label=f"Left wrist ({rec_id})")[self.temp_cut :]
-            right_frames = _load_video_frames(right_arm_vids_by_id[rec_id], label=f"Right wrist ({rec_id})")[self.temp_cut :]
-            bird_frames = _load_video_frames(bird_vids_by_id[rec_id], label=f"Bird ({rec_id})")[self.temp_cut :]
-            front_frames = _load_video_frames(front_vids_by_id[rec_id], label=f"Front ({rec_id})")[self.temp_cut :]
+            left_frames = _load_video_frames(left_arm_vids_by_id[rec_id], label=f"Left wrist ({rec_id})")
+            right_frames = _load_video_frames(right_arm_vids_by_id[rec_id], label=f"Right wrist ({rec_id})")
+            bird_frames = _load_video_frames(bird_vids_by_id[rec_id], label=f"Bird ({rec_id})")
+            front_frames = _load_video_frames(front_vids_by_id[rec_id], label=f"Front ({rec_id})")
 
-            left_joint_arr = np.load(left_joint_npy_by_id[rec_id]).astype(np.float32)[self.temp_cut :]
-            right_joint_arr = np.load(right_joint_npy_by_id[rec_id]).astype(np.float32)[self.temp_cut :]
+            left_joint_arr = np.load(left_joint_npy_by_id[rec_id]).astype(np.float32)
+            right_joint_arr = np.load(right_joint_npy_by_id[rec_id]).astype(np.float32)
             if left_joint_arr.ndim != 2 or right_joint_arr.ndim != 2:
                 raise ValueError(f"Expected 2D joint arrays for {rec_id}")
             left_joint_lookup = [torch.from_numpy(step) for step in left_joint_arr]

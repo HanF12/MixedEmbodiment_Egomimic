@@ -14,9 +14,8 @@ Shared pose (human hands / robot EEF / mixed hand+EEF), EgoMimic-style shared he
 
 Robot joints:
   14D = left 7 + right 7  (still absolute; mixed zeros the inactive arm)
-  Teleop gripper joints (indices 6 and 13) are binarized at load at
-  ROBOT_TELEOP_GRIPPER_BINARIZE_THRESHOLD (0.2). Mixed EEF/joints use the
-  same value via ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD (0.2).
+  Robot/mixed EEF pose grippers (NPZ) and joint grippers (NPY) are binarized at
+  load with independent thresholds (shared across teleop + mixed).
 
 Robot / mixed proprio: joints only [14] (robot_input_proj + robot CVAE)
 Human proprio: absolute pose [8]
@@ -79,13 +78,15 @@ POSE_DIM_PER_SIDE = 4  # xyz(3) + grip(1)
 POSE_DIM = 8  # left 4 + right 4
 # Gripper dims in flattened [8] pose: left grip, right grip
 POSE_GRIP_INDICES = (POSE_DIM_PER_SIDE - 1, POSE_DIM - 1)  # (3, 7)
-# Gripper binarize thresholds (human hand open/close left as-is / baked in NPZ).
-# Pure bimanual teleop (robot modality): joints at load + EEF NPZ on disk use 0.2.
-ROBOT_TELEOP_GRIPPER_BINARIZE_THRESHOLD = 0.2
-# Mixed modality: EEF at load + joints at load — match teleop at 0.2.
-ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD = 0.2
-# Back-compat alias used by teleop robot dataloaders / concat_bimanual_joints default.
-ROBOT_JOINT_GRIPPER_BINARIZE_THRESHOLD = ROBOT_TELEOP_GRIPPER_BINARIZE_THRESHOLD
+# Gripper binarize thresholds at load (human hand open/close left as-is).
+# NPZ = robot/mixed EEF pose grip channel; NPY = joint gripper channels.
+# Same values apply to teleop and mixed (set independently via CLI).
+ROBOT_NPZ_GRIPPER_BINARIZE_THRESHOLD = 0.8
+ROBOT_NPY_GRIPPER_BINARIZE_THRESHOLD = 0.8
+# Back-compat aliases
+ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD = ROBOT_NPZ_GRIPPER_BINARIZE_THRESHOLD
+ROBOT_TELEOP_GRIPPER_BINARIZE_THRESHOLD = ROBOT_NPY_GRIPPER_BINARIZE_THRESHOLD
+ROBOT_JOINT_GRIPPER_BINARIZE_THRESHOLD = ROBOT_NPY_GRIPPER_BINARIZE_THRESHOLD
 HUMAN_STATE_DIM = POSE_DIM
 HUMAN_PROPRIO_DIM = POSE_DIM
 ROBOT_PROPRIO_DIM = ROBOT_JOINT_DIM  # EgoMimic: joints only
@@ -107,6 +108,7 @@ EMBODIMENT_MIXED = 2
 EMBODIMENT_NAMES = ("robot", "human", "mixed")
 
 # Sync CSVs still include front_index for timestamp alignment (not a model cam).
+# Leading-frame temp_cut removed from dataloaders; see legacy_temp_cut.py
 ROBOT_SYNC_INDEX_COLUMNS = (
     "left_joint_index",
     "right_joint_index",
@@ -117,14 +119,6 @@ ROBOT_SYNC_INDEX_COLUMNS = (
     "eef_pose_index",
 )
 
-ROBOT_TEMP_CUT_INDEX_COLUMNS = (
-    "left_joint_index",
-    "right_joint_index",
-    "left_index",
-    "right_index",
-    "bird_index",
-    "front_index",
-)
 
 HUMAN_SYNC_INDEX_COLUMNS = (
     "bird_index",
@@ -141,12 +135,6 @@ MIXED_SYNC_INDEX_COLUMNS = (
     "eef_pose_index",
 )
 
-MIXED_TEMP_CUT_INDEX_COLUMNS = (
-    "bird_index",
-    "front_index",
-    "wrist_index",
-    "joint_index",
-)
 
 ROBOT_EEF_RELDIR = Path("joint-data") / "combined_npz_commonframe"
 ROBOT_EEF_COORD_FRAME = (
@@ -237,13 +225,13 @@ def concat_bimanual_joints(
     *,
     rec_id: str = "",
     binarize_grippers: bool = True,
-    gripper_threshold: float = ROBOT_TELEOP_GRIPPER_BINARIZE_THRESHOLD,
+    gripper_threshold: float = ROBOT_NPY_GRIPPER_BINARIZE_THRESHOLD,
 ) -> torch.Tensor:
     """
     Robot qpos: [7 left, 7 right] -> [14].
 
     By default, gripper joints (last channel per arm; flattened indices 6 and 13)
-    are binarized with the same threshold as EEF pose grippers.
+    are binarized with ROBOT_NPY_GRIPPER_BINARIZE_THRESHOLD.
     """
     left_tensor = torch.as_tensor(left_step, dtype=torch.float32).reshape(-1)
     right_tensor = torch.as_tensor(right_step, dtype=torch.float32).reshape(-1)
@@ -287,7 +275,7 @@ def flatten_bimanual_pose(pose_t: np.ndarray | torch.Tensor, *, rec_id: str = ""
 def binarize_flat_pose_grippers(
     flat_pose: torch.Tensor | np.ndarray,
     *,
-    threshold: float = ROBOT_TELEOP_GRIPPER_BINARIZE_THRESHOLD,
+    threshold: float = ROBOT_NPZ_GRIPPER_BINARIZE_THRESHOLD,
 ) -> torch.Tensor:
     """
     Binarize left/right gripper dims in a flattened [8] pose.
@@ -342,7 +330,7 @@ def compose_mixed_flat_pose(
     hand_slot: int,
     robot_slot: int,
     binarize_eef_gripper: bool = True,
-    eef_gripper_threshold: float = ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD,
+    eef_gripper_threshold: float = ROBOT_NPZ_GRIPPER_BINARIZE_THRESHOLD,
     rec_id: str = "",
 ) -> torch.Tensor:
     """
@@ -376,7 +364,7 @@ def single_arm_joint_vector(
     robot_side: str,
     rec_id: str = "",
     binarize_grippers: bool = True,
-    gripper_threshold: float = ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD,
+    gripper_threshold: float = ROBOT_NPY_GRIPPER_BINARIZE_THRESHOLD,
 ) -> torch.Tensor:
     """
     Pack one arm's joints into a [14] vector; inactive arm is zeros.
@@ -462,6 +450,8 @@ def build_run_metadata(
     num_epochs: int = DEFAULT_NUM_EPOCHS,
     batch_size: int = DEFAULT_BATCH_SIZE,
     lr: float = DEFAULT_LR,
+    npz_gripper_binarize_threshold: float = ROBOT_NPZ_GRIPPER_BINARIZE_THRESHOLD,
+    npy_gripper_binarize_threshold: float = ROBOT_NPY_GRIPPER_BINARIZE_THRESHOLD,
 ) -> dict[str, Any]:
     mixed_roots_list = [str(p) for p in (mixed_data_roots or [])]
     mixed_sync_list = [str(p) for p in (mixed_sync_dirs or [])]
@@ -514,16 +504,20 @@ def build_run_metadata(
         "robot_eef_reldir": str(ROBOT_EEF_RELDIR),
         "human_pose_reldir": str(HUMAN_POSE_RELDIR),
         "gripper_semantics": (
-            "shared last per-side dim: human open/close (typically binary); "
-            f"pure teleop robot: EEF NPZ + joint grippers use "
-            f"{ROBOT_TELEOP_GRIPPER_BINARIZE_THRESHOLD}; "
-            f"mixed modality EEF/joints use {ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD}; "
+            "shared last per-side dim: human open/close left as-is; "
+            f"robot/mixed EEF pose (NPZ) binarized at load with threshold "
+            f"{float(npz_gripper_binarize_threshold)}; "
+            f"robot/mixed joint grippers (NPY) binarized at load with threshold "
+            f"{float(npy_gripper_binarize_threshold)}; "
             "relative pose deltas include gripper dims"
         ),
-        "robot_teleop_gripper_binarize_threshold": float(ROBOT_TELEOP_GRIPPER_BINARIZE_THRESHOLD),
-        "robot_eef_gripper_binarize_threshold": float(ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD),
-        "robot_joint_gripper_binarize_threshold": float(ROBOT_TELEOP_GRIPPER_BINARIZE_THRESHOLD),
-        "mixed_gripper_binarize_threshold": float(ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD),
+        "npz_gripper_binarize_threshold": float(npz_gripper_binarize_threshold),
+        "npy_gripper_binarize_threshold": float(npy_gripper_binarize_threshold),
+        # Back-compat keys (same shared thresholds for teleop + mixed)
+        "robot_eef_gripper_binarize_threshold": float(npz_gripper_binarize_threshold),
+        "robot_joint_gripper_binarize_threshold": float(npy_gripper_binarize_threshold),
+        "robot_teleop_gripper_binarize_threshold": float(npy_gripper_binarize_threshold),
+        "mixed_gripper_binarize_threshold": float(npz_gripper_binarize_threshold),
         "max_skew_s": float(max_skew_s),
         "pose_loss_weight": float(pose_loss_weight),
         "joint_loss_weight": float(joint_loss_weight),

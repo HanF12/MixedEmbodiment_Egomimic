@@ -82,6 +82,7 @@ EMBODIMENT_ROBOT = 0
 EMBODIMENT_HUMAN = 1
 EMBODIMENT_NAMES = ("robot", "human")
 
+# Leading-frame temp_cut removed from dataloaders; see legacy_temp_cut.py
 ROBOT_SYNC_INDEX_COLUMNS = (
     "left_joint_index",
     "right_joint_index",
@@ -92,14 +93,6 @@ ROBOT_SYNC_INDEX_COLUMNS = (
     "eef_pose_index",
 )
 
-ROBOT_TEMP_CUT_INDEX_COLUMNS = (
-    "left_joint_index",
-    "right_joint_index",
-    "left_index",
-    "right_index",
-    "bird_index",
-    "front_index",
-)
 
 HUMAN_SYNC_INDEX_COLUMNS = (
     "bird_index",

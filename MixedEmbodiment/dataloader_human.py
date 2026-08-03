@@ -69,7 +69,6 @@ class HumanEpisodeDataset(Dataset):
         num_queries: int = DEFAULT_NUM_QUERIES,
         transform: str = "resnet_normalization",
         max_demos: int | None = None,
-        temp_cut: int = 10,
         resize_factor: float = 1.0,
         max_sync_rows: int | None = None,
         require_valid_pos: bool = True,
@@ -78,7 +77,6 @@ class HumanEpisodeDataset(Dataset):
     ) -> None:
         super().__init__()
         self.num_queries = int(num_queries)
-        self.temp_cut = int(temp_cut)
         self.resize_factor = float(resize_factor)
         self.max_sync_rows = int(max_sync_rows) if max_sync_rows is not None else None
         self.require_valid_pos = bool(require_valid_pos)
@@ -148,15 +146,6 @@ class HumanEpisodeDataset(Dataset):
                     required_slots=(0, 1),
                 )
 
-            mask = df["bird_index"].to_numpy() >= self.temp_cut
-            mask = mask & (df["front_index"].to_numpy() >= self.temp_cut)
-            # pose_index indexes the original NPZ; do not temp_cut the pose timeline.
-            # front_index only used for sync filtering (not loaded as a model camera).
-            df = df[mask].reset_index(drop=True)
-            df["bird_index"] = df["bird_index"] - self.temp_cut
-            df["front_index"] = df["front_index"] - self.temp_cut
-            if df.empty:
-                continue
 
             if frame_ok is not None:
                 keep = []
@@ -173,9 +162,7 @@ class HumanEpisodeDataset(Dataset):
             if self.max_sync_rows is not None and len(df) > self.max_sync_rows:
                 df = df.iloc[: self.max_sync_rows].reset_index(drop=True)
 
-            bird_f = load_video_frames(bird_by[rec_id], resize_factor=self.resize_factor, label=f"bird({rec_id})")[
-                self.temp_cut :
-            ]
+            bird_f = load_video_frames(bird_by[rec_id], resize_factor=self.resize_factor, label=f"bird({rec_id})")
             demo_idx = self.num_demos
             self.demo_start_idx.append(len(self.pose_data))
             n_i = len(df)

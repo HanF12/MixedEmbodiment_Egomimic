@@ -15,7 +15,6 @@ from Combined_relative_xyz_3cam.config import (
     POSE_DIM,
     ROBOT_JOINT_DIM,
     ROBOT_SYNC_INDEX_COLUMNS,
-    ROBOT_TEMP_CUT_INDEX_COLUMNS,
     camera_mask_tensor,
     concat_bimanual_joints,
     flatten_bimanual_pose,
@@ -75,7 +74,6 @@ class RobotEpisodeDataset(Dataset):
         num_queries: int = DEFAULT_NUM_QUERIES,
         transform: str = "resnet_normalization",
         max_demos: int | None = None,
-        temp_cut: int = 10,
         resize_factor: float = 1.0,
         max_sync_rows: int | None = None,
         require_valid_eef: bool = True,
@@ -84,7 +82,6 @@ class RobotEpisodeDataset(Dataset):
     ) -> None:
         super().__init__()
         self.num_queries = int(num_queries)
-        self.temp_cut = int(temp_cut)
         self.resize_factor = float(resize_factor)
         self.max_sync_rows = int(max_sync_rows) if max_sync_rows is not None else None
         self.require_valid_eef = bool(require_valid_eef)
@@ -165,15 +162,6 @@ class RobotEpisodeDataset(Dataset):
                     required_slots=(0, 1),
                 )
 
-            # temp_cut only on video/joint indices — NOT on eef_pose_index (original NPZ timeline)
-            mask = np.ones(len(df), dtype=bool)
-            for col in ROBOT_TEMP_CUT_INDEX_COLUMNS:
-                mask &= df[col].to_numpy() >= self.temp_cut
-            df = df[mask].reset_index(drop=True)
-            for col in ROBOT_TEMP_CUT_INDEX_COLUMNS:
-                df[col] = df[col] - self.temp_cut
-            if df.empty:
-                continue
 
             if frame_ok is not None:
                 keep = []
@@ -190,17 +178,11 @@ class RobotEpisodeDataset(Dataset):
             if self.max_sync_rows is not None and len(df) > self.max_sync_rows:
                 df = df.iloc[: self.max_sync_rows].reset_index(drop=True)
 
-            bird_f = load_video_frames(bird_by[rec_id], resize_factor=self.resize_factor, label=f"bird({rec_id})")[
-                self.temp_cut :
-            ]
-            left_f = load_video_frames(left_by[rec_id], resize_factor=self.resize_factor, label=f"left({rec_id})")[
-                self.temp_cut :
-            ]
-            right_f = load_video_frames(right_by[rec_id], resize_factor=self.resize_factor, label=f"right({rec_id})")[
-                self.temp_cut :
-            ]
-            left_j = np.load(left_j_by[rec_id]).astype(np.float32)[self.temp_cut :]
-            right_j = np.load(right_j_by[rec_id]).astype(np.float32)[self.temp_cut :]
+            bird_f = load_video_frames(bird_by[rec_id], resize_factor=self.resize_factor, label=f"bird({rec_id})")
+            left_f = load_video_frames(left_by[rec_id], resize_factor=self.resize_factor, label=f"left({rec_id})")
+            right_f = load_video_frames(right_by[rec_id], resize_factor=self.resize_factor, label=f"right({rec_id})")
+            left_j = np.load(left_j_by[rec_id]).astype(np.float32)
+            right_j = np.load(right_j_by[rec_id]).astype(np.float32)
 
             demo_idx = self.num_demos
             self.demo_start_idx.append(len(self.joint_data))

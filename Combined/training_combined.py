@@ -889,8 +889,6 @@ def main() -> None:
                 step=step,
             )
 
-        latest = output_dir / "combined_act_latest.pth"
-        torch.save(model.state_dict(), latest)
         if avg < best:
             best = avg
             torch.save(model.state_dict(), output_dir / "combined_act_best.pth")

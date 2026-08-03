@@ -13,10 +13,10 @@ from MixedEmbodiment.config import (
     DEFAULT_NUM_QUERIES,
     EMBODIMENT_ROBOT,
     POSE_DIM,
-    ROBOT_TELEOP_GRIPPER_BINARIZE_THRESHOLD,
+    ROBOT_NPY_GRIPPER_BINARIZE_THRESHOLD,
+    ROBOT_NPZ_GRIPPER_BINARIZE_THRESHOLD,
     ROBOT_JOINT_DIM,
     ROBOT_SYNC_INDEX_COLUMNS,
-    ROBOT_TEMP_CUT_INDEX_COLUMNS,
     binarize_flat_pose_grippers,
     camera_mask_tensor,
     concat_bimanual_joints,
@@ -77,21 +77,23 @@ class RobotEpisodeDataset(Dataset):
         num_queries: int = DEFAULT_NUM_QUERIES,
         transform: str = "resnet_normalization",
         max_demos: int | None = None,
-        temp_cut: int = 10,
         resize_factor: float = 1.0,
         max_sync_rows: int | None = None,
         require_valid_eef: bool = True,
         jpeg_in_ram: bool = False,
         jpeg_quality: int = 90,
+        npz_gripper_binarize_threshold: float = ROBOT_NPZ_GRIPPER_BINARIZE_THRESHOLD,
+        npy_gripper_binarize_threshold: float = ROBOT_NPY_GRIPPER_BINARIZE_THRESHOLD,
     ) -> None:
         super().__init__()
         self.num_queries = int(num_queries)
-        self.temp_cut = int(temp_cut)
         self.resize_factor = float(resize_factor)
         self.max_sync_rows = int(max_sync_rows) if max_sync_rows is not None else None
         self.require_valid_eef = bool(require_valid_eef)
         self.jpeg_in_ram = bool(jpeg_in_ram)
         self.jpeg_quality = int(jpeg_quality)
+        self.npz_gripper_binarize_threshold = float(npz_gripper_binarize_threshold)
+        self.npy_gripper_binarize_threshold = float(npy_gripper_binarize_threshold)
         self.image_transform = build_image_transform(transform)
 
         bird_vids = sorted(resolve_path(bird_vids_dir).glob("*.mp4"))
@@ -173,15 +175,6 @@ class RobotEpisodeDataset(Dataset):
                     required_slots=(0, 1),
                 )
 
-            # temp_cut only on video/joint indices — NOT on eef_pose_index (original NPZ timeline)
-            mask = np.ones(len(df), dtype=bool)
-            for col in ROBOT_TEMP_CUT_INDEX_COLUMNS:
-                mask &= df[col].to_numpy() >= self.temp_cut
-            df = df[mask].reset_index(drop=True)
-            for col in ROBOT_TEMP_CUT_INDEX_COLUMNS:
-                df[col] = df[col] - self.temp_cut
-            if df.empty:
-                continue
 
             if frame_ok is not None:
                 keep = []
@@ -198,17 +191,11 @@ class RobotEpisodeDataset(Dataset):
             if self.max_sync_rows is not None and len(df) > self.max_sync_rows:
                 df = df.iloc[: self.max_sync_rows].reset_index(drop=True)
 
-            bird_f = load_video_frames(bird_by[rec_id], resize_factor=self.resize_factor, label=f"bird({rec_id})")[
-                self.temp_cut :
-            ]
-            left_f = load_video_frames(left_by[rec_id], resize_factor=self.resize_factor, label=f"left({rec_id})")[
-                self.temp_cut :
-            ]
-            right_f = load_video_frames(right_by[rec_id], resize_factor=self.resize_factor, label=f"right({rec_id})")[
-                self.temp_cut :
-            ]
-            left_j = np.load(left_j_by[rec_id]).astype(np.float32)[self.temp_cut :]
-            right_j = np.load(right_j_by[rec_id]).astype(np.float32)[self.temp_cut :]
+            bird_f = load_video_frames(bird_by[rec_id], resize_factor=self.resize_factor, label=f"bird({rec_id})")
+            left_f = load_video_frames(left_by[rec_id], resize_factor=self.resize_factor, label=f"left({rec_id})")
+            right_f = load_video_frames(right_by[rec_id], resize_factor=self.resize_factor, label=f"right({rec_id})")
+            left_j = np.load(left_j_by[rec_id]).astype(np.float32)
+            right_j = np.load(right_j_by[rec_id]).astype(np.float32)
 
             demo_idx = self.num_demos
             self.demo_start_idx.append(len(self.joint_data))
@@ -243,14 +230,13 @@ class RobotEpisodeDataset(Dataset):
                         right_j[int(df.loc[i, "right_joint_index"])],
                         rec_id=rec_id,
                         binarize_grippers=True,
-                        gripper_threshold=ROBOT_TELEOP_GRIPPER_BINARIZE_THRESHOLD,
+                        gripper_threshold=self.npy_gripper_binarize_threshold,
                     )
                 )
                 eidx = int(df.loc[i, "eef_pose_index"])
                 flat = flatten_bimanual_pose(eef_arr[eidx], rec_id=rec_id)
-                # EEF NPZ grippers are baked at 0.2; re-apply same thr (no-op on {0,1}).
                 flat = binarize_flat_pose_grippers(
-                    flat, threshold=ROBOT_TELEOP_GRIPPER_BINARIZE_THRESHOLD
+                    flat, threshold=self.npz_gripper_binarize_threshold
                 )
                 self.eef_pose_data.append(flat)
                 self.sample_demo_idx.append(demo_idx)

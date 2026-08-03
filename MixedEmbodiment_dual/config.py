@@ -15,7 +15,7 @@ Shared pose (human hands / robot EEF / mixed hand+EEF), EgoMimic-style shared he
 Robot joints:
   14D = left 7 + right 7  (still absolute; mixed zeros the inactive arm)
   Gripper joint channels (indices 6 and 13) are binarized at load with the
-  same threshold as EEF pose grippers (ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD = 0.2).
+  same threshold as EEF pose grippers (ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD = 0.8).
 
 Robot / mixed proprio: joints only [14] (robot_input_proj + robot CVAE)
 Human proprio: absolute pose [8]
@@ -79,8 +79,8 @@ POSE_DIM = 8  # left 4 + right 4
 # Gripper dims in flattened [8] pose: left grip, right grip
 POSE_GRIP_INDICES = (POSE_DIM_PER_SIDE - 1, POSE_DIM - 1)  # (3, 7)
 # Teleop + mixed: both use 0.2.
-ROBOT_TELEOP_GRIPPER_BINARIZE_THRESHOLD = 0.2
-ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD = 0.2
+ROBOT_TELEOP_GRIPPER_BINARIZE_THRESHOLD = 0.8
+ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD = 0.8
 ROBOT_JOINT_GRIPPER_BINARIZE_THRESHOLD = ROBOT_TELEOP_GRIPPER_BINARIZE_THRESHOLD
 HUMAN_STATE_DIM = POSE_DIM
 HUMAN_PROPRIO_DIM = POSE_DIM
@@ -110,6 +110,7 @@ MIXED_HUMAN_POSE_HAND4 = "hand4"
 MIXED_HUMAN_POSE_MODES = (MIXED_HUMAN_POSE_FULL8, MIXED_HUMAN_POSE_HAND4)
 
 # Sync CSVs still include front_index for timestamp alignment (not a model cam).
+# Leading-frame temp_cut removed from dataloaders; see legacy_temp_cut.py
 ROBOT_SYNC_INDEX_COLUMNS = (
     "left_joint_index",
     "right_joint_index",
@@ -120,14 +121,6 @@ ROBOT_SYNC_INDEX_COLUMNS = (
     "eef_pose_index",
 )
 
-ROBOT_TEMP_CUT_INDEX_COLUMNS = (
-    "left_joint_index",
-    "right_joint_index",
-    "left_index",
-    "right_index",
-    "bird_index",
-    "front_index",
-)
 
 HUMAN_SYNC_INDEX_COLUMNS = (
     "bird_index",
@@ -144,12 +137,6 @@ MIXED_SYNC_INDEX_COLUMNS = (
     "eef_pose_index",
 )
 
-MIXED_TEMP_CUT_INDEX_COLUMNS = (
-    "bird_index",
-    "front_index",
-    "wrist_index",
-    "joint_index",
-)
 
 ROBOT_EEF_RELDIR = Path("joint-data") / "combined_npz_commonframe"
 ROBOT_EEF_COORD_FRAME = (

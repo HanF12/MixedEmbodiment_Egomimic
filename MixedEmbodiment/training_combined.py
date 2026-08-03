@@ -66,6 +66,8 @@ from MixedEmbodiment.config import (  # noqa: E402
     POSE_DIM,
     ROBOT_EEF_RELDIR,
     ROBOT_JOINT_DIM,
+    ROBOT_NPY_GRIPPER_BINARIZE_THRESHOLD,
+    ROBOT_NPZ_GRIPPER_BINARIZE_THRESHOLD,
     build_run_metadata,
     default_run_name,
     discover_sessions_roots,
@@ -232,6 +234,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--joint_loss_weight", type=float, default=1.0)
     p.add_argument("--kl_weight", type=float, default=DEFAULT_KL_WEIGHT)
     p.add_argument("--hand_lambda", type=float, default=DEFAULT_HAND_LAMBDA, help="EgoMimic human loss scale")
+    p.add_argument(
+        "--npz_gripper_binarize_threshold",
+        type=float,
+        default=ROBOT_NPZ_GRIPPER_BINARIZE_THRESHOLD,
+        help=(
+            "Binarize robot/mixed EEF pose grippers from NPZ at load "
+            f"(shared across teleop + mixed; default {ROBOT_NPZ_GRIPPER_BINARIZE_THRESHOLD}). "
+            "Human hand poses are not re-binarized."
+        ),
+    )
+    p.add_argument(
+        "--npy_gripper_binarize_threshold",
+        type=float,
+        default=ROBOT_NPY_GRIPPER_BINARIZE_THRESHOLD,
+        help=(
+            "Binarize robot/mixed joint grippers from NPY at load "
+            f"(shared across teleop + mixed; default {ROBOT_NPY_GRIPPER_BINARIZE_THRESHOLD})."
+        ),
+    )
     p.add_argument(
         "--mixed_lambda",
         type=float,
@@ -868,6 +889,8 @@ def main() -> None:
             max_sync_rows=cli.max_sync_rows,
             jpeg_in_ram=cli.jpeg_in_ram,
             jpeg_quality=cli.jpeg_quality,
+            npz_gripper_binarize_threshold=cli.npz_gripper_binarize_threshold,
+            npy_gripper_binarize_threshold=cli.npy_gripper_binarize_threshold,
         )
         np.savez(
             output_dir / "normalization_stats_robot.npz",
@@ -988,6 +1011,8 @@ def main() -> None:
                 max_sync_rows=cli.max_sync_rows,
                 jpeg_in_ram=cli.jpeg_in_ram,
                 jpeg_quality=cli.jpeg_quality,
+                npz_gripper_binarize_threshold=cli.npz_gripper_binarize_threshold,
+                npy_gripper_binarize_threshold=cli.npy_gripper_binarize_threshold,
             )
             mixed_children.append(child)
 
@@ -1030,6 +1055,8 @@ def main() -> None:
         num_epochs=cli.epochs,
         batch_size=cli.batch,
         lr=cli.lr,
+        npz_gripper_binarize_threshold=cli.npz_gripper_binarize_threshold,
+        npy_gripper_binarize_threshold=cli.npy_gripper_binarize_threshold,
     )
     meta["jpeg_in_ram"] = bool(cli.jpeg_in_ram)
     meta["jpeg_quality"] = int(cli.jpeg_quality) if cli.jpeg_in_ram else None
