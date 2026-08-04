@@ -285,7 +285,7 @@ parser.add_argument(
 parser.add_argument(
     "--gripper_threshold_left",
     type=float,
-    default=0.35,
+    default=0.6,
     help="[binary] Left gripper: denormalized pred < threshold → 0, else 70",
 )
 parser.add_argument(
@@ -312,8 +312,8 @@ parser.add_argument(
     default=80.0,
     help="[continuous] Clamp scaled gripper cmd to this (set <0 to disable)",
 )
-parser.add_argument("--max_joint_speed", type=float, default=0.35)
-parser.add_argument("--max_gripper_speed", type=float, default=70)
+parser.add_argument("--max_joint_speed", type=float, default=0.5)
+parser.add_argument("--max_gripper_speed", type=float, default=100000)
 parser.add_argument("--bird_role", choices=("left", "right", "center", "front"), default="center")
 parser.add_argument("--bird_serial", type=str, default=None)
 parser.add_argument("--bird_color_fps", type=int, default=15)

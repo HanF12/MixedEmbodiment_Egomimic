@@ -448,6 +448,11 @@ def replay(
     labels = ", ".join(traj.label for traj, _ in arms)
     rospy.loginfo(f"Replaying {n_steps} steps on: {labels}")
     rospy.loginfo("Watch the SLAVE (follower) arms — host leaders are not commanded.")
+    gmax_note = "none" if gripper_max is None else f"{gripper_max:g}"
+    rospy.loginfo(
+        f"Gripper map: published = raw * scale, clamp max={gmax_note} "
+        f"(scale={gripper_scale:g})"
+    )
 
     next_progress = time.monotonic() + progress_interval_sec if progress_interval_sec > 0 else float("inf")
 
@@ -458,16 +463,24 @@ def replay(
                 return
 
             sleep_s = 1.0 / rate_hz
+            raw_by_side: dict[str, float] = {}
+            cmd_by_side: dict[str, float] = {}
             for arm_i, (traj, replayer) in enumerate(arms):
                 i = start_steps[arm_i] + step_idx
+                raw = traj.positions[i]
+                raw_grip = float(raw[-1])
                 step = preprocess_step(
-                    traj.positions[i],
+                    raw,
                     gripper_scale=gripper_scale,
                     gripper_max=gripper_max,
                     clamp_joint6=clamp_joint6,
                     joint6_min=joint6_min,
                     joint6_max=joint6_max,
                 )
+                pub_grip = float(step[-1])
+                side = "L" if "left" in traj.label.lower() else ("R" if "right" in traj.label.lower() else traj.label)
+                raw_by_side[side] = raw_grip
+                cmd_by_side[side] = pub_grip
                 replayer.publish_step(step)
 
                 if (
@@ -479,6 +492,23 @@ def replay(
                         sleep_s,
                         float(traj.timestamps[i + 1] - traj.timestamps[i]),
                     )
+
+            # Same style as inference_combined.py gripper overlay.
+            if "L" in raw_by_side and "R" in raw_by_side:
+                print(
+                    f"gripper raw L/R={raw_by_side['L']:.3f}/{raw_by_side['R']:.3f} "
+                    f"-> cmd {cmd_by_side['L']:.1f}/{cmd_by_side['R']:.1f} "
+                    f"(scale={gripper_scale:g} max={gmax_note})",
+                    flush=True,
+                )
+            else:
+                side = next(iter(raw_by_side))
+                print(
+                    f"gripper raw {side}={raw_by_side[side]:.3f} "
+                    f"-> cmd {cmd_by_side[side]:.1f} "
+                    f"(scale={gripper_scale:g} max={gmax_note})",
+                    flush=True,
+                )
 
             now = time.monotonic()
             if now >= next_progress:
@@ -604,20 +634,41 @@ def main() -> None:
 
     # If explicit position files are provided, we can replay without discovering a recording id
     # in data_dir (useful with session-style folder structures).
-    rec_id = args.datetime_id
-    inferred_id = _infer_rec_id_from_position_path(args.right_position_file) if args.right_position_file else None
-    if not rec_id and inferred_id:
-        rec_id = inferred_id
-
     left_pos_file = args.left_position_file or args.position_file
     left_ts_file = args.left_timestamp_file or args.timestamp_file
+    right_pos_file = args.right_position_file
 
-    replay_left = not args.right_only
-    replay_right = args.dual or args.right_only
-    if not args.dual and not args.left_only and not args.right_only:
+    rec_id = args.datetime_id
+    if not rec_id:
+        inferred_id = None
+        if right_pos_file:
+            inferred_id = _infer_rec_id_from_position_path(right_pos_file)
+        if not inferred_id and left_pos_file:
+            inferred_id = _infer_rec_id_from_position_path(left_pos_file)
+        if inferred_id:
+            rec_id = inferred_id
+
+    # Mode selection:
+    # - explicit --dual / --left-only / --right-only win
+    # - else if only one side's position file is given, replay that side only
+    # - else default left (+ right if recording exists for rec_id)
+    if args.dual:
+        replay_left, replay_right = True, True
+    elif args.left_only:
+        replay_left, replay_right = True, False
+    elif args.right_only:
+        replay_left, replay_right = False, True
+    elif right_pos_file and not left_pos_file:
+        replay_left, replay_right = False, True
+    elif left_pos_file and not right_pos_file:
+        replay_left, replay_right = True, False
+    elif left_pos_file and right_pos_file:
+        replay_left, replay_right = True, True
+    else:
+        replay_left = True
         replay_right = has_right_recording(data_dir, rec_id) if rec_id else False
 
-    needs_rec_id = (replay_left and not left_pos_file) or (replay_right and not args.right_position_file)
+    needs_rec_id = (replay_left and not left_pos_file) or (replay_right and not right_pos_file)
     if not rec_id and needs_rec_id:
         available = list_available_recordings(data_dir)
         if not available:
@@ -667,17 +718,18 @@ def main() -> None:
         )
 
     if replay_right:
-        if not has_right_recording(data_dir, rec_id) and not args.right_position_file:
+        if not right_pos_file and (not rec_id or not has_right_recording(data_dir, rec_id)):
             raise SystemExit(
                 f"No right-arm recording for id {rec_id}. "
                 f"Expected {os.path.join(data_dir, _right_position_name(rec_id))}. "
-                "Re-record with the updated store_joint.py, or use --left-only."
+                "Re-record with the updated store_joint.py, or use --left-only / "
+                "--right-position-file."
             )
         pos_path, ts_path = resolve_arm_paths(
             data_dir,
             rec_id,
             "right",
-            args.right_position_file,
+            right_pos_file,
             args.right_timestamp_file,
         )
         positions, timestamps = load_trajectory(pos_path, ts_path)

@@ -255,6 +255,9 @@ def plot_pose(npz_path: str | Path, *, ori_scale_m: float = 0.015, ori_stride: i
             ax_open.set_ylabel("open (0/1)")
 
     # Combined 3D trajectory
+    traj_pts = []
+    legend_handles = []
+    legend_labels = []
     for hand_idx in (0, 1):
         hand_name = HAND_NAMES.get(hand_idx, f"Hand {hand_idx}")
         m = valid[:, hand_idx]
@@ -262,6 +265,7 @@ def plot_pose(npz_path: str | Path, *, ori_scale_m: float = 0.015, ori_stride: i
         for s, e in segments:
             pts = pos[s : e + 1, hand_idx]
             tn = t_norm_all[s : e + 1]
+            traj_pts.append(pts)
             _add_gradient_trajectory_3d(ax_traj, pts, tn, cmap=cmap)
             _add_ticks_3d_gradient(
                 ax_traj,
@@ -274,14 +278,31 @@ def plot_pose(npz_path: str | Path, *, ori_scale_m: float = 0.015, ori_stride: i
                 alpha=0.65,
                 linewidth=1.0,
             )
-        # Add legend entry only (color is time-varying, so use a neutral handle)
-        ax_traj.plot([], [], [], color="black", linewidth=2.0, label=hand_name)
+        # Proxy legend entry only (empty ax.plot would force ~[0,1] 3D limits).
+        legend_handles.append(plt.Line2D([0], [0], color="black", linewidth=2.0))
+        legend_labels.append(hand_name)
+
+    if traj_pts:
+        all_pts = np.concatenate(traj_pts, axis=0)
+        mins = np.nanmin(all_pts, axis=0)
+        maxs = np.nanmax(all_pts, axis=0)
+        center = 0.5 * (mins + maxs)
+        # Equal-aspect cube with a little padding so orientation ticks stay visible.
+        half = 0.5 * float(np.max(maxs - mins))
+        half = max(half * 1.15, 0.05)  # at least ±5 cm
+        ax_traj.set_xlim(center[0] - half, center[0] + half)
+        ax_traj.set_ylim(center[1] - half, center[1] + half)
+        ax_traj.set_zlim(center[2] - half, center[2] + half)
+        try:
+            ax_traj.set_box_aspect((1, 1, 1))
+        except Exception:
+            pass
 
     ax_traj.set_title("3D trajectory — Left + Right")
     ax_traj.set_xlabel("X (m)")
     ax_traj.set_ylabel("Y (m)")
     ax_traj.set_zlabel("Z (m)")
-    ax_traj.legend(loc="upper right")
+    ax_traj.legend(legend_handles, legend_labels, loc="upper right")
 
     # Separate orientation rays (one subplot per hand)
     for hand_idx, ax in [(0, ax_rays_l), (1, ax_rays_r)]:
@@ -319,15 +340,62 @@ def plot_pose(npz_path: str | Path, *, ori_scale_m: float = 0.015, ori_stride: i
 
 def main():
     parser = argparse.ArgumentParser(description="Plot pose .npz (left+right combined in 3D by default).")
-    parser.add_argument("npz", type=str, help="Path to .npz (must contain 'pose' or legacy combined fields)")
+    parser.add_argument(
+        "npz",
+        type=str,
+        help="Path to a .npz file, or a directory of .npz files",
+    )
     parser.add_argument("--ori-scale", type=float, default=0.015, help="Palm_dir tick length on the 3D trajectory (m)")
     parser.add_argument("--ori-stride", type=int, default=2, help="Plot every Nth orientation tick")
-    parser.add_argument("-o", "--output", type=str, default=None, help="Save figure to this path")
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        default=None,
+        help="Save figure path (file mode), or output directory (dir mode)",
+    )
     parser.add_argument("--no-show", action="store_true", help="Do not open an interactive window")
+    parser.add_argument(
+        "--glob",
+        type=str,
+        default="*.npz",
+        help="When npz is a directory, only plot files matching this glob (default: *.npz)",
+    )
     args = parser.parse_args()
 
+    path = Path(args.npz).expanduser().resolve()
+    if path.is_dir():
+        files = sorted(path.glob(args.glob))
+        if not files:
+            raise SystemExit(f"No files matching {args.glob!r} in {path}")
+        show = not args.no_show
+        out_dir = None
+        if args.output:
+            out_dir = Path(args.output).expanduser().resolve()
+            out_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Plotting {len(files)} files from {path}")
+        if out_dir is not None:
+            print(f"Saving figures under {out_dir}")
+        if show:
+            print("Interactive: close each window to advance to the next file.")
+        for i, f in enumerate(files, 1):
+            out = str(out_dir / f"{f.stem}.png") if out_dir is not None else None
+            print(f"[{i}/{len(files)}] {f.name}")
+            plot_pose(
+                f,
+                ori_scale_m=float(args.ori_scale),
+                ori_stride=int(args.ori_stride),
+                output=out,
+                show=show,
+            )
+        print(f"Done. {len(files)} plots.")
+        return
+
+    if not path.is_file():
+        raise SystemExit(f"Not a file or directory: {path}")
+
     plot_pose(
-        args.npz,
+        path,
         ori_scale_m=float(args.ori_scale),
         ori_stride=int(args.ori_stride),
         output=args.output,

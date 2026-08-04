@@ -546,7 +546,7 @@ def start_recorders(
     if mode.bird_realsense and bird_realsense_serial:
         # If we are not running realtime hand pose, we still want depth in the .bag
         # for offline processing (e.g. WiLoR+RGBD).
-b        bag_depth = True if not mode.hand_pose else None
+        bag_depth = True if not mode.hand_pose else None
         bird_proc = _spawn(
             build_bird_rs_cmd(
                 datetime_id,
