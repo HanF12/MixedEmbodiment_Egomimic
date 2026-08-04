@@ -1,4 +1,4 @@
-"""Shared path / video helpers for MixedEmbodiment dataloaders."""
+"""Shared path / video helpers for Combined-relative dataloaders."""
 
 from __future__ import annotations
 
@@ -171,7 +171,7 @@ def normalize_future_chunk(
     Normalize valid future steps, then pad with exact zeros in normalized space.
 
     Caller is responsible for the action-space of raw_steps (absolute or relative).
-    For relative pose targets, pass deltas vs the chunk anchor so that
+    For Combined-relative pose targets, pass deltas vs the chunk anchor so that
     actions[0] is near zero before normalization.
 
     Returns:

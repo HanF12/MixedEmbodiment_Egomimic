@@ -1,1 +1,1 @@
-"""MixedEmbodiment: Combined_relative fork with robot + human + mixed hand/arm training."""
+"""MixedEmbodiment: one CLI-selectable package for robot / human / mixed ACT training."""

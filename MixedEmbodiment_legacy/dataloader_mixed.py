@@ -9,23 +9,23 @@ import pandas as pd
 import torch
 from torch.utils.data import ConcatDataset, Dataset
 
-from MixedEmbodiment.config import (
+from MixedEmbodiment_legacy.config import (
     DEFAULT_NUM_QUERIES,
     EMBODIMENT_MIXED,
     JOINT_DIM_PER_ARM,
     MIXED_SYNC_INDEX_COLUMNS,
     POSE_DIM,
-    ROBOT_JOINT_DIM,
     ROBOT_NPY_GRIPPER_BINARIZE_THRESHOLD,
     ROBOT_NPZ_GRIPPER_BINARIZE_THRESHOLD,
+    ROBOT_JOINT_DIM,
     camera_mask_tensor,
     compose_mixed_flat_pose,
     joint_loss_mask_for_side,
     single_arm_joint_vector,
     stack_camera_tensors,
 )
-from MixedEmbodiment.data_synchronization import side_to_slot, xyz_gripper_valid_mask
-from MixedEmbodiment.dataloader_utils import (
+from MixedEmbodiment_legacy.data_synchronization import side_to_slot, xyz_gripper_valid_mask
+from MixedEmbodiment_legacy.dataloader_utils import (
     build_image_transform,
     compute_relative_pose_stats,
     demo_id_from_hash_filename,
@@ -53,9 +53,7 @@ class MixedEpisodeDataset(Dataset):
     Joints [14] = active arm qpos (gripper binarized); inactive arm zeros.
     Cameras [3] = bird + active wrist; inactive wrist zeroed/masked.
     Front RGB is used only in sync CSV generation (not loaded here).
-    Proprio / CVAE follow the robot joint pathway (see core.py) — mixed never
-    feeds pose_state into the model as an observation, with or without
-    --pose_observation (that flag only affects the human embodiment).
+    Proprio / CVAE follow the robot joint pathway (see core.py).
     """
 
     def __init__(
@@ -137,7 +135,13 @@ class MixedEpisodeDataset(Dataset):
 
         for sync_csv in sync_csvs:
             rec_id = sync_csv.stem
-            needed = {"bird": bird_by, "wrist": wrist_by, "joint": joint_by, "hand": hand_by, "eef": eef_by}
+            needed = {
+                "bird": bird_by,
+                "wrist": wrist_by,
+                "joint": joint_by,
+                "hand": hand_by,
+                "eef": eef_by,
+            }
             missing = [k for k, m in needed.items() if rec_id not in m]
             if missing:
                 print(f"WARNING: skip mixed {rec_id} - missing {missing}")
@@ -172,6 +176,7 @@ class MixedEpisodeDataset(Dataset):
                 required_slots=(self.robot_slot,),
             )
 
+
             if len(df) > 0:
                 keep = []
                 for i in range(len(df)):
@@ -193,8 +198,12 @@ class MixedEpisodeDataset(Dataset):
                 print(f"WARNING: skip mixed {rec_id} - no valid rows after filters")
                 continue
 
-            bird_f = load_video_frames(bird_by[rec_id], resize_factor=self.resize_factor, label=f"bird({rec_id})")
-            wrist_f = load_video_frames(wrist_by[rec_id], resize_factor=self.resize_factor, label=f"wrist({rec_id})")
+            bird_f = load_video_frames(
+                bird_by[rec_id], resize_factor=self.resize_factor, label=f"bird({rec_id})"
+            )
+            wrist_f = load_video_frames(
+                wrist_by[rec_id], resize_factor=self.resize_factor, label=f"wrist({rec_id})"
+            )
             joint_arr = np.load(joint_by[rec_id])
 
             demo_idx = self.num_demos
@@ -204,10 +213,18 @@ class MixedEpisodeDataset(Dataset):
 
             for i in range(n_i):
                 self.bird_frames.append(
-                    store_frame(bird_f[int(df.loc[i, "bird_index"])], jpeg_in_ram=self.jpeg_in_ram, jpeg_quality=self.jpeg_quality)
+                    store_frame(
+                        bird_f[int(df.loc[i, "bird_index"])],
+                        jpeg_in_ram=self.jpeg_in_ram,
+                        jpeg_quality=self.jpeg_quality,
+                    )
                 )
                 self.wrist_frames.append(
-                    store_frame(wrist_f[int(df.loc[i, "wrist_index"])], jpeg_in_ram=self.jpeg_in_ram, jpeg_quality=self.jpeg_quality)
+                    store_frame(
+                        wrist_f[int(df.loc[i, "wrist_index"])],
+                        jpeg_in_ram=self.jpeg_in_ram,
+                        jpeg_quality=self.jpeg_quality,
+                    )
                 )
                 self.joint_data.append(
                     single_arm_joint_vector(
@@ -238,13 +255,17 @@ class MixedEpisodeDataset(Dataset):
             print(f"    -> mixed {rec_id}: {n_i} samples (robot={self.robot_side}, hand={self.hand_side})")
 
         if self.num_demos == 0:
-            raise FileNotFoundError("No complete mixed demos found for MixedEmbodiment.")
+            raise FileNotFoundError("No complete mixed demos found for MixedEmbodiment_legacy.")
 
         all_q = torch.stack(self.joint_data, dim=0)  # [N, 14]
         all_p = torch.stack(self.pose_data, dim=0)  # [N, 8]
         self.joint_mean = torch.zeros(ROBOT_JOINT_DIM, dtype=torch.float32)
         self.joint_std = torch.ones(ROBOT_JOINT_DIM, dtype=torch.float32)
-        active = slice(0, JOINT_DIM_PER_ARM) if self.robot_side == "left" else slice(JOINT_DIM_PER_ARM, ROBOT_JOINT_DIM)
+        active = (
+            slice(0, JOINT_DIM_PER_ARM)
+            if self.robot_side == "left"
+            else slice(JOINT_DIM_PER_ARM, ROBOT_JOINT_DIM)
+        )
         self.joint_mean[active] = all_q[:, active].mean(dim=0)
         self.joint_std[active] = all_q[:, active].std(dim=0).clamp(min=1e-2)
 
@@ -261,7 +282,9 @@ class MixedEpisodeDataset(Dataset):
         self.state_mean = self.joint_mean
         self.state_std = self.joint_std
 
-        frame_bytes = sum(frame_nbytes(f) for f in self.bird_frames) + sum(frame_nbytes(f) for f in self.wrist_frames)
+        frame_bytes = sum(frame_nbytes(f) for f in self.bird_frames) + sum(
+            frame_nbytes(f) for f in self.wrist_frames
+        )
         print(
             f"Mixed dataset ready: demos={self.num_demos} samples={self.num_samples} "
             f"robot_side={self.robot_side} hand_side={self.hand_side} "

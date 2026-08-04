@@ -10,7 +10,7 @@ Required per demo:
   robot EEF NPZ in joint-data/combined_npz_commonframe (robot side slot valid)
 
 Example:
-  python -m MixedEmbodiment.build_sync \\
+  python -m MixedEmbodiment_legacy.build_sync \\
     --data_root recording/sessions/left_robot_right_hand/0720 \\
     --sync_dir recording/sessions/left_robot_right_hand/0720/sync_csv
 """
@@ -28,15 +28,15 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from MixedEmbodiment.config import HUMAN_POSE_RELDIR, ROBOT_EEF_RELDIR
-from MixedEmbodiment.dataloader_utils import (
+from MixedEmbodiment_legacy.config import HUMAN_POSE_RELDIR, ROBOT_EEF_RELDIR
+from MixedEmbodiment_legacy.dataloader_utils import (
     demo_id_from_hash_filename,
     demo_id_from_joint_npy,
     demo_id_from_pose_npz,
     demo_id_from_robot_eef_npz,
     prune_orphan_sync_csvs,
 )
-from MixedEmbodiment.data_synchronization import (
+from MixedEmbodiment_legacy.data_synchronization import (
     EMBODIMENT_PRESETS,
     Side,
     synchronize_mixed_hand_robot,

@@ -9,17 +9,18 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from MixedEmbodiment.config import (
+from MixedEmbodiment_legacy.config import (
     DEFAULT_NUM_QUERIES,
     EMBODIMENT_HUMAN,
-    HUMAN_SYNC_INDEX_COLUMNS,
+    POSE_DIM,
     ROBOT_JOINT_DIM,
+    HUMAN_SYNC_INDEX_COLUMNS,
     camera_mask_tensor,
     flatten_bimanual_pose,
     stack_camera_tensors,
 )
-from MixedEmbodiment.data_synchronization import xyz_gripper_valid_mask
-from MixedEmbodiment.dataloader_utils import (
+from MixedEmbodiment_legacy.data_synchronization import xyz_gripper_valid_mask
+from MixedEmbodiment_legacy.dataloader_utils import (
     build_image_transform,
     compute_relative_pose_stats,
     demo_id_from_hash_filename,
@@ -53,13 +54,7 @@ class HumanEpisodeDataset(Dataset):
       pose_actions[k] = pose[t+k] - pose[t]  (relative to chunk anchor)
       pose_actions[0] is zeros before normalization.
 
-    pose_state is still computed here as the absolute hand pose at t (normalized
-    with absolute stats) — it is returned in the batch for logging / dataset
-    parity, but by default the model never actually uses it as an observation
-    (see core.py's `use_pose_observation`; the human proprio + CVAE state
-    channel are zeroed unless --pose_observation is passed). This dataset does
-    not need to know which mode is active: the masking happens entirely inside
-    the model.
+    pose_state uses absolute hand pose at t (normalized with absolute stats).
 
     Common batch schema (joint_* are zeros; has_joint_target=False).
     """
@@ -90,6 +85,7 @@ class HumanEpisodeDataset(Dataset):
         self.image_transform = build_image_transform(transform)
 
         bird_vids = sorted(resolve_path(bird_vids_dir).glob("*.mp4"))
+        front_vids = sorted(resolve_path(front_vids_dir).glob("*.mp4"))
         pose_files = sorted(resolve_path(pose_npz_dir).glob("*.npz"))
         sync_csvs = sorted(resolve_path(sync_csv_dir).glob("*.csv"))
         if max_demos is not None and max_demos > 0:
@@ -98,6 +94,7 @@ class HumanEpisodeDataset(Dataset):
             raise FileNotFoundError(f"No human sync CSVs in {sync_csv_dir}")
 
         bird_by = index_paths_by_demo_id(bird_vids, demo_id_from_hash_filename)
+        front_by = index_paths_by_demo_id(front_vids, demo_id_from_hash_filename)
         pose_by = index_paths_by_demo_id(pose_files, demo_id_from_pose_npz)
         print("Human dataset: 3-cam slots [bird, left_wrist=0, right_wrist=0]; front for sync only")
         if self.jpeg_in_ram:
@@ -149,6 +146,7 @@ class HumanEpisodeDataset(Dataset):
                     required_slots=(0, 1),
                 )
 
+
             if frame_ok is not None:
                 keep = []
                 for i in range(len(df)):
@@ -174,7 +172,11 @@ class HumanEpisodeDataset(Dataset):
                 bidx = int(df.loc[i, "bird_index"])
                 pidx = int(df.loc[i, "pose_index"])
                 self.bird_frames.append(
-                    store_frame(bird_f[bidx], jpeg_in_ram=self.jpeg_in_ram, jpeg_quality=self.jpeg_quality)
+                    store_frame(
+                        bird_f[bidx],
+                        jpeg_in_ram=self.jpeg_in_ram,
+                        jpeg_quality=self.jpeg_quality,
+                    )
                 )
                 self.pose_data.append(flatten_bimanual_pose(pose_arr[pidx], rec_id=rec_id))  # [8]
                 self.sample_demo_idx.append(demo_idx)
@@ -184,11 +186,13 @@ class HumanEpisodeDataset(Dataset):
             print(f"    -> human {rec_id}: {n_i} samples")
 
         if self.num_demos == 0:
-            raise FileNotFoundError("No complete human demos found for MixedEmbodiment.")
+            raise FileNotFoundError("No complete human demos found for MixedEmbodiment_legacy.")
 
         all_p = torch.stack(self.pose_data, dim=0)  # [N, 8]
+        # Absolute pose stats for proprio (pose_state)
         self.pose_abs_mean = all_p.mean(dim=0)
         self.pose_abs_std = all_p.std(dim=0).clamp(min=1e-2)
+        # Relative pose stats for action targets (pose_actions)
         self.pose_mean, self.pose_std = compute_relative_pose_stats(
             self.pose_data,
             demo_start_idx=self.demo_start_idx,
@@ -197,6 +201,7 @@ class HumanEpisodeDataset(Dataset):
         )
         self.pose_rel_mean = self.pose_mean
         self.pose_rel_std = self.pose_std
+        # Backward-compatible aliases (state = absolute pose for human)
         self.state_mean = self.pose_abs_mean
         self.state_std = self.pose_abs_std
         frame_bytes = sum(frame_nbytes(f) for f in self.bird_frames)

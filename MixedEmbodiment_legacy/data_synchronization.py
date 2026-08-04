@@ -1,46 +1,20 @@
 """
-Timestamp synchronization for MixedEmbodiment training — the single "loading"
-file for all three modalities.
+Timestamp synchronization for MixedEmbodiment training.
 
-Low-level per-demo synchronizers (nearest-window multi-stream alignment):
-  1) synchronize_robot_bimanual  — joints + 4 cameras + EEF pose timeline
-  2) synchronize_human_hands    — bird + front + hand-pose NPZ timeline
-  3) synchronize_mixed_hand_robot — one wrist + one arm + hand NPZ + EEF NPZ
-
-High-level directory-discovery / orchestration (previously split between
-training_combined.py and the standalone MixedEmbodiment_gripweight/build_sync.py
-module — folded in here so there is one place that turns a sessions/<kind>/<date>
-folder into sync CSVs):
-  4) resolve_robot_eef_dir / resolve_human_pose_dir — locate the pose NPZ dirs
-  5) infer_mixed_preset — robot_side/hand_side from a left_robot_right_hand /
-     right_robot_left_hand folder name
-  6) build_robot_sync_csvs / build_human_sync_csvs / build_mixed_sync_csvs —
-     discover per-demo files under a data root and write one sync CSV per demo
+1) synchronize_robot_bimanual  — joints + 4 cameras + EEF pose timeline
+2) synchronize_human_hands    — bird + front + hand-pose NPZ timeline
+3) synchronize_mixed_hand_robot — one wrist + one arm + hand NPZ + EEF NPZ
 
 Orientation / valid_rot is never used for frame validity (training drops rot6d).
 """
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from typing import Literal, Sequence
 
 import numpy as np
 import pandas as pd
-
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
-from MixedEmbodiment.config import HUMAN_POSE_RELDIR, ROBOT_EEF_RELDIR  # noqa: E402
-from MixedEmbodiment.dataloader_utils import (  # noqa: E402
-    demo_id_from_hash_filename,
-    demo_id_from_joint_npy,
-    demo_id_from_pose_npz,
-    demo_id_from_robot_eef_npz,
-    prune_orphan_sync_csvs,
-)
 
 
 def _assert_sorted(name: str, values: np.ndarray, *, strict: bool = True) -> None:
@@ -108,14 +82,14 @@ def _sync_streams(
     rows = []
     master = 0
 
-    while all(idx < size for idx, size in zip(idxs, lengths)):
+    while all(i < L for i, L in zip(idxs, lengths)):
         pivot = max(float(stream_ts[s][idxs[s]]) for s in range(n))
 
         for s in range(n):
             while idxs[s] < lengths[s] and pivot - float(stream_ts[s][idxs[s]]) > max_skew_s:
                 idxs[s] += 1
 
-        if not all(idx < size for idx, size in zip(idxs, lengths)):
+        if not all(i < L for i, L in zip(idxs, lengths)):
             break
 
         values = [float(stream_ts[s][idxs[s]]) for s in range(n)]
@@ -190,6 +164,25 @@ def xyz_gripper_valid_mask(
     return ok
 
 
+# Backward-compatible name used by older call sites
+def full_hand_pose_valid_mask(
+    *,
+    valid_pos: np.ndarray | None = None,
+    valid_rot: np.ndarray | None = None,
+    valid_open: np.ndarray | None = None,
+    n_frames: int | None = None,
+    required_slots: Sequence[int] | None = None,
+) -> np.ndarray:
+    """Deprecated alias: ignores valid_rot; requires xyz + gripper only."""
+    del valid_rot  # unused; orientation never gates validity
+    return xyz_gripper_valid_mask(
+        valid_pos=valid_pos,
+        valid_open=valid_open,
+        n_frames=n_frames,
+        required_slots=required_slots,
+    )
+
+
 def _validate_index_column(df: pd.DataFrame, col: str, length: int, *, label: str) -> None:
     if col not in df.columns or len(df) == 0:
         return
@@ -199,11 +192,6 @@ def _validate_index_column(df: pd.DataFrame, col: str, length: int, *, label: st
             f"{label}: {col} out of range for length={length} "
             f"(min={int(idx.min())}, max={int(idx.max())})"
         )
-
-
-# ---------------------------------------------------------------------------
-# 1) Robot bimanual sync
-# ---------------------------------------------------------------------------
 
 
 def synchronize_robot_bimanual(
@@ -243,7 +231,7 @@ def synchronize_robot_bimanual(
 
     if eef_ts is None:
         raise ValueError(
-            "eef_ts is required for robot sync. "
+            "eef_ts is required for Combined robot sync. "
             "Pass timestamps from joint-data/combined_npz_commonframe."
         )
 
@@ -252,7 +240,15 @@ def synchronize_robot_bimanual(
 
     tmp_csv = Path(out_csv).with_suffix(".tmp.csv")
     df = _sync_streams(
-        ["left_joint", "right_joint", "left_cam", "right_cam", "bird_cam", "front_cam", "eef_pose"],
+        [
+            "left_joint",
+            "right_joint",
+            "left_cam",
+            "right_cam",
+            "bird_cam",
+            "front_cam",
+            "eef_pose",
+        ],
         [left_j, right_j, left_c, right_c, bird, front, eef_unique],
         tmp_csv,
         index_columns=[
@@ -290,7 +286,10 @@ def synchronize_robot_bimanual(
                 "Pass valid_pos and valid_open from the EEF NPZ."
             )
         frame_ok = xyz_gripper_valid_mask(
-            valid_pos=valid_pos, valid_open=valid_open, n_frames=len(eef_raw), required_slots=(0, 1)
+            valid_pos=valid_pos,
+            valid_open=valid_open,
+            n_frames=len(eef_raw),
+            required_slots=(0, 1),
         )
         eef_idx = df["eef_pose_index"].to_numpy(dtype=np.int64)
         in_range = (eef_idx >= 0) & (eef_idx < len(frame_ok))
@@ -304,6 +303,7 @@ def synchronize_robot_bimanual(
             f"(dropped {n_before - len(df)}, require xyz+gripper for both arms; orient ignored)"
         )
 
+    # Validate index ranges against original stream lengths.
     _validate_index_column(df, "left_joint_index", len(left_j), label="robot sync")
     _validate_index_column(df, "right_joint_index", len(right_j), label="robot sync")
     _validate_index_column(df, "left_index", len(left_c), label="robot sync")
@@ -324,7 +324,9 @@ def synchronize_robot_bimanual(
     ]
     if debug:
         keep = keep + [
-            c for c in df.columns if c.endswith("_time") or c == "time_diff" or c == "eef_pose_unique_index"
+            c
+            for c in df.columns
+            if c.endswith("_time") or c == "time_diff" or c == "eef_pose_unique_index"
         ]
     df = df[keep]
 
@@ -333,11 +335,6 @@ def synchronize_robot_bimanual(
     df.to_csv(out_path, index=False)
     print(f"Wrote robot sync CSV with eef_pose_index -> {out_path} (rows={len(df)}, debug={debug})")
     return df
-
-
-# ---------------------------------------------------------------------------
-# 2) Human hands sync
-# ---------------------------------------------------------------------------
 
 
 def synchronize_human_hands(
@@ -359,7 +356,12 @@ def synchronize_human_hands(
     pose_ts may contain duplicates (bag-rate NPZs). We collapse to a unique
     increasing timeline and write pose_index into the *original* NPZ array.
 
-    Index columns: bird_index, front_index, pose_index
+    When require_full_pose is True (default), rows whose pose_index lacks
+    valid xyz + open/close for both hands are dropped. Orientation / valid_rot
+    is ignored. Pass valid_pos / valid_open from the NPZ.
+
+    Index columns:
+      bird_index, front_index, pose_index
     """
     del valid_rot  # orientation never gates sync validity
     bird = _assert_finite_1d("bird_cam", bird_ts)
@@ -398,7 +400,10 @@ def synchronize_human_hands(
                 "Pass valid_pos and valid_open, or set require_full_pose=False."
             )
         frame_ok = xyz_gripper_valid_mask(
-            valid_pos=valid_pos, valid_open=valid_open, n_frames=len(pose_raw), required_slots=(0, 1)
+            valid_pos=valid_pos,
+            valid_open=valid_open,
+            n_frames=len(pose_raw),
+            required_slots=(0, 1),
         )
         pose_idx = df["pose_index"].to_numpy(dtype=np.int64)
         in_range = (pose_idx >= 0) & (pose_idx < len(frame_ok))
@@ -419,7 +424,11 @@ def synchronize_human_hands(
 
     keep = ["master_index", "bird_index", "front_index", "pose_index"]
     if debug:
-        keep = keep + [c for c in df.columns if c.endswith("_time") or c == "time_diff" or c == "pose_unique_index"]
+        keep = keep + [
+            c
+            for c in df.columns
+            if c.endswith("_time") or c == "time_diff" or c == "pose_unique_index"
+        ]
     df = df[keep]
 
     out_path = Path(out_csv)
@@ -428,9 +437,8 @@ def synchronize_human_hands(
     print(f"Wrote human sync CSV with pose_index remap -> {out_path} (rows={len(df)}, debug={debug})")
     return df
 
-
 # ---------------------------------------------------------------------------
-# 3) Mixed one-hand + one-robot-arm sync
+# Mixed one-hand + one-robot-arm sync
 # ---------------------------------------------------------------------------
 
 Side = Literal["left", "right"]
@@ -457,15 +465,6 @@ def side_to_slot(side: Side) -> int:
     if side not in SLOT:
         raise ValueError(f"side must be 'left' or 'right', got {side!r}")
     return SLOT[side]
-
-
-def infer_mixed_preset(data_root: Path) -> dict[str, Side] | None:
-    """Infer robot_side/hand_side from a left_robot_right_hand / right_robot_left_hand path."""
-    parts = {p.lower() for p in data_root.parts}
-    for name, preset in EMBODIMENT_PRESETS.items():
-        if name in parts:
-            return preset
-    return None
 
 
 def synchronize_mixed_hand_robot(
@@ -544,14 +543,25 @@ def synchronize_mixed_hand_robot(
 
     if require_valid_active_slots and len(df) > 0:
         hand_ok = xyz_gripper_valid_mask(
-            valid_pos=hand_valid_pos, valid_open=hand_valid_open, n_frames=len(hand_raw), required_slots=(hand_slot,)
+            valid_pos=hand_valid_pos,
+            valid_open=hand_valid_open,
+            n_frames=len(hand_raw),
+            required_slots=(hand_slot,),
         )
         eef_ok = xyz_gripper_valid_mask(
-            valid_pos=eef_valid_pos, valid_open=eef_valid_open, n_frames=len(eef_raw), required_slots=(robot_slot,)
+            valid_pos=eef_valid_pos,
+            valid_open=eef_valid_open,
+            n_frames=len(eef_raw),
+            required_slots=(robot_slot,),
         )
         h_idx = df["hand_pose_index"].to_numpy(dtype=np.int64)
         e_idx = df["eef_pose_index"].to_numpy(dtype=np.int64)
-        row_ok = (h_idx >= 0) & (h_idx < len(hand_ok)) & (e_idx >= 0) & (e_idx < len(eef_ok))
+        row_ok = (
+            (h_idx >= 0)
+            & (h_idx < len(hand_ok))
+            & (e_idx >= 0)
+            & (e_idx < len(eef_ok))
+        )
         keep = np.zeros(len(df), dtype=bool)
         keep[row_ok] = hand_ok[h_idx[row_ok]] & eef_ok[e_idx[row_ok]]
         df = df[keep].reset_index(drop=True)
@@ -572,8 +582,13 @@ def synchronize_mixed_hand_robot(
     keep_cols = ["master_index", *MIXED_SYNC_INDEX_COLUMNS]
     if debug:
         keep_cols = keep_cols + [
-            c for c in df.columns if c.endswith("_time") or c == "time_diff" or c.endswith("_unique_index")
+            c
+            for c in df.columns
+            if c.endswith("_time")
+            or c == "time_diff"
+            or c.endswith("_unique_index")
         ]
+    # Ensure master_index exists even if filter emptied via unique path
     if "master_index" not in df.columns and len(df) > 0:
         df["master_index"] = np.arange(len(df), dtype=np.int64)
     elif "master_index" not in df.columns:
@@ -589,214 +604,3 @@ def synchronize_mixed_hand_robot(
         f"(rows={len(df)}, robot={robot_side}, hand={hand_side}, debug={debug})"
     )
     return df
-
-
-# ---------------------------------------------------------------------------
-# 4) Directory discovery + orchestration (formerly split across
-#    training_combined.py and the standalone build_sync.py module)
-# ---------------------------------------------------------------------------
-
-
-def resolve_robot_eef_dir(robot_root: Path, override: str | None = None) -> Path:
-    if override:
-        return Path(override).expanduser().resolve()
-    preferred = (robot_root / ROBOT_EEF_RELDIR).resolve()
-    if preferred.is_dir() and any(preferred.glob("*.npz")):
-        return preferred
-    raise FileNotFoundError(
-        f"Robot/mixed EEF NPZ dir not found. Expected {preferred} under {robot_root}."
-    )
-
-
-def resolve_human_pose_dir(human_root: Path, override: str | None = None) -> Path:
-    if override:
-        return Path(override).expanduser().resolve()
-    preferred = (human_root / HUMAN_POSE_RELDIR).resolve()
-    if preferred.is_dir() and any(preferred.glob("*.npz")):
-        return preferred
-    fallback = (human_root / "bird-realsense-data" / "combined_npz").resolve()
-    if fallback.is_dir() and any(fallback.glob("*.npz")):
-        print(f"WARNING: default hand/human pose dir missing/empty ({preferred}); falling back to {fallback}")
-        return fallback
-    raise FileNotFoundError(
-        f"Human/mixed hand pose NPZ dir not found. Expected {preferred} under {human_root}."
-    )
-
-
-def build_robot_sync_csvs(
-    data_root: Path,
-    sync_dir: Path,
-    eef_dir: Path,
-    max_skew_s: float,
-    max_demos: int | None,
-) -> None:
-    bird = {demo_id_from_hash_filename(p): p for p in sorted((data_root / "bird-realsense-data" / "npy").glob("*.npy"))}
-    front = {demo_id_from_hash_filename(p): p for p in sorted((data_root / "front-realsense-data" / "npy").glob("*.npy"))}
-    left_c = {demo_id_from_hash_filename(p): p for p in sorted((data_root / "aloha-data" / "left" / "npy").glob("*.npy"))}
-    right_c = {demo_id_from_hash_filename(p): p for p in sorted((data_root / "aloha-data" / "right" / "npy").glob("*.npy"))}
-    left_j = {
-        demo_id_from_joint_npy(p, prefix="joint_timestamp_"): p
-        for p in sorted((data_root / "joint-data" / "left" / "time").glob("*.npy"))
-    }
-    right_j = {
-        demo_id_from_joint_npy(p, prefix="joint_timestamp_"): p
-        for p in sorted((data_root / "joint-data" / "right" / "time").glob("*.npy"))
-    }
-    eef = {demo_id_from_robot_eef_npz(p): p for p in sorted(eef_dir.glob("*.npz"))}
-
-    base_ids = sorted(set(bird) & set(front) & set(left_c) & set(right_c) & set(left_j) & set(right_j))
-    ids = sorted(set(base_ids) & set(eef))
-    for demo_id in sorted(set(base_ids) - set(eef)):
-        print(f"WARNING: skip robot {demo_id} - missing EEF pose under {eef_dir}")
-
-    if max_demos is not None and max_demos > 0:
-        ids = ids[:max_demos]
-    if not ids:
-        raise FileNotFoundError(
-            f"No complete robot demos under {data_root} with EEF in {eef_dir}. "
-            f"base_complete={len(base_ids)} eef={len(eef)}"
-        )
-    sync_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Building robot sync for {len(ids)} demos -> {sync_dir}")
-    for demo_id in ids:
-        eef_npz = np.load(eef[demo_id])
-        for key in ("timestamps", "pose", "valid_pos", "valid_open"):
-            if key not in eef_npz.files:
-                raise KeyError(f"{eef[demo_id].name} missing required key '{key}'")
-        synchronize_robot_bimanual(
-            np.load(left_j[demo_id]),
-            np.load(right_j[demo_id]),
-            np.load(left_c[demo_id]),
-            np.load(right_c[demo_id]),
-            np.load(bird[demo_id]),
-            np.load(front[demo_id]),
-            sync_dir / f"{demo_id}.csv",
-            eef_ts=eef_npz["timestamps"],
-            max_skew_s=max_skew_s,
-            debug=False,
-            valid_pos=eef_npz["valid_pos"],
-            valid_open=eef_npz["valid_open"],
-            require_full_eef_pose=True,
-        )
-    prune_orphan_sync_csvs(sync_dir, ids)
-
-
-def build_human_sync_csvs(
-    data_root: Path,
-    sync_dir: Path,
-    pose_dir: Path,
-    max_skew_s: float,
-    max_demos: int | None,
-) -> None:
-    bird = {demo_id_from_hash_filename(p): p for p in sorted((data_root / "bird-realsense-data" / "npy").glob("*.npy"))}
-    front = {demo_id_from_hash_filename(p): p for p in sorted((data_root / "front-realsense-data" / "npy").glob("*.npy"))}
-    pose = {demo_id_from_pose_npz(p): p for p in sorted(pose_dir.glob("*.npz"))}
-    ids = sorted(set(bird) & set(front) & set(pose))
-    if max_demos is not None and max_demos > 0:
-        ids = ids[:max_demos]
-    if not ids:
-        raise FileNotFoundError(
-            f"No complete human demos under {data_root}. "
-            f"Need bird/front npy timestamps and pose NPZs in {pose_dir}."
-        )
-    sync_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Building human sync for {len(ids)} demos -> {sync_dir} (pose_dir={pose_dir})")
-    for demo_id in ids:
-        pose_npz = np.load(pose[demo_id])
-        for key in ("valid_pos", "valid_open"):
-            if key not in pose_npz.files:
-                raise KeyError(f"{pose[demo_id].name} missing required validity key '{key}'")
-        synchronize_human_hands(
-            np.load(bird[demo_id]),
-            np.load(front[demo_id]),
-            pose_npz["timestamps"],
-            sync_dir / f"{demo_id}.csv",
-            max_skew_s=max_skew_s,
-            debug=False,
-            valid_pos=pose_npz["valid_pos"],
-            valid_open=pose_npz["valid_open"],
-            require_full_pose=True,
-        )
-    prune_orphan_sync_csvs(sync_dir, ids)
-
-
-def build_mixed_sync_csvs(
-    data_root: Path,
-    sync_dir: Path,
-    *,
-    robot_side: Side,
-    hand_side: Side,
-    pose_dir: Path,
-    eef_dir: Path,
-    max_skew_s: float,
-    max_demos: int | None,
-) -> list[str]:
-    def _map_hash(dir_path: Path) -> dict[str, Path]:
-        if not dir_path.is_dir():
-            return {}
-        return {demo_id_from_hash_filename(p): p for p in sorted(dir_path.glob("*.npy"))}
-
-    bird = _map_hash(data_root / "bird-realsense-data" / "npy")
-    front = _map_hash(data_root / "front-realsense-data" / "npy")
-    wrist = _map_hash(data_root / "aloha-data" / robot_side / "npy")
-
-    joint_dir = data_root / "joint-data" / robot_side / "time"
-    joints: dict[str, Path] = {}
-    if joint_dir.is_dir():
-        for p in sorted(joint_dir.glob("*.npy")):
-            joints[demo_id_from_joint_npy(p, prefix="joint_timestamp_")] = p
-
-    hands = {demo_id_from_pose_npz(p): p for p in sorted(pose_dir.glob("*.npz"))}
-    eefs = {demo_id_from_robot_eef_npz(p): p for p in sorted(eef_dir.glob("*.npz"))}
-
-    ids = sorted(set(bird) & set(front) & set(wrist) & set(joints) & set(hands) & set(eefs))
-    if max_demos is not None and max_demos > 0:
-        ids = ids[: int(max_demos)]
-
-    print(
-        f"Mixed sync discovery under {data_root}\n"
-        f"  robot_side={robot_side} hand_side={hand_side}\n"
-        f"  bird={len(bird)} front={len(front)} wrist({robot_side})={len(wrist)} "
-        f"joint({robot_side})={len(joints)} hand_npz={len(hands)} eef_npz={len(eefs)}\n"
-        f"  complete demos={len(ids)} -> {sync_dir}"
-    )
-    if not ids:
-        raise FileNotFoundError(
-            f"No complete mixed demos under {data_root}. "
-            f"Need bird, front, {robot_side} wrist, {robot_side} joints, "
-            f"hand NPZ in {pose_dir}, EEF NPZ in {eef_dir}."
-        )
-
-    sync_dir.mkdir(parents=True, exist_ok=True)
-    wrote: list[str] = []
-    for demo_id in ids:
-        hand_npz = np.load(hands[demo_id])
-        eef_npz = np.load(eefs[demo_id])
-        for key in ("timestamps", "valid_pos", "valid_open"):
-            if key not in hand_npz.files:
-                raise KeyError(f"{hands[demo_id].name} missing '{key}'")
-            if key not in eef_npz.files:
-                raise KeyError(f"{eefs[demo_id].name} missing '{key}'")
-
-        synchronize_mixed_hand_robot(
-            np.load(bird[demo_id]),
-            np.load(front[demo_id]),
-            np.load(wrist[demo_id]),
-            np.load(joints[demo_id]),
-            hand_npz["timestamps"],
-            eef_npz["timestamps"],
-            sync_dir / f"{demo_id}.csv",
-            robot_side=robot_side,
-            hand_side=hand_side,
-            hand_valid_pos=hand_npz["valid_pos"],
-            hand_valid_open=hand_npz["valid_open"],
-            eef_valid_pos=eef_npz["valid_pos"],
-            eef_valid_open=eef_npz["valid_open"],
-            max_skew_s=max_skew_s,
-            debug=False,
-            require_valid_active_slots=True,
-        )
-        wrote.append(demo_id)
-    prune_orphan_sync_csvs(sync_dir, wrote)
-    print(f"Done. Wrote {len(wrote)} mixed sync CSVs -> {sync_dir}")
-    return wrote

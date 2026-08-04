@@ -9,11 +9,13 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from MixedEmbodiment.config import (
+from MixedEmbodiment_legacy.config import (
     DEFAULT_NUM_QUERIES,
     EMBODIMENT_ROBOT,
+    POSE_DIM,
     ROBOT_NPY_GRIPPER_BINARIZE_THRESHOLD,
     ROBOT_NPZ_GRIPPER_BINARIZE_THRESHOLD,
+    ROBOT_JOINT_DIM,
     ROBOT_SYNC_INDEX_COLUMNS,
     binarize_flat_pose_grippers,
     camera_mask_tensor,
@@ -21,8 +23,8 @@ from MixedEmbodiment.config import (
     flatten_bimanual_pose,
     stack_camera_tensors,
 )
-from MixedEmbodiment.data_synchronization import xyz_gripper_valid_mask
-from MixedEmbodiment.dataloader_utils import (
+from MixedEmbodiment_legacy.data_synchronization import xyz_gripper_valid_mask
+from MixedEmbodiment_legacy.dataloader_utils import (
     build_image_transform,
     compute_relative_pose_stats,
     demo_id_from_hash_filename,
@@ -36,6 +38,7 @@ from MixedEmbodiment.dataloader_utils import (
     relative_pose_chunk,
     resolve_path,
     store_frame,
+    zero_rgb_like,
 )
 
 
@@ -51,12 +54,6 @@ class RobotEpisodeDataset(Dataset):
 
     pose_state uses absolute EEF pose at t (normalized with absolute stats).
     pose_actions use relative deltas (normalized with relative stats).
-
-    Note: pose_state is computed here for completeness / logging parity with the
-    human dataset, but the robot embodiment NEVER feeds it into the model as an
-    observation (core.py's robot/mixed proprio path uses joint_state only,
-    regardless of --pose_observation). It exists only so pose_actions (the
-    shared-head auxiliary target) can be built relative to a well-defined anchor.
 
     Returns dict (common batch schema):
       embodiment, images, camera_mask,
@@ -178,6 +175,7 @@ class RobotEpisodeDataset(Dataset):
                     required_slots=(0, 1),
                 )
 
+
             if frame_ok is not None:
                 keep = []
                 for i in range(len(df)):
@@ -206,13 +204,25 @@ class RobotEpisodeDataset(Dataset):
 
             for i in range(n_i):
                 self.bird_frames.append(
-                    store_frame(bird_f[int(df.loc[i, "bird_index"])], jpeg_in_ram=self.jpeg_in_ram, jpeg_quality=self.jpeg_quality)
+                    store_frame(
+                        bird_f[int(df.loc[i, "bird_index"])],
+                        jpeg_in_ram=self.jpeg_in_ram,
+                        jpeg_quality=self.jpeg_quality,
+                    )
                 )
                 self.left_frames.append(
-                    store_frame(left_f[int(df.loc[i, "left_index"])], jpeg_in_ram=self.jpeg_in_ram, jpeg_quality=self.jpeg_quality)
+                    store_frame(
+                        left_f[int(df.loc[i, "left_index"])],
+                        jpeg_in_ram=self.jpeg_in_ram,
+                        jpeg_quality=self.jpeg_quality,
+                    )
                 )
                 self.right_frames.append(
-                    store_frame(right_f[int(df.loc[i, "right_index"])], jpeg_in_ram=self.jpeg_in_ram, jpeg_quality=self.jpeg_quality)
+                    store_frame(
+                        right_f[int(df.loc[i, "right_index"])],
+                        jpeg_in_ram=self.jpeg_in_ram,
+                        jpeg_quality=self.jpeg_quality,
+                    )
                 )
                 self.joint_data.append(
                     concat_bimanual_joints(
@@ -225,7 +235,9 @@ class RobotEpisodeDataset(Dataset):
                 )
                 eidx = int(df.loc[i, "eef_pose_index"])
                 flat = flatten_bimanual_pose(eef_arr[eidx], rec_id=rec_id)
-                flat = binarize_flat_pose_grippers(flat, threshold=self.npz_gripper_binarize_threshold)
+                flat = binarize_flat_pose_grippers(
+                    flat, threshold=self.npz_gripper_binarize_threshold
+                )
                 self.eef_pose_data.append(flat)
                 self.sample_demo_idx.append(demo_idx)
 
@@ -234,14 +246,16 @@ class RobotEpisodeDataset(Dataset):
             print(f"    -> robot {rec_id}: {n_i} samples")
 
         if self.num_demos == 0:
-            raise FileNotFoundError("No complete robot demos found for MixedEmbodiment.")
+            raise FileNotFoundError("No complete robot demos found for MixedEmbodiment_legacy.")
 
         all_q = torch.stack(self.joint_data, dim=0)  # [N, 14]
         all_e = torch.stack(self.eef_pose_data, dim=0)  # [N, 8]
         self.joint_mean = all_q.mean(dim=0)
         self.joint_std = all_q.std(dim=0).clamp(min=1e-2)
+        # Absolute pose stats for proprio (pose_state)
         self.eef_abs_mean = all_e.mean(dim=0)
         self.eef_abs_std = all_e.std(dim=0).clamp(min=1e-2)
+        # Relative pose stats for action targets (pose_actions)
         self.eef_mean, self.eef_std = compute_relative_pose_stats(
             self.eef_pose_data,
             demo_start_idx=self.demo_start_idx,
@@ -250,6 +264,7 @@ class RobotEpisodeDataset(Dataset):
         )
         self.eef_rel_mean = self.eef_mean
         self.eef_rel_std = self.eef_std
+        # Backward-compatible aliases (state = joints for robot)
         self.state_mean = self.joint_mean
         self.state_std = self.joint_std
         frame_bytes = sum(
@@ -275,7 +290,8 @@ class RobotEpisodeDataset(Dataset):
         sample_idx = ep_start + start_in_ep
         demo_end = ep_start + ep_len
 
-        bird_t = self.image_transform(load_frame(self.bird_frames[sample_idx]))
+        bird_np = load_frame(self.bird_frames[sample_idx])
+        bird_t = self.image_transform(bird_np)
         images = stack_camera_tensors(
             bird_t,
             self.image_transform(load_frame(self.left_frames[sample_idx])),
@@ -287,6 +303,7 @@ class RobotEpisodeDataset(Dataset):
         pose_state = (pose_raw - self.eef_abs_mean) / self.eef_abs_std
         joint_state = (joint_raw - self.joint_mean) / self.joint_std
 
+        # Absolute futures, then convert pose to deltas vs first observation in chunk.
         slice_end = min(demo_end, sample_idx + self.num_queries)
         pose_future_abs = list(self.eef_pose_data[sample_idx:slice_end])
         joint_future = list(self.joint_data[sample_idx:slice_end])

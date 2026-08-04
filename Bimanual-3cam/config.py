@@ -32,7 +32,7 @@ LEFT_ARM_SLICE = slice(0, JOINT_DIM_PER_ARM)
 RIGHT_ARM_SLICE = slice(JOINT_DIM_PER_ARM, STATE_DIM)
 GRIPPER_INDICES = (JOINT_DIM_PER_ARM - 1, STATE_DIM - 1)
 # Match Combined_relative_3cam: binarize joint grippers at load.
-ROBOT_JOINT_GRIPPER_BINARIZE_THRESHOLD = 0.2
+ROBOT_JOINT_GRIPPER_BINARIZE_THRESHOLD = 0.5
 
 
 def default_run_name() -> str:

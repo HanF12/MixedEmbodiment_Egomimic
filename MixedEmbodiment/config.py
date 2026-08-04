@@ -1,9 +1,11 @@
 """
 MixedEmbodiment ACT constants and helpers.
 
-True 3-camera architecture aligned with Combined_relative_3cam — front is NOT a
-model slot (still used for timestamp sync CSVs only).
+One package, three CLI-selectable modalities (robot / human / mixed), replacing
+the separate Combined_relative_3cam_gripweight and MixedEmbodiment_gripweight
+folders. Architecture and conventions are unchanged from those two packages:
 
+True 3-camera architecture — front is NOT a model slot.
 Camera slot order is fixed as:
   [bird, left_wrist, right_wrist]  -> model cams cam0..cam2
 
@@ -15,15 +17,22 @@ Shared pose (human hands / robot EEF / mixed hand+EEF), EgoMimic-style shared he
 Robot joints:
   14D = left 7 + right 7  (still absolute; mixed zeros the inactive arm)
   Robot/mixed EEF pose grippers (NPZ) and joint grippers (NPY) are binarized at
-  load with independent thresholds (shared across teleop + mixed).
+  load with a shared threshold (--gripper_binarize_threshold).
 
 Robot / mixed proprio: joints only [14] (robot_input_proj + robot CVAE)
-Human proprio: absolute pose [8]
+Human proprio: absolute pose [8] by default DISABLED (see POSE_OBSERVATION below) —
+  the model instead only ever sees a zeroed placeholder for the human proprio slot
+  and must predict relative pose purely from video + the CVAE latent.
 
 Third modality (mixed):
   left_robot_right_hand + right_robot_left_hand are one modality (ConcatDataset).
   Needs bird + active wrist + active-arm joints + hand-side pose + robot-side EEF.
   Bimanual NPZs still store both sides; only the correct side slots are read.
+
+Input layout: always the `sessions/<kind>/<date>/...` tree (see
+discover_sessions_roots). There is no support for arbitrary explicit data roots —
+every run points at one `--sessions_root` and the three modalities are discovered
+underneath it.
 """
 
 from __future__ import annotations
@@ -38,10 +47,10 @@ import torch
 
 DEFAULT_NUM_QUERIES = 45  # keep Combined horizon (EgoMimic uses 100)
 
-# EgoMimic-matched training defaults (same as Combined_relative_3cam)
+# EgoMimic-matched training defaults (same as Combined_relative_3cam / MixedEmbodiment)
 DEFAULT_NUM_EPOCHS = 10000
-# One epoch = one full pass over the longest modality loader
-# (max(len(robot), len(human), len(mixed))); shorter modalities are recycled.
+# One epoch = one full pass over the longest active-modality loader
+# (max over whichever of robot/human/mixed are active); shorter ones are recycled.
 DEFAULT_BATCH_SIZE = 8
 DEFAULT_LR = 1e-5
 DEFAULT_WEIGHT_DECAY = 1e-4
@@ -51,6 +60,9 @@ DEFAULT_HAND_LAMBDA = 1.0
 # L_mixed = mixed_lambda * (pose + joint + KL) before equal mean over modalities.
 DEFAULT_MIXED_LAMBDA = 1.0
 DEFAULT_RECON_LOSS = "l1"
+# Gripper emphasis (the "gripweight" feature): scales per-element recon error on
+# gripper dims of both the shared pose head and the robot/mixed joint head.
+DEFAULT_GRIPPER_LOSS_WEIGHT = 5.0
 
 # Temporal convention for action chunks:
 # Chunk is built starting at the current observation index t.
@@ -59,6 +71,15 @@ DEFAULT_RECON_LOSS = "l1"
 # Joint actions remain absolute: joint_actions[k] = joints[t+k].
 ACTION_CHUNK_STARTS_AT_CURRENT = True
 POSE_ACTION_RELATIVE_TO_CHUNK_ANCHOR = True
+
+# Whether the human proprio slot is allowed to carry the true absolute hand pose.
+# Default is False: the human (and, structurally, robot/mixed already never do
+# this) embodiment never receives absolute pose as an observation — only images
+# + the CVAE latent drive the prediction, and the model is scored purely on how
+# well it predicts the *relative* pose chunk. Set True (via --pose_observation)
+# to reproduce the legacy Combined_relative_3cam_gripweight / MixedEmbodiment_gripweight
+# behavior, where the human's absolute pose at time t was fed in as proprio.
+DEFAULT_USE_POSE_OBSERVATION = False
 
 # --- Robot joints ---
 ROBOT_JOINT_DIM = 14
@@ -78,15 +99,16 @@ POSE_DIM_PER_SIDE = 4  # xyz(3) + grip(1)
 POSE_DIM = 8  # left 4 + right 4
 # Gripper dims in flattened [8] pose: left grip, right grip
 POSE_GRIP_INDICES = (POSE_DIM_PER_SIDE - 1, POSE_DIM - 1)  # (3, 7)
-# Gripper binarize thresholds at load (human hand open/close left as-is).
-# NPZ = robot/mixed EEF pose grip channel; NPY = joint gripper channels.
-# Same values apply to teleop and mixed (set independently via CLI).
-ROBOT_NPZ_GRIPPER_BINARIZE_THRESHOLD = 0.8
-ROBOT_NPY_GRIPPER_BINARIZE_THRESHOLD = 0.8
-# Back-compat aliases
-ROBOT_EEF_GRIPPER_BINARIZE_THRESHOLD = ROBOT_NPZ_GRIPPER_BINARIZE_THRESHOLD
-ROBOT_TELEOP_GRIPPER_BINARIZE_THRESHOLD = ROBOT_NPY_GRIPPER_BINARIZE_THRESHOLD
-ROBOT_JOINT_GRIPPER_BINARIZE_THRESHOLD = ROBOT_NPY_GRIPPER_BINARIZE_THRESHOLD
+
+# Single shared gripper-binarize threshold (--gripper_binarize_threshold).
+# Historically NPZ (EEF/hand pose) and NPY (joint) thresholds were configurable
+# independently, but every run in this repo used the same value for both, so
+# the CLI now exposes one flag. The two constants below stay independently
+# addressable in code (e.g. for a future divergence) but default to the same
+# CLI-provided value.
+GRIPPER_BINARIZE_THRESHOLD = 0.5
+ROBOT_NPZ_GRIPPER_BINARIZE_THRESHOLD = GRIPPER_BINARIZE_THRESHOLD  # EEF/hand pose from NPZ
+ROBOT_NPY_GRIPPER_BINARIZE_THRESHOLD = GRIPPER_BINARIZE_THRESHOLD  # joint grippers from NPY
 HUMAN_STATE_DIM = POSE_DIM
 HUMAN_PROPRIO_DIM = POSE_DIM
 ROBOT_PROPRIO_DIM = ROBOT_JOINT_DIM  # EgoMimic: joints only
@@ -106,9 +128,9 @@ EMBODIMENT_ROBOT = 0
 EMBODIMENT_HUMAN = 1
 EMBODIMENT_MIXED = 2
 EMBODIMENT_NAMES = ("robot", "human", "mixed")
+EMBODIMENT_IDS = {"robot": EMBODIMENT_ROBOT, "human": EMBODIMENT_HUMAN, "mixed": EMBODIMENT_MIXED}
 
 # Sync CSVs still include front_index for timestamp alignment (not a model cam).
-# Leading-frame temp_cut removed from dataloaders; see legacy_temp_cut.py
 ROBOT_SYNC_INDEX_COLUMNS = (
     "left_joint_index",
     "right_joint_index",
@@ -118,7 +140,6 @@ ROBOT_SYNC_INDEX_COLUMNS = (
     "front_index",
     "eef_pose_index",
 )
-
 
 HUMAN_SYNC_INDEX_COLUMNS = (
     "bird_index",
@@ -135,7 +156,6 @@ MIXED_SYNC_INDEX_COLUMNS = (
     "eef_pose_index",
 )
 
-
 ROBOT_EEF_RELDIR = Path("joint-data") / "combined_npz_commonframe"
 ROBOT_EEF_COORD_FRAME = (
     "arm_fk_targetframe_commonframe: left/right arm-base FK poses "
@@ -143,22 +163,16 @@ ROBOT_EEF_COORD_FRAME = (
     "Training uses xyz+gripper only (rotation dropped)."
 )
 
-# Default pose NPZ layouts under each modality root (sessions layout).
+# Default pose NPZ layout under each modality root (sessions layout).
 HUMAN_POSE_RELDIR = Path("bird-realsense-data") / "combined_npz_targetframe"
 
-# Top-level sessions tree. Training can be launched with only --sessions_root.
+# Top-level sessions tree. This is the ONLY supported data-input shape
+# (item 7): every run points at one --sessions_root and robot / human / mixed
+# roots are discovered underneath it.
 DEFAULT_SESSIONS_ROOT = Path("sessions")
 ROBOT_SESSION_KIND = "teleop_bimanual"
 HUMAN_SESSION_KIND = "human_hands_bimanual_raw"
 MIXED_SESSION_KINDS = ("left_robot_right_hand", "right_robot_left_hand")
-
-# Legacy explicit defaults (still used if a date folder exists under sessions/).
-DEFAULT_ROBOT_DATA_ROOT = DEFAULT_SESSIONS_ROOT / ROBOT_SESSION_KIND / "0714"
-DEFAULT_HUMAN_DATA_ROOT = DEFAULT_SESSIONS_ROOT / HUMAN_SESSION_KIND / "0714"
-DEFAULT_MIXED_DATA_ROOTS = (
-    DEFAULT_SESSIONS_ROOT / "left_robot_right_hand" / "0720",
-    DEFAULT_SESSIONS_ROOT / "right_robot_left_hand" / "0720",
-)
 
 MAX_STATE_DIM = max(POSE_DIM, ROBOT_JOINT_DIM)
 
@@ -171,16 +185,11 @@ def _looks_like_session_date_root(path: Path) -> bool:
 
 
 def list_session_date_roots(sessions_root: str | Path, kind: str) -> list[Path]:
-    """
-    List date roots under sessions/<kind>/<date> (sorted).
-
-    Example: sessions/left_robot_right_hand/0720
-    """
+    """List date roots under sessions/<kind>/<date> (sorted)."""
     base = Path(sessions_root).expanduser().resolve() / kind
     if not base.is_dir():
         return []
-    dates = [p for p in sorted(base.iterdir()) if _looks_like_session_date_root(p)]
-    return dates
+    return [p for p in sorted(base.iterdir()) if _looks_like_session_date_root(p)]
 
 
 def discover_sessions_roots(
@@ -231,7 +240,7 @@ def concat_bimanual_joints(
     Robot qpos: [7 left, 7 right] -> [14].
 
     By default, gripper joints (last channel per arm; flattened indices 6 and 13)
-    are binarized with ROBOT_NPY_GRIPPER_BINARIZE_THRESHOLD.
+    are binarized with the shared gripper_binarize_threshold.
     """
     left_tensor = torch.as_tensor(left_step, dtype=torch.float32).reshape(-1)
     right_tensor = torch.as_tensor(right_step, dtype=torch.float32).reshape(-1)
@@ -427,20 +436,32 @@ def camera_mask_tensor(
     return torch.tensor(mask, dtype=torch.float32)
 
 
+def gripper_dim_weights(action_dim: int, grip_indices: tuple[int, ...], weight: float) -> list[float]:
+    """Per-dim multipliers for recon loss; gripper indices get `weight`, others 1.0."""
+    w = float(weight)
+    out = [1.0] * int(action_dim)
+    for idx in grip_indices:
+        i = int(idx)
+        if not (0 <= i < len(out)):
+            raise IndexError(f"gripper index {i} out of range for action_dim={action_dim}")
+        out[i] = w
+    return out
+
+
 def build_run_metadata(
     *,
+    embodiments: list[str],
+    sessions_root: str | Path,
     robot_data_root: str | Path | None,
     human_data_root: str | Path | None,
-    robot_sync_dir: str | Path | None,
-    human_sync_dir: str | Path | None,
+    mixed_data_roots: list[str | Path] | tuple[str | Path, ...] | None,
     num_queries: int,
     max_skew_s: float,
-    robot_eef_dir: str | Path | None = None,
-    mixed_data_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
-    mixed_sync_dirs: list[str | Path] | tuple[str | Path, ...] | None = None,
-    action_chunk_starts_at_current: bool = ACTION_CHUNK_STARTS_AT_CURRENT,
+    use_pose_observation: bool,
+    gripper_binarize_threshold: float,
     pose_loss_weight: float = 1.0,
     joint_loss_weight: float = 1.0,
+    gripper_loss_weight: float = DEFAULT_GRIPPER_LOSS_WEIGHT,
     kl_weight: float = DEFAULT_KL_WEIGHT,
     reconstruction_loss: str = DEFAULT_RECON_LOSS,
     joint_modality_update: bool = True,
@@ -450,17 +471,24 @@ def build_run_metadata(
     num_epochs: int = DEFAULT_NUM_EPOCHS,
     batch_size: int = DEFAULT_BATCH_SIZE,
     lr: float = DEFAULT_LR,
-    npz_gripper_binarize_threshold: float = ROBOT_NPZ_GRIPPER_BINARIZE_THRESHOLD,
-    npy_gripper_binarize_threshold: float = ROBOT_NPY_GRIPPER_BINARIZE_THRESHOLD,
 ) -> dict[str, Any]:
     mixed_roots_list = [str(p) for p in (mixed_data_roots or [])]
-    mixed_sync_list = [str(p) for p in (mixed_sync_dirs or [])]
     return {
-        "variant": "mixed-embodiment-relative-3cam",
+        "variant": "mixed-embodiment-relative-3cam-gripweight",
+        "embodiments": list(embodiments),
         "pose_layout": "xyz+gripper only (8D); rot6d dropped at load",
         "pose_action_space": "relative_to_chunk_anchor",
+        "pose_observation": bool(use_pose_observation),
+        "pose_observation_semantics": (
+            "True: human proprio + CVAE state channel receive the true absolute "
+            "pose at t (legacy Combined_relative_3cam_gripweight / "
+            "MixedEmbodiment_gripweight behavior). "
+            "False (default): human proprio + CVAE state channel are zeroed; the "
+            "model predicts the relative pose chunk from images + latent only. "
+            "Robot/mixed never receive pose as an observation either way "
+            "(their proprio is always joint_state)."
+        ),
         "embodiment_cue": "modality routing (separate projs/heads/cams), no embedding token",
-        "modalities": ["robot", "human", "mixed"],
         "mixed_policy": (
             "third modality = Concat(left_robot_right_hand, right_robot_left_hand); "
             "proprio/CVAE use robot joint path; pose [8]=hand slot + robot EEF slot "
@@ -481,46 +509,36 @@ def build_run_metadata(
         "mixed_camera_mask_left_robot": list(MIXED_CAMERA_MASK_LEFT_ROBOT),
         "mixed_camera_mask_right_robot": list(MIXED_CAMERA_MASK_RIGHT_ROBOT),
         "num_queries": int(num_queries),
-        "action_chunk_starts_at_current": bool(action_chunk_starts_at_current),
+        "action_chunk_starts_at_current": bool(ACTION_CHUNK_STARTS_AT_CURRENT),
         "pose_action_relative_to_chunk_anchor": bool(POSE_ACTION_RELATIVE_TO_CHUNK_ANCHOR),
         "action_chunk_convention": (
             "pose_actions[k] = pose[t+k] - pose[t] (delta vs first observation in the chunk); "
             "pose_actions[0] is zeros; at inference absolute_pose[k] = anchor_pose[t] + denorm(pred[k]). "
             "joint_actions[k] remain absolute joints at t+k."
         ),
+        "sessions_root": str(sessions_root),
         "robot_data_root": str(robot_data_root) if robot_data_root is not None else None,
         "human_data_root": str(human_data_root) if human_data_root is not None else None,
         "mixed_data_roots": mixed_roots_list,
-        "mixed_data_root": mixed_roots_list[0] if mixed_roots_list else None,
-        "robot_sync_dir": str(robot_sync_dir) if robot_sync_dir is not None else None,
-        "human_sync_dir": str(human_sync_dir) if human_sync_dir is not None else None,
-        "mixed_sync_dirs": mixed_sync_list,
-        "mixed_sync_dir": mixed_sync_list[0] if mixed_sync_list else None,
-        "robot_eef_dir": str(robot_eef_dir) if robot_eef_dir is not None else None,
-        "robot_eef_file_format": "npz",
-        "robot_eef_pose_dim": POSE_DIM,
-        "robot_eef_sync_column": "eef_pose_index",
-        "robot_eef_coord_frame": ROBOT_EEF_COORD_FRAME,
         "robot_eef_reldir": str(ROBOT_EEF_RELDIR),
         "human_pose_reldir": str(HUMAN_POSE_RELDIR),
+        "gripper_binarize_threshold": float(gripper_binarize_threshold),
         "gripper_semantics": (
             "shared last per-side dim: human open/close left as-is; "
-            f"robot/mixed EEF pose (NPZ) binarized at load with threshold "
-            f"{float(npz_gripper_binarize_threshold)}; "
-            f"robot/mixed joint grippers (NPY) binarized at load with threshold "
-            f"{float(npy_gripper_binarize_threshold)}; "
+            f"robot/mixed EEF pose (NPZ) and joint (NPY) grippers binarized at load "
+            f"with threshold {float(gripper_binarize_threshold)}; "
             "relative pose deltas include gripper dims"
         ),
-        "npz_gripper_binarize_threshold": float(npz_gripper_binarize_threshold),
-        "npy_gripper_binarize_threshold": float(npy_gripper_binarize_threshold),
-        # Back-compat keys (same shared thresholds for teleop + mixed)
-        "robot_eef_gripper_binarize_threshold": float(npz_gripper_binarize_threshold),
-        "robot_joint_gripper_binarize_threshold": float(npy_gripper_binarize_threshold),
-        "robot_teleop_gripper_binarize_threshold": float(npy_gripper_binarize_threshold),
-        "mixed_gripper_binarize_threshold": float(npz_gripper_binarize_threshold),
         "max_skew_s": float(max_skew_s),
         "pose_loss_weight": float(pose_loss_weight),
         "joint_loss_weight": float(joint_loss_weight),
+        "gripper_loss_weight": float(gripper_loss_weight),
+        "gripper_loss_weighting": (
+            "per-element recon error on gripper dims (pose indices "
+            f"{POSE_GRIP_INDICES}, joint indices {GRIPPER_INDICES}) "
+            f"scaled by gripper_loss_weight={float(gripper_loss_weight)}; "
+            "non-gripper dims remain weight 1.0"
+        ),
         "kl_weight": float(kl_weight),
         "hand_lambda": float(hand_lambda),
         "mixed_lambda": float(mixed_lambda),
@@ -528,8 +546,8 @@ def build_run_metadata(
         "joint_modality_update": bool(joint_modality_update),
         "num_epochs": int(num_epochs),
         "epoch_length": (
-            "max(len(robot_loader), len(human_loader), len(mixed_loader)); "
-            "shorter modalities recycled; loss = mean over available modalities"
+            "max over active-modality loader lengths; shorter modalities recycled; "
+            "loss = mean over active modalities per step"
         ),
         "steps_per_epoch": int(steps_per_epoch) if steps_per_epoch is not None else None,
         "batch_size": int(batch_size),
