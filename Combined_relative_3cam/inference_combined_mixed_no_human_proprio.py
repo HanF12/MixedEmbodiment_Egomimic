@@ -1,26 +1,17 @@
 #!/usr/bin/env python
 """
-Combined-relative mixed-ACT inference (robot / joint pathway only).
+Combined-relative-3cam ACT inference for *mixed* embodiment:
+  - one robot arm (left OR right)
+  - one human hand (the opposite side; present only in the bird view)
 
-I/O closely follows Bimanual-3cam/inference_bimanual.py (RealSense + ROS joints),
-but drives MixedEmbodiment.MixedDETRVAE with:
-  - embodiment = robot
-  - proprio = joint_state [14]  (robot_input_proj)
-  - camera slots [bird, left_wrist, right_wrist] (true 3-cam; no front)
-  - shared pose head is xyz+gripper (8D); control from joint_action_head only
-  - MixedEmbodiment training also has human/mixed modalities; this script uses robot joint path only
+This script intentionally runs the model through the ROBOT joint pathway
+(`embodiment=EMBODIMENT_ROBOT`) so we get `joint_pred` and can command the robot.
+The "mixed" aspect is implemented purely by:
+  - packing a *single-arm* joint_state into the 14D vector (inactive arm = zeros)
+  - masking cameras to keep bird + active wrist only
+  - publishing joint targets to the active arm only
 
-Relative vs absolute
---------------------
-Training uses *relative* pose actions for the shared EEF/hand head:
-  pose_actions[k] = pose[t+k] - pose[t]
-Joint actions remain *absolute*:
-  joint_actions[k] = joints[t+k]
-
-This script publishes absolute joint targets from joint_pred, so the relative
-pose training convention does **not** change the robot control loop. Human /
-EEF relative norms are optional (for logging / future pose control) and unused
-when commanding joints.
+It is compatible with "no human proprio" checkpoints (no human_input_* / human_cvae_state_*).
 """
 
 from __future__ import annotations
@@ -37,6 +28,7 @@ import numpy as np
 import pyrealsense2 as rs
 import rospy
 import torch
+import torch.nn as nn
 from sensor_msgs.msg import JointState
 
 _PKG_DIR = Path(__file__).resolve().parent
@@ -55,11 +47,9 @@ from config import (  # noqa: E402
     POSE_DIM,
     RIGHT_ARM_SLICE,
     ROBOT_JOINT_DIM,
-    camera_mask_tensor,
-    concat_bimanual_joints,
-    load_run_metadata,
     stack_camera_tensors,
     validate_run_metadata,
+    load_run_metadata,
 )
 from core import build  # noqa: E402
 
@@ -77,9 +67,25 @@ from joint_lisener import (  # type: ignore  # noqa: E402
 RESNET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 RESNET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
-DEFAULT_CHECKPOINT = "mixed_act_epoch_7000.pth"
-DEFAULT_ROBOT_NORM = "mixed_normalization_stats_robot.npz"
-DEFAULT_HUMAN_NORM = "mixed_normalization_stats_human.npz"
+# Reasonable defaults for fold-3 mixed checkpoints in this repo.
+DEFAULT_CHECKPOINT = "mixed_act_epoch_9000_fold_3.pth"
+DEFAULT_MIXED_NORM = "normalization_stats_mixed_fold_3.npz"
+
+
+def convert_model_to_no_human_proprio(model: nn.Module) -> nn.Module:
+    """
+    Drop human proprio / CVAE-state adapters so state_dict matches checkpoints
+    that have neither pose Linears nor learned constants.
+    """
+    for name in (
+        "human_input_proj",
+        "human_cvae_state_proj",
+        "human_input_const",
+        "human_cvae_state_const",
+    ):
+        if hasattr(model, name):
+            delattr(model, name)
+    return model
 
 
 def resolve_path(path_like: str) -> Path:
@@ -197,6 +203,45 @@ def load_joint_norm_stats(path: Path) -> tuple[np.ndarray, np.ndarray]:
     return mean, std
 
 
+def mixed_camera_mask(robot_side: str) -> torch.Tensor:
+    """
+    Return float mask [3] aligned with CAMERA_ORDER=(bird,left_wrist,right_wrist).
+    """
+    if robot_side == "left":
+        return torch.tensor([1.0, 1.0, 0.0], dtype=torch.float32)
+    if robot_side == "right":
+        return torch.tensor([1.0, 0.0, 1.0], dtype=torch.float32)
+    raise ValueError(f"robot_side must be 'left' or 'right', got {robot_side!r}")
+
+
+def pack_single_arm_qpos(
+    arm_qpos: np.ndarray,
+    *,
+    robot_side: str,
+    binarize_gripper: bool,
+    gripper_threshold: float,
+) -> np.ndarray:
+    """
+    Build a 14D joint vector with inactive arm = zeros.
+    """
+    q = np.zeros((ROBOT_JOINT_DIM,), dtype=np.float32)
+    arm = np.asarray(arm_qpos, dtype=np.float32).reshape(-1)
+    if arm.size < 7:
+        raise ValueError(f"Expected >=7 joints, got {arm.size}")
+    if robot_side == "left":
+        q[LEFT_ARM_SLICE] = arm[:7]
+        grip_idx = GRIPPER_INDICES[0]
+    elif robot_side == "right":
+        q[RIGHT_ARM_SLICE] = arm[:7]
+        grip_idx = GRIPPER_INDICES[1]
+    else:
+        raise ValueError(f"robot_side must be 'left' or 'right', got {robot_side!r}")
+    if binarize_gripper:
+        thr = float(gripper_threshold)
+        q[grip_idx] = 1.0 if float(q[grip_idx]) >= thr else 0.0
+    return q
+
+
 class ArmPublishers:
     def __init__(self, arm_topic: str, gripper_topic: str, frame_id: str = "world"):
         self.arm_pub = rospy.Publisher(arm_topic, JointState, queue_size=10)
@@ -246,20 +291,23 @@ class Args:
 
 
 parser = argparse.ArgumentParser(
-    description="MixedEmbodiment ACT inference (robot/joint pathway; absolute joint targets)"
+    description=(
+        "Combined-relative-3cam ACT inference for mixed one-arm embodiment "
+        "(no human proprio checkpoints; absolute joint targets)"
+    )
 )
 parser.add_argument("--checkpoint", type=str, default=DEFAULT_CHECKPOINT)
 parser.add_argument(
-    "--normalization_path",
-    type=str,
-    default=DEFAULT_ROBOT_NORM,
-    help="Robot normalization npz (joint_mean/joint_std or qpos_mean/qpos_std)",
+    "--robot_side",
+    choices=("left", "right"),
+    required=True,
+    help="Which side is the robot arm to command (the other side is the human hand).",
 )
 parser.add_argument(
-    "--human_normalization_path",
+    "--normalization_path",
     type=str,
-    default=DEFAULT_HUMAN_NORM,
-    help="Human relative-pose norms (unused for joint control; validated/logged only)",
+    default=DEFAULT_MIXED_NORM,
+    help="Mixed normalization npz (must include joint_mean/joint_std or qpos_mean/qpos_std; shape (14,))",
 )
 parser.add_argument("--num_queries", type=int, default=DEFAULT_NUM_QUERIES)
 parser.add_argument("--display", action=argparse.BooleanOptionalAction, default=True)
@@ -278,34 +326,35 @@ parser.add_argument("--topic_gripper_left", type=str, default="/gripper_position
 parser.add_argument("--topic_arm_right", type=str, default="/arm_joint_target_position_slave_right")
 parser.add_argument("--topic_gripper_right", type=str, default="/gripper_position_control_slave_right")
 parser.add_argument(
+    "--binarize_input_gripper",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="If set, binarize the active-arm joint-state gripper channel to {0,1} before normalization/model input.",
+)
+parser.add_argument(
+    "--input_gripper_binarize_threshold",
+    type=float,
+    # Training default in this repo (see Combined_relative_3cam/config.py)
+    default=0.7,
+    help="Threshold for --binarize_input_gripper (value >= thr → 1, else 0).",
+)
+parser.add_argument(
     "--gripper_mode",
     choices=("binary", "continuous"),
     default="binary",
-    help="binary: threshold denorm preds to 0/70; continuous: scale*pred then clamp to --gripper_max",
+    help="binary: threshold denorm pred to 0/70; continuous: scale*pred then clamp to --gripper_max",
 )
 parser.add_argument(
-    "--gripper_threshold_left",
+    "--gripper_threshold",
     type=float,
-    default=0.5,
-    help="[binary] Left gripper: denormalized pred < threshold → 0, else 70",
+    default=0.55,
+    help="[binary] Active gripper: denormalized pred < threshold → 0, else 70",
 )
 parser.add_argument(
-    "--gripper_threshold_right",
-    type=float,
-    default=0.5,
-    help="[binary] Right gripper: denormalized pred < threshold → 0, else 70",
-)
-parser.add_argument(
-    "--gripper_scale_left",
+    "--gripper_scale",
     type=float,
     default=65.0,
-    help="[continuous] Multiply left denormalized gripper pred by this before publishing",
-)
-parser.add_argument(
-    "--gripper_scale_right",
-    type=float,
-    default=65.0,
-    help="[continuous] Multiply right denormalized gripper pred by this before publishing",
+    help="[continuous] Multiply denormalized gripper pred by this before publishing",
 )
 parser.add_argument(
     "--gripper_max",
@@ -314,7 +363,7 @@ parser.add_argument(
     help="[continuous] Clamp scaled gripper cmd to this (set <0 to disable)",
 )
 parser.add_argument("--max_joint_speed", type=float, default=0.5)
-parser.add_argument("--max_gripper_speed", type=float, default=999)
+parser.add_argument("--max_gripper_speed", type=float, default=100000)
 parser.add_argument("--bird_role", choices=("left", "right", "center", "front"), default="center")
 parser.add_argument("--bird_serial", type=str, default=None)
 parser.add_argument("--bird_color_fps", type=int, default=15)
@@ -329,55 +378,40 @@ cli = parser.parse_args(rospy.myargv(argv=sys.argv)[1:])
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"device={device} cuda_available={torch.cuda.is_available()}")
 print(
-    f"safety: max_joint_speed={cli.max_joint_speed:g} rad/s, "
-    f"max_gripper_speed={cli.max_gripper_speed:g}, gripper_mode={cli.gripper_mode}"
+    f"mode=mixed robot_side={cli.robot_side} "
+    f"safety: max_joint_speed={cli.max_joint_speed:g} rad/s, max_gripper_speed={cli.max_gripper_speed:g}, "
+    f"gripper_mode={cli.gripper_mode}"
 )
 print(f"cameras={list(CAMERA_ORDER)} (true 3-cam, pose_dim={POSE_DIM})")
+print(f"camera_mask={mixed_camera_mask(str(cli.robot_side)).tolist()} (bird + active wrist)")
 
 checkpoint_path = resolve_path(cli.checkpoint)
 metadata = load_run_metadata(checkpoint_path.parent)
 if metadata is not None:
     try:
         validate_run_metadata(metadata, num_queries=cli.num_queries)
-        print(
-            f"run_metadata: pose_action_space={metadata.get('pose_action_space')} "
-            f"(joint control uses absolute joint_pred)"
-        )
+        print(f"run_metadata: pose_action_space={metadata.get('pose_action_space')} (joint control uses joint_pred)")
     except ValueError as exc:
         print(f"Warning: skipping run_metadata validation: {exc}")
 
 model = build(Args(cli.num_queries)).to(device)
+convert_model_to_no_human_proprio(model)
 state_dict = torch.load(str(checkpoint_path), map_location=device)
-model.load_state_dict(state_dict)
+model.load_state_dict(state_dict, strict=True)
 model.eval()
-print(f"Loaded checkpoint: {checkpoint_path}")
+print(f"Loaded no-human-proprio checkpoint: {checkpoint_path}")
 
-robot_norm_path = resolve_path(cli.normalization_path)
-joint_mean_np, joint_std_np = load_joint_norm_stats(robot_norm_path)
+norm_path = resolve_path(cli.normalization_path)
+joint_mean_np, joint_std_np = load_joint_norm_stats(norm_path)
 qpos_mean = torch.from_numpy(joint_mean_np.reshape(1, ROBOT_JOINT_DIM)).to(device)
 qpos_std = torch.from_numpy(joint_std_np.reshape(1, ROBOT_JOINT_DIM)).to(device)
-print(f"Robot joint norms: {robot_norm_path}")
+print(f"Joint norms: {norm_path}")
 
-human_norm_path = resolve_path(cli.human_normalization_path)
-if human_norm_path.is_file():
-    human_stats = np.load(str(human_norm_path), allow_pickle=True)
-    space = (
-        str(human_stats["pose_action_space"])
-        if "pose_action_space" in human_stats.files
-        else "unknown"
-    )
-    print(
-        f"Human pose norms (unused for joint control): {human_norm_path} "
-        f"keys={human_stats.files} pose_action_space={space}"
-    )
-else:
-    print(f"Warning: human normalization file not found: {human_norm_path}")
-
-robot_cam_mask = camera_mask_tensor(EMBODIMENT_ROBOT).unsqueeze(0).to(device)  # [1,3]
-# Dummy pose_state for API; robot path uses joint_state only.
+cam_mask = mixed_camera_mask(str(cli.robot_side)).unsqueeze(0).to(device)  # [1,3]
+# Dummy pose_state for API; no-human-proprio checkpoints ignore human state adapters anyway.
 dummy_pose_state = torch.zeros(1, POSE_DIM, dtype=torch.float32, device=device)
 
-rospy.init_node("mixed_embodiment_act_inference_robot", anonymous=True)
+rospy.init_node("combined_relative_act_inference_mixed_no_human_proprio", anonymous=True)
 joint_state_listener(topic=str(cli.left_joint_topic), side="left")
 joint_state_listener(topic=str(cli.right_joint_topic), side="right")
 left_publishers = ArmPublishers(str(cli.topic_arm_left), str(cli.topic_gripper_left))
@@ -412,6 +446,10 @@ last_cmd: Optional[np.ndarray] = None
 last_cmd_t: Optional[float] = None
 last_preview_t = 0.0
 
+robot_side = str(cli.robot_side)
+active_offset = 0 if robot_side == "left" else 7
+active_grip_idx = GRIPPER_INDICES[0] if robot_side == "left" else GRIPPER_INDICES[1]
+
 try:
     while not rospy.is_shutdown():
         frames = [poll_color_bgr(pipeline, timeout_ms=90) for _, _, pipeline in pipelines]
@@ -421,18 +459,24 @@ try:
             loop_rate.sleep()
             continue
 
-        qpos_np = concat_bimanual_joints(
-            np.asarray(list(left_state[0]), dtype=np.float32),
-            np.asarray(list(right_state[0]), dtype=np.float32),
-            rec_id="live_inference",
-        ).cpu().numpy()
+        if robot_side == "left":
+            active_arm = np.asarray(list(left_state[0]), dtype=np.float32)
+        else:
+            active_arm = np.asarray(list(right_state[0]), dtype=np.float32)
+
+        qpos_np = pack_single_arm_qpos(
+            active_arm,
+            robot_side=robot_side,
+            binarize_gripper=bool(cli.binarize_input_gripper),
+            gripper_threshold=float(cli.input_gripper_binarize_threshold),
+        )
         joint_state = torch.from_numpy(qpos_np).unsqueeze(0).to(device)
         joint_state = (joint_state - qpos_mean) / qpos_std
 
         if float(cli.resize_factor) != 1.0:
             frames = [maybe_resize(frame, float(cli.resize_factor)) for frame in frames]
 
-        # Stack by label (not list index) so order always matches training:
+        # Stack by label so order always matches training:
         # CAMERA_ORDER = (bird, left_wrist, right_wrist) -> cam0/cam1/cam2.
         frame_by_label = {label: frame for (label, _, _), frame in zip(pipelines, frames)}
         stacked_images = stack_camera_tensors(
@@ -447,13 +491,12 @@ try:
                 images=stacked_images,
                 embodiment=EMBODIMENT_ROBOT,
                 joint_state=joint_state,
-                camera_mask=robot_cam_mask,
+                camera_mask=cam_mask,
             )
             pred = out["joint_pred"]
             if pred is None:
-                raise RuntimeError("joint_pred is None for robot embodiment")
+                raise RuntimeError("joint_pred is None (expected in robot joint path)")
 
-        # Absolute joint trajectory (training joint_actions are absolute).
         predicted_trajectory = pred[0] * qpos_std.squeeze(0) + qpos_mean.squeeze(0)
         predicted_trajectory_np = predicted_trajectory.cpu().numpy()
         past_predictions_buffer.append(predicted_trajectory_np)
@@ -474,40 +517,27 @@ try:
         else:
             positions_to_publish = predicted_trajectory_np[0].astype(np.float32)
 
-        # Raw denormalized gripper preds, then map via --gripper_mode.
-        raw_grip_l = float(positions_to_publish[GRIPPER_INDICES[0]])
-        raw_grip_r = float(positions_to_publish[GRIPPER_INDICES[1]])
-        thr_l = float(cli.gripper_threshold_left)
-        thr_r = float(cli.gripper_threshold_right)
+        # Post-process ACTIVE gripper only; inactive arm remains unused (and unpublished).
+        raw_grip = float(positions_to_publish[active_grip_idx])
         if cli.gripper_mode == "binary":
-            cmd_l = 70.0 if raw_grip_l >= thr_l else 0.0
-            cmd_r = 70.0 if raw_grip_r >= thr_r else 0.0
+            cmd_grip = 70.0 if raw_grip >= float(cli.gripper_threshold) else 0.0
         else:
-            cmd_l = raw_grip_l * float(cli.gripper_scale_left)
-            cmd_r = raw_grip_r * float(cli.gripper_scale_right)
+            cmd_grip = raw_grip * float(cli.gripper_scale)
             if float(cli.gripper_max) >= 0:
-                cmd_l = min(cmd_l, float(cli.gripper_max))
-                cmd_r = min(cmd_r, float(cli.gripper_max))
-        positions_to_publish[GRIPPER_INDICES[0]] = cmd_l
-        positions_to_publish[GRIPPER_INDICES[1]] = cmd_r
+                cmd_grip = min(cmd_grip, float(cli.gripper_max))
+        positions_to_publish[active_grip_idx] = float(cmd_grip)
 
         desired = positions_to_publish.astype(np.float32)
         now_t = time.monotonic()
         if last_cmd is None or last_cmd_t is None:
             last_cmd = qpos_np.astype(np.float32).copy()
+            # Seed gripper command in the active slot
             if cli.gripper_mode == "binary":
-                last_cmd[GRIPPER_INDICES[0]] = 70.0 if float(last_cmd[GRIPPER_INDICES[0]]) >= thr_l else 0.0
-                last_cmd[GRIPPER_INDICES[1]] = 70.0 if float(last_cmd[GRIPPER_INDICES[1]]) >= thr_r else 0.0
+                last_cmd[active_grip_idx] = 70.0 if float(last_cmd[active_grip_idx]) >= float(cli.gripper_threshold) else 0.0
             else:
-                last_cmd[GRIPPER_INDICES[0]] *= float(cli.gripper_scale_left)
-                last_cmd[GRIPPER_INDICES[1]] *= float(cli.gripper_scale_right)
+                last_cmd[active_grip_idx] = float(last_cmd[active_grip_idx]) * float(cli.gripper_scale)
                 if float(cli.gripper_max) >= 0:
-                    last_cmd[GRIPPER_INDICES[0]] = min(
-                        float(last_cmd[GRIPPER_INDICES[0]]), float(cli.gripper_max)
-                    )
-                    last_cmd[GRIPPER_INDICES[1]] = min(
-                        float(last_cmd[GRIPPER_INDICES[1]]), float(cli.gripper_max)
-                    )
+                    last_cmd[active_grip_idx] = min(float(last_cmd[active_grip_idx]), float(cli.gripper_max))
             last_cmd_t = now_t
         else:
             dt_nom = 1.0 / max(1e-3, float(cli.inference_fps))
@@ -516,38 +546,32 @@ try:
             max_dg = float(cli.max_gripper_speed) * dt
             cmd = last_cmd.copy()
 
-            for offset in (0, 7):
-                dq = desired[offset : offset + 6] - cmd[offset : offset + 6]
-                dq = np.clip(dq, -max_dq, max_dq)
-                cmd[offset : offset + 6] += dq
-                dg = float(np.clip(desired[offset + 6] - cmd[offset + 6], -max_dg, max_dg))
-                cmd[offset + 6] += dg
+            offset = int(active_offset)
+            dq = desired[offset : offset + 6] - cmd[offset : offset + 6]
+            dq = np.clip(dq, -max_dq, max_dq)
+            cmd[offset : offset + 6] += dq
+            dg = float(np.clip(desired[offset + 6] - cmd[offset + 6], -max_dg, max_dg))
+            cmd[offset + 6] += dg
 
             last_cmd = cmd.astype(np.float32)
             last_cmd_t = now_t
 
-        left_publishers.publish(last_cmd[LEFT_ARM_SLICE])
-        right_publishers.publish(last_cmd[RIGHT_ARM_SLICE])
+        if robot_side == "left":
+            left_publishers.publish(last_cmd[LEFT_ARM_SLICE])
+        else:
+            right_publishers.publish(last_cmd[RIGHT_ARM_SLICE])
 
         if bool(cli.display):
             wall = time.time()
             min_dt = 1.0 / max(1e-3, float(cli.display_max_fps))
             if wall - last_preview_t >= min_dt:
                 last_preview_t = wall
-                if cli.gripper_mode == "binary":
-                    mode_note = f"binary thr L/R={thr_l:g}/{thr_r:g}"
-                else:
-                    mode_note = (
-                        f"continuous scale L/R={cli.gripper_scale_left:g}/{cli.gripper_scale_right:g} "
-                        f"max={cli.gripper_max:g}"
-                    )
                 grip_overlay = (
-                    f"raw L/R={raw_grip_l:.3f}/{raw_grip_r:.3f} "
-                    f"-> cmd {desired[GRIPPER_INDICES[0]]:.1f}/{desired[GRIPPER_INDICES[1]]:.1f} "
-                    f"({mode_note})"
+                    f"robot_side={robot_side} "
+                    f"raw_grip={raw_grip:.3f} -> cmd_grip={float(cmd_grip):.1f} "
+                    f"(cam_mask={cam_mask.squeeze(0).tolist()})"
                 )
                 print(f"gripper {grip_overlay}", flush=True)
-                # Preview in fixed training order (ignore pipeline list order).
                 preview_order = ("bird", "left_wrist", "right_wrist")
                 serial_by_label = {label: serial for label, serial, _ in pipelines}
                 shown = []
@@ -569,7 +593,7 @@ try:
                     shown[1][:h, :w],  # left_wrist (cam1)
                     shown[2][:h, :w],  # right_wrist (cam2)
                 )
-                cv2.imshow("MixedEmbodiment ACT Inference (robot)", preview)
+                cv2.imshow("Combined-relative-3cam ACT Inference (mixed, no human proprio)", preview)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
 
@@ -583,3 +607,4 @@ finally:
         except Exception:
             pass
     cv2.destroyAllWindows()
+

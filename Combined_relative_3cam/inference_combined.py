@@ -277,6 +277,22 @@ parser.add_argument("--topic_gripper_left", type=str, default="/gripper_position
 parser.add_argument("--topic_arm_right", type=str, default="/arm_joint_target_position_slave_right")
 parser.add_argument("--topic_gripper_right", type=str, default="/gripper_position_control_slave_right")
 parser.add_argument(
+    "--binarize_input_grippers",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help=(
+        "If set, binarize the 14D joint-state gripper channels (indices 6,13) "
+        "to {0,1} with --input_gripper_binarize_threshold before normalization / model input. "
+        "Use --no-binarize_input_grippers to pass continuous measured grippers."
+    ),
+)
+parser.add_argument(
+    "--input_gripper_binarize_threshold",
+    type=float,
+    default=0.5,
+    help="Threshold for --binarize_input_grippers (value >= thr → 1, else 0)",
+)
+parser.add_argument(
     "--gripper_mode",
     choices=("binary", "continuous"),
     default="binary",
@@ -291,7 +307,7 @@ parser.add_argument(
 parser.add_argument(
     "--gripper_threshold_right",
     type=float,
-    default=0.35,
+    default=0.5,
     help="[binary] Right gripper: denormalized pred < threshold → 0, else 70",
 )
 parser.add_argument(
@@ -327,6 +343,13 @@ cli = parser.parse_args(rospy.myargv(argv=sys.argv)[1:])
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"device={device} cuda_available={torch.cuda.is_available()}")
+if bool(cli.binarize_input_grippers):
+    print(
+        f"input joint grippers: binarized to {{0,1}} at "
+        f"threshold={float(cli.input_gripper_binarize_threshold):g} (indices {GRIPPER_INDICES})"
+    )
+else:
+    print("input joint grippers: continuous (no binarize)")
 
 checkpoint_path = resolve_path(cli.checkpoint)
 metadata = load_run_metadata(checkpoint_path.parent)
@@ -418,6 +441,8 @@ try:
             np.asarray(list(left_state[0]), dtype=np.float32),
             np.asarray(list(right_state[0]), dtype=np.float32),
             rec_id="live_inference",
+            binarize_grippers=bool(cli.binarize_input_grippers),
+            gripper_threshold=float(cli.input_gripper_binarize_threshold),
         ).cpu().numpy()
         joint_state = torch.from_numpy(qpos_np).unsqueeze(0).to(device)
         joint_state = (joint_state - qpos_mean) / qpos_std

@@ -27,6 +27,20 @@ AXIS_COLORS = ["#e74c3c", "#2ecc71", "#3498db"]
 AXIS_LABELS = ["X", "Y", "Z"]
 
 
+def _find_npz_by_stamp(folder: Path, stamp14: str, *, prefer_contains: str | None = None) -> Path:
+    folder = Path(folder).expanduser().resolve()
+    if not folder.is_dir():
+        raise FileNotFoundError(f"Not a directory: {folder}")
+    cand = sorted([p for p in folder.glob("*.npz") if stamp14 in p.name])
+    if not cand:
+        raise FileNotFoundError(f"No .npz containing stamp={stamp14} under {folder}")
+    if prefer_contains is not None:
+        pref = [p for p in cand if prefer_contains in p.name]
+        if pref:
+            return pref[0]
+    return cand[0]
+
+
 def contiguous_segments(mask: np.ndarray):
     idx = np.flatnonzero(mask)
     if idx.size == 0:
@@ -97,6 +111,7 @@ def _load_pose_like(npz_path: Path):
             t = ts - ts[0]
         else:
             t = np.arange(pose.shape[0], dtype=np.float64)
+            ts = None
 
         b1, b2, b3 = _rot6d_to_axes(rot6d)
         palm_dir = b2
@@ -104,7 +119,7 @@ def _load_pose_like(npz_path: Path):
         rotvec = _maybe_rotvec_from_axes(b1, b2, b3)
 
         valid = np.isfinite(pos).all(axis=-1) & np.isfinite(rot6d).all(axis=-1)
-        return t, pos, rotvec, palm_dir, palm_normal, valid, hand_open
+        return t, pos, rotvec, palm_dir, palm_normal, valid, hand_open, ts
 
     # Legacy/full combined format
     ts = np.asarray(d["timestamps"], dtype=np.float64)
@@ -123,7 +138,7 @@ def _load_pose_like(npz_path: Path):
         & np.isfinite(palm_dir).all(axis=-1)
         & np.isfinite(palm_normal).all(axis=-1)
     )
-    return t, pos, rotvec, palm_dir, palm_normal, valid, None
+    return t, pos, rotvec, palm_dir, palm_normal, valid, None, ts
 
 
 def _add_ticks_3d(ax3d, pts: np.ndarray, vecs: np.ndarray, *, scale_m: float, stride: int, color: str, alpha: float = 0.75):
@@ -180,12 +195,30 @@ def _add_ticks_3d_gradient(
     return lc
 
 
-def plot_pose(npz_path: str | Path, *, ori_scale_m: float = 0.015, ori_stride: int = 2, output: str | None = None, show: bool = True):
-    npz_path = Path(npz_path)
-    t, pos, rotvec, palm_dir, palm_normal, valid, hand_open = _load_pose_like(npz_path)
+def plot_pose_arrays(
+    *,
+    title: str,
+    t: np.ndarray,
+    pos: np.ndarray,
+    rotvec: np.ndarray,
+    palm_dir: np.ndarray,
+    palm_normal: np.ndarray,
+    valid: np.ndarray,
+    hand_open: np.ndarray | None,
+    ori_scale_m: float = 0.015,
+    ori_stride: int = 2,
+    output: str | None = None,
+    show: bool = True,
+):
+    t = np.asarray(t, dtype=np.float64).reshape(-1)
+    pos = np.asarray(pos, dtype=np.float64)
+    rotvec = np.asarray(rotvec, dtype=np.float64)
+    palm_dir = np.asarray(palm_dir, dtype=np.float64)
+    palm_normal = np.asarray(palm_normal, dtype=np.float64)
+    valid = np.asarray(valid, dtype=bool)
 
     fig = plt.figure(figsize=(22, 10))
-    fig.suptitle(f"Hand pose — left+right together in 3D\n{npz_path.name}", fontsize=12)
+    fig.suptitle(title, fontsize=12)
 
     # Layout (2 rows x 4 cols):
     #  - Row 0: left pos | right pos | combined 3D (spans 2 cols)
@@ -235,7 +268,7 @@ def plot_pose(npz_path: str | Path, *, ori_scale_m: float = 0.015, ori_stride: i
         if n_valid:
             ax_pos.legend(loc="upper right")
 
-        # rotvec components if available (otherwise NaNs -> empty plots)
+        # rotvec components if available (otherwise NaNs -> empty plotjs)
         for axis_idx, lbl in enumerate(["rx", "ry", "rz"]):
             first = True
             for s, e in contiguous_segments(m):
@@ -338,6 +371,273 @@ def plot_pose(npz_path: str | Path, *, ori_scale_m: float = 0.015, ori_stride: i
         plt.close(fig)
 
 
+def plot_overlay_left_from_one_right_from_other(
+    *,
+    left_npz: Path,
+    right_npz: Path,
+    ori_scale_m: float = 0.015,
+    ori_stride: int = 2,
+    output: str | None = None,
+    show: bool = True,
+):
+    """
+    Overlay two independent timelines in one figure:
+      - LEFT hand (slot 0) is taken from left_npz
+      - RIGHT hand (slot 1) is taken from right_npz
+
+    No timestamp alignment/resampling is performed. Each subplot uses its own
+    time axis for that stream; the 3D panel simply overlays both trajectories.
+    """
+    left_npz = Path(left_npz)
+    right_npz = Path(right_npz)
+
+    tL, posL, rotvecL, palm_dirL, palm_normL, validL, openL, _ = _load_pose_like(left_npz)
+    tR, posR, rotvecR, palm_dirR, palm_normR, validR, openR, _ = _load_pose_like(right_npz)
+
+    # Extract only the desired slots.
+    t_left = np.asarray(tL, dtype=np.float64).reshape(-1)
+    t_right = np.asarray(tR, dtype=np.float64).reshape(-1)
+    left_pos = np.asarray(posL[:, 0], dtype=np.float64)
+    right_pos = np.asarray(posR[:, 1], dtype=np.float64)
+    left_rot = np.asarray(rotvecL[:, 0], dtype=np.float64)
+    right_rot = np.asarray(rotvecR[:, 1], dtype=np.float64)
+    left_dir = np.asarray(palm_dirL[:, 0], dtype=np.float64)
+    right_dir = np.asarray(palm_dirR[:, 1], dtype=np.float64)
+    left_norm = np.asarray(palm_normL[:, 0], dtype=np.float64)
+    right_norm = np.asarray(palm_normR[:, 1], dtype=np.float64)
+    left_valid = np.asarray(validL[:, 0], dtype=bool)
+    right_valid = np.asarray(validR[:, 1], dtype=bool)
+
+    left_open = None if openL is None else np.asarray(openL[:, 0], dtype=np.float64).reshape(-1)
+    right_open = None if openR is None else np.asarray(openR[:, 1], dtype=np.float64).reshape(-1)
+
+    fig = plt.figure(figsize=(22, 10))
+    fig.suptitle(
+        "Overlay (no alignment): LEFT from hand NPZ, RIGHT from robot NPZ\n"
+        f"left={left_npz.name}\nright={right_npz.name}",
+        fontsize=11,
+    )
+
+    gs = fig.add_gridspec(2, 4)
+    ax_pos_l = fig.add_subplot(gs[0, 0])
+    ax_pos_r = fig.add_subplot(gs[0, 1])
+    ax_traj = fig.add_subplot(gs[0, 2:4], projection="3d")
+    ax_ori_l = fig.add_subplot(gs[1, 0])
+    ax_ori_r = fig.add_subplot(gs[1, 1])
+    ax_rays_l = fig.add_subplot(gs[1, 2], projection="3d")
+    ax_rays_r = fig.add_subplot(gs[1, 3], projection="3d")
+
+    cmap = LinearSegmentedColormap.from_list("blue_red", ["#1f77b4", "#d62728"])
+
+    def t_norm(t: np.ndarray, m: np.ndarray) -> np.ndarray:
+        if t.size == 0:
+            return t
+        if np.any(m):
+            tv = t[m]
+            t0 = float(np.min(tv))
+            t1 = float(np.max(tv))
+        else:
+            t0 = float(np.min(t))
+            t1 = float(np.max(t))
+        denom = (t1 - t0) if (t1 - t0) > 1e-12 else 1.0
+        return np.clip((t - t0) / denom, 0.0, 1.0)
+
+    tn_left = t_norm(t_left, left_valid)
+    tn_right = t_norm(t_right, right_valid)
+
+    # Left time series
+    for axis_idx in range(3):
+        first = True
+        for s, e in contiguous_segments(left_valid):
+            ax_pos_l.plot(
+                t_left[s : e + 1],
+                left_pos[s : e + 1, axis_idx],
+                color=AXIS_COLORS[axis_idx],
+                linewidth=1.4,
+                label=AXIS_LABELS[axis_idx] if first else None,
+            )
+            first = False
+    ax_pos_l.set_title(f"Left — position vs time ({int(left_valid.sum())}/{len(t_left)})")
+    ax_pos_l.set_xlabel("Time (s)")
+    ax_pos_l.set_ylabel("Position (m)")
+    ax_pos_l.grid(True, alpha=0.3)
+    if int(left_valid.sum()):
+        ax_pos_l.legend(loc="upper right")
+
+    for axis_idx, lbl in enumerate(["rx", "ry", "rz"]):
+        first = True
+        for s, e in contiguous_segments(left_valid):
+            ax_ori_l.plot(t_left[s : e + 1], left_rot[s : e + 1, axis_idx], linewidth=1.2, label=lbl if first else None)
+            first = False
+    ax_ori_l.set_title("Left — orientation rotvec vs time")
+    ax_ori_l.set_xlabel("Time (s)")
+    ax_ori_l.set_ylabel("rotvec (rad)")
+    ax_ori_l.grid(True, alpha=0.3)
+    if int(left_valid.sum()):
+        ax_ori_l.legend(loc="upper right")
+    if left_open is not None:
+        ax_open = ax_ori_l.twinx()
+        ax_open.step(t_left, left_open, where="post", color="#34495e", alpha=0.35, linewidth=1.1)
+        ax_open.set_ylim(-0.1, 1.1)
+        ax_open.set_ylabel("open (0/1)")
+
+    # Right time series
+    for axis_idx in range(3):
+        first = True
+        for s, e in contiguous_segments(right_valid):
+            ax_pos_r.plot(
+                t_right[s : e + 1],
+                right_pos[s : e + 1, axis_idx],
+                color=AXIS_COLORS[axis_idx],
+                linewidth=1.4,
+                label=AXIS_LABELS[axis_idx] if first else None,
+            )
+            first = False
+    ax_pos_r.set_title(f"Right — position vs time ({int(right_valid.sum())}/{len(t_right)})")
+    ax_pos_r.set_xlabel("Time (s)")
+    ax_pos_r.set_ylabel("Position (m)")
+    ax_pos_r.grid(True, alpha=0.3)
+    if int(right_valid.sum()):
+        ax_pos_r.legend(loc="upper right")
+
+    for axis_idx, lbl in enumerate(["rx", "ry", "rz"]):
+        first = True
+        for s, e in contiguous_segments(right_valid):
+            ax_ori_r.plot(t_right[s : e + 1], right_rot[s : e + 1, axis_idx], linewidth=1.2, label=lbl if first else None)
+            first = False
+    ax_ori_r.set_title("Right — orientation rotvec vs time")
+    ax_ori_r.set_xlabel("Time (s)")
+    ax_ori_r.set_ylabel("rotvec (rad)")
+    ax_ori_r.grid(True, alpha=0.3)
+    if int(right_valid.sum()):
+        ax_ori_r.legend(loc="upper right")
+    if right_open is not None:
+        ax_open = ax_ori_r.twinx()
+        ax_open.step(t_right, right_open, where="post", color="#34495e", alpha=0.35, linewidth=1.1)
+        ax_open.set_ylim(-0.1, 1.1)
+        ax_open.set_ylabel("open (0/1)")
+
+    # Combined 3D overlay
+    traj_pts = []
+    legend_handles = []
+    legend_labels = []
+
+    for s, e in contiguous_segments(left_valid):
+        pts = left_pos[s : e + 1]
+        tn = tn_left[s : e + 1]
+        traj_pts.append(pts)
+        _add_gradient_trajectory_3d(ax_traj, pts, tn, cmap=cmap)
+        _add_ticks_3d_gradient(
+            ax_traj,
+            pts,
+            left_dir[s : e + 1],
+            tn,
+            scale_m=float(ori_scale_m),
+            stride=int(ori_stride),
+            cmap=cmap,
+            alpha=0.65,
+            linewidth=1.0,
+        )
+    legend_handles.append(plt.Line2D([0], [0], color="black", linewidth=2.0))
+    legend_labels.append("Left (hand)")
+
+    for s, e in contiguous_segments(right_valid):
+        pts = right_pos[s : e + 1]
+        tn = tn_right[s : e + 1]
+        traj_pts.append(pts)
+        _add_gradient_trajectory_3d(ax_traj, pts, tn, cmap=cmap)
+        _add_ticks_3d_gradient(
+            ax_traj,
+            pts,
+            right_dir[s : e + 1],
+            tn,
+            scale_m=float(ori_scale_m),
+            stride=int(ori_stride),
+            cmap=cmap,
+            alpha=0.65,
+            linewidth=1.0,
+        )
+    legend_handles.append(plt.Line2D([0], [0], color="black", linewidth=2.0))
+    legend_labels.append("Right (robot)")
+
+    if traj_pts:
+        all_pts = np.concatenate(traj_pts, axis=0)
+        mins = np.nanmin(all_pts, axis=0)
+        maxs = np.nanmax(all_pts, axis=0)
+        center = 0.5 * (mins + maxs)
+        half = 0.5 * float(np.max(maxs - mins))
+        half = max(half * 1.15, 0.05)
+        ax_traj.set_xlim(center[0] - half, center[0] + half)
+        ax_traj.set_ylim(center[1] - half, center[1] + half)
+        ax_traj.set_zlim(center[2] - half, center[2] + half)
+        try:
+            ax_traj.set_box_aspect((1, 1, 1))
+        except Exception:
+            pass
+
+    ax_traj.set_title("3D trajectory — Left(hand) + Right(robot)")
+    ax_traj.set_xlabel("X (m)")
+    ax_traj.set_ylabel("Y (m)")
+    ax_traj.set_zlabel("Z (m)")
+    ax_traj.legend(legend_handles, legend_labels, loc="upper right")
+
+    # Rays subplots
+    for ax, v, n, m, title in (
+        (ax_rays_l, left_dir, left_norm, left_valid, "Left rays"),
+        (ax_rays_r, right_dir, right_norm, right_valid, "Right rays"),
+    ):
+        ax.set_title(title)
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+        ax.set_xlim(-1.05, 1.05)
+        ax.set_ylim(-1.05, 1.05)
+        ax.set_zlim(-1.05, 1.05)
+        idx = np.flatnonzero(m)
+        if idx.size == 0:
+            continue
+        _add_ticks_3d(ax, np.zeros_like(v[idx]), v[idx], scale_m=1.0, stride=int(ori_stride), color="#2c3e50", alpha=0.60)
+        _add_ticks_3d(ax, np.zeros_like(n[idx]), n[idx], scale_m=1.0, stride=int(ori_stride), color="#2c3e50", alpha=0.30)
+
+    fig.tight_layout()
+    if output is not None:
+        out = Path(output).expanduser().resolve()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out, dpi=150, bbox_inches="tight")
+        print(f"Saved plot -> {out}")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+def plot_pose(
+    npz_path: str | Path,
+    *,
+    ori_scale_m: float = 0.015,
+    ori_stride: int = 2,
+    output: str | None = None,
+    show: bool = True,
+):
+    npz_path = Path(npz_path)
+    t, pos, rotvec, palm_dir, palm_normal, valid, hand_open, _ = _load_pose_like(npz_path)
+    plot_pose_arrays(
+        title=f"Hand pose — left+right together in 3D\n{npz_path.name}",
+        t=t,
+        pos=pos,
+        rotvec=rotvec,
+        palm_dir=palm_dir,
+        palm_normal=palm_normal,
+        valid=valid,
+        hand_open=hand_open,
+        ori_scale_m=float(ori_scale_m),
+        ori_stride=int(ori_stride),
+        output=output,
+        show=show,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Plot pose .npz (left+right combined in 3D by default).")
     parser.add_argument(
@@ -361,7 +661,108 @@ def main():
         default="*.npz",
         help="When npz is a directory, only plot files matching this glob (default: *.npz)",
     )
+    parser.add_argument(
+        "--combine-left-right",
+        action="store_true",
+        help=(
+            "Combine LEFT slot from a hand-pose NPZ with RIGHT slot from a robot EEF NPZ "
+            "and plot them together. Use --left-dir/--right-dir/--stamp."
+        ),
+    )
+    parser.add_argument("--left-dir", type=str, default=None, help="Directory containing left-hand pose .npz files")
+    parser.add_argument("--right-dir", type=str, default=None, help="Directory containing right-hand pose .npz files")
+    parser.add_argument(
+        "--stamp",
+        type=str,
+        default=None,
+        help=(
+            "14-digit stamp (e.g. 20260815144549). If omitted with --combine-left-right, "
+            "plots ALL stamps that exist in both dirs."
+        ),
+    )
     args = parser.parse_args()
+
+    if bool(args.combine_left_right):
+        if not (args.left_dir and args.right_dir):
+            raise SystemExit("--combine-left-right requires --left-dir and --right-dir")
+
+        left_dir = Path(args.left_dir).expanduser().resolve()
+        right_dir = Path(args.right_dir).expanduser().resolve()
+        if not left_dir.is_dir():
+            raise SystemExit(f"--left-dir is not a directory: {left_dir}")
+        if not right_dir.is_dir():
+            raise SystemExit(f"--right-dir is not a directory: {right_dir}")
+
+        # Single-stamp mode
+        if args.stamp is not None:
+            stamp = str(args.stamp).strip()
+            if len(stamp) != 14 or (not stamp.isdigit()):
+                raise SystemExit("--stamp must be a 14-digit string like 20260815144549")
+            left_npz = _find_npz_by_stamp(left_dir, stamp, prefer_contains="_wilor_rgbd_pose")
+            right_npz = _find_npz_by_stamp(right_dir, stamp, prefer_contains="commonframe")
+            plot_overlay_left_from_one_right_from_other(
+                left_npz=left_npz,
+                right_npz=right_npz,
+                ori_scale_m=float(args.ori_scale),
+                ori_stride=int(args.ori_stride),
+                output=args.output,
+                show=not args.no_show,
+            )
+            return
+
+        # Batch mode: find all 14-digit stamps common to both dirs.
+        import re
+
+        stamp_re = re.compile(r"(\d{14})")
+
+        def stamps_in_dir(d: Path) -> dict[str, Path]:
+            out: dict[str, Path] = {}
+            for p in sorted(d.glob("*.npz")):
+                ms = stamp_re.findall(p.name)
+                if not ms:
+                    continue
+                # Prefer the *last* 14-digit group in the filename (often the demo stamp).
+                out[str(ms[-1])] = p
+            return out
+
+        left_map = stamps_in_dir(left_dir)
+        right_map = stamps_in_dir(right_dir)
+        stamps = sorted(set(left_map) & set(right_map))
+        if not stamps:
+            raise SystemExit(f"No shared 14-digit stamps between {left_dir} and {right_dir}")
+
+        # Output handling: for batch, output must be a directory (or omitted -> default).
+        out_dir = None
+        if args.output:
+            out_path = Path(args.output).expanduser().resolve()
+            if out_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".pdf"):
+                raise SystemExit("For batch combine, -o/--output must be a directory (not a single file path).")
+            out_dir = out_path
+        else:
+            out_dir = left_dir / "overlay_plots"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        show = not args.no_show
+        print(f"[combine-left-right] Found {len(stamps)} matched stamps.")
+        print(f"[combine-left-right] Saving plots under: {out_dir}")
+        if show:
+            print("Interactive: close each window to advance to the next plot.")
+
+        for i, stamp in enumerate(stamps, 1):
+            left_npz = _find_npz_by_stamp(left_dir, stamp, prefer_contains="_wilor_rgbd_pose")
+            right_npz = _find_npz_by_stamp(right_dir, stamp, prefer_contains="commonframe")
+            out = str(out_dir / f"overlay_{stamp}.png")
+            print(f"[{i}/{len(stamps)}] {stamp} -> {Path(out).name}")
+            plot_overlay_left_from_one_right_from_other(
+                left_npz=left_npz,
+                right_npz=right_npz,
+                ori_scale_m=float(args.ori_scale),
+                ori_stride=int(args.ori_stride),
+                output=out,
+                show=show,
+            )
+        print(f"Done. Wrote {len(stamps)} plots -> {out_dir}")
+        return
 
     path = Path(args.npz).expanduser().resolve()
     if path.is_dir():

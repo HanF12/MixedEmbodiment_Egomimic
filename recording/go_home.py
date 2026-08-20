@@ -92,9 +92,18 @@ def read_current_pose(joint_states_topic: str, timeout: float, label: str) -> np
             f"[{label}] Expected >=6 joint positions, got {len(msg.position)}"
         )
     pose = np.zeros(7, dtype=np.float64)
-    pose[:6] = np.asarray(msg.position[:6], dtype=np.float64)
-    if len(msg.position) >= 7:
-        pose[6] = float(msg.position[6])
+    # Prefer explicit name-based mapping when available so we don't silently
+    # depend on the publisher's position[] ordering.
+    if len(msg.name) == len(msg.position) and all(name in msg.name for name in DEFAULT_JOINT_NAMES):
+        pos_by_name = {name: float(pos) for name, pos in zip(msg.name, msg.position)}
+        pose[:6] = np.asarray([pos_by_name[name] for name in DEFAULT_JOINT_NAMES], dtype=np.float64)
+        # Gripper may or may not have a stable name; only trust it if a 7th slot exists.
+        if len(msg.position) >= 7:
+            pose[6] = float(msg.position[6])
+    else:
+        pose[:6] = np.asarray(msg.position[:6], dtype=np.float64)
+        if len(msg.position) >= 7:
+            pose[6] = float(msg.position[6])
     return pose
 
 
@@ -129,6 +138,15 @@ def apply_gripper_command(
 
 def per_joint_travel(start: np.ndarray, goal: np.ndarray) -> np.ndarray:
     return np.abs(shortest_joint_delta(start[:6], goal[:6]))
+
+
+def per_joint_error_deg(current: np.ndarray, goal: np.ndarray) -> np.ndarray:
+    """Absolute shortest-path joint error in degrees for the 6 arm joints."""
+    return np.degrees(np.abs(shortest_joint_delta(current[:6], goal[:6])))
+
+
+def max_joint_error_deg(current: np.ndarray, goal: np.ndarray) -> float:
+    return float(np.max(per_joint_error_deg(current, goal)))
 
 
 def load_saved_home() -> dict[str, np.ndarray]:
@@ -195,7 +213,11 @@ def go_home_arm(
     gripper_scale: float,
     gripper_max: Optional[float],
     max_speed_rad_s: float,
+    max_gripper_speed: float,
     at_home_tol: float,
+    joint_states_topic: str,
+    final_joint_tol_deg: float,
+    verify_timeout_sec: float,
     grippers_only: bool = False,
 ) -> None:
     import rospy
@@ -238,8 +260,20 @@ def go_home_arm(
             suggested = float(np.max(per_joint_travel(start_pose, home_pose))) / max_speed_rad_s
             rospy.logwarn(
                 f"[{label}] Requested move may be fast ({speed:.2f} rad/s). "
-                f"Consider --duration-sec {suggested:.1f} or higher."
+                f"Auto-stretching duration to {suggested:.1f}s."
             )
+            duration_sec = suggested
+
+    # Enforce gripper stroke rate by stretching duration if needed.
+    if float(max_gripper_speed) > 0 and grip_delta > 0:
+        min_dur = grip_delta / float(max_gripper_speed)
+        if min_dur > duration_sec:
+            rospy.logwarn(
+                f"[{label}] Gripper move {grip_delta:.2f} over {duration_sec:.1f}s "
+                f"({grip_delta / duration_sec:.1f}/s) exceeds --max-gripper-speed "
+                f"{float(max_gripper_speed):g}/s; stretching to {min_dur:.1f}s."
+            )
+            duration_sec = min_dur
 
     steps = max(1, int(round(duration_sec * rate_hz)))
     if grippers_only:
@@ -256,6 +290,11 @@ def go_home_arm(
         rospy.loginfo(f"[{label}] goal  arm = {np.round(home_pose[:6], 4).tolist()}")
 
     rate = rospy.Rate(rate_hz)
+    last_stroke = start_stroke
+    dt = 1.0 / max(1e-3, float(rate_hz))
+    max_dg = (
+        float(max_gripper_speed) * dt if float(max_gripper_speed) > 0 else float("inf")
+    )
     for step in range(steps):
         if rospy.is_shutdown():
             rospy.loginfo(f"[{label}] Homing interrupted.")
@@ -267,6 +306,10 @@ def go_home_arm(
             gripper_scale=gripper_scale,
             gripper_max=gripper_max,
         )
+        desired_stroke = float(cmd[6])
+        dg = float(np.clip(desired_stroke - last_stroke, -max_dg, max_dg))
+        cmd[6] = last_stroke + dg
+        last_stroke = float(cmd[6])
         replayer.publish_step(cmd)
         rate.sleep()
 
@@ -275,6 +318,18 @@ def go_home_arm(
         gripper_scale=gripper_scale,
         gripper_max=gripper_max,
     )
+    # Finish any remaining gripper travel under the same speed cap.
+    if float(max_gripper_speed) > 0:
+        while abs(float(final_cmd[6]) - last_stroke) > 1e-3:
+            if rospy.is_shutdown():
+                return
+            dg = float(np.clip(float(final_cmd[6]) - last_stroke, -max_dg, max_dg))
+            last_stroke += dg
+            catchup = final_cmd.copy()
+            catchup[6] = last_stroke
+            replayer.publish_step(catchup)
+            rate.sleep()
+
     hold_steps = max(1, int(hold_sec * rate_hz))
     for _ in range(hold_steps):
         if rospy.is_shutdown():
@@ -282,7 +337,42 @@ def go_home_arm(
         replayer.publish_step(final_cmd)
         rate.sleep()
 
-    rospy.loginfo(f"[{label}] Home pose reached.")
+    if not grippers_only:
+        # Keep commanding the final target until measured joint feedback is close
+        # enough. This avoids "relative-looking" endpoints when the low-level
+        # controller simply has not finished moving yet.
+        deadline = rospy.Time.now().to_sec() + max(0.0, float(verify_timeout_sec))
+        max_err_deg = float("inf")
+        last_pose = None
+        while not rospy.is_shutdown():
+            try:
+                last_pose = read_current_pose(joint_states_topic, timeout=0.5, label=label)
+            except Exception:
+                last_pose = None
+            if last_pose is not None:
+                max_err_deg = max_joint_error_deg(last_pose, home_pose)
+                if max_err_deg <= float(final_joint_tol_deg):
+                    rospy.loginfo(
+                        f"[{label}] Home verified: max joint error {max_err_deg:.2f} deg "
+                        f"(tol {float(final_joint_tol_deg):g} deg)."
+                    )
+                    break
+            if rospy.Time.now().to_sec() >= deadline:
+                rospy.logwarn(
+                    f"[{label}] Timed out before reaching home tolerance: "
+                    f"max joint error {max_err_deg:.2f} deg "
+                    f"(tol {float(final_joint_tol_deg):g} deg)."
+                )
+                if last_pose is not None:
+                    rospy.logwarn(
+                        f"[{label}] Final measured joints = "
+                        f"{np.round(last_pose[:6], 4).tolist()}"
+                    )
+                break
+            replayer.publish_step(final_cmd)
+            rate.sleep()
+
+    rospy.loginfo(f"[{label}] Home pose command complete.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -300,6 +390,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subscriber-timeout", type=float, default=10.0)
     parser.add_argument("--joint-state-timeout", type=float, default=5.0)
     parser.add_argument("--max-speed-rad-s", type=float, default=0.4)
+    parser.add_argument(
+        "--final-joint-tol-deg",
+        type=float,
+        default=5.0,
+        help="Require measured final arm joint error <= this many degrees (default: 5).",
+    )
+    parser.add_argument(
+        "--verify-timeout-sec",
+        type=float,
+        default=12.0,
+        help="After the nominal move finishes, keep commanding home this long while waiting to verify tolerance.",
+    )
+    parser.add_argument(
+        "--max-gripper-speed",
+        type=float,
+        default=50.0,
+        help=(
+            "Max published gripper stroke change rate (units/s). "
+            "Stretches duration and per-step clamps if exceeded. Set <=0 to disable (default: 50)."
+        ),
+    )
     parser.add_argument("--at-home-tol", type=float, default=0.02)
 
     parser.add_argument("--gripper-scale", type=float, default=30.2)
@@ -432,7 +543,7 @@ def main() -> None:
         rospy.loginfo(f"Warmup {args.warmup_sec:.1f}s — Ctrl+C to abort before motion.")
         rospy.sleep(args.warmup_sec)
 
-    arms_plan: list[tuple[str, JointReplayer, np.ndarray, np.ndarray]] = []
+    arms_plan: list[tuple[str, JointReplayer, np.ndarray, np.ndarray, str]] = []
 
     if do_left:
         start = read_current_pose(args.left_joint_states_topic, args.joint_state_timeout, "left")
@@ -449,7 +560,7 @@ def main() -> None:
             "world",
             1000,
         )
-        arms_plan.append(("left", replayer, start, home))
+        arms_plan.append(("left", replayer, start, home, args.left_joint_states_topic))
 
     if do_right:
         start = read_current_pose(args.right_joint_states_topic, args.joint_state_timeout, "right")
@@ -466,7 +577,7 @@ def main() -> None:
             "world",
             1000,
         )
-        arms_plan.append(("right", replayer, start, home))
+        arms_plan.append(("right", replayer, start, home, args.right_joint_states_topic))
 
     if not arms_plan:
         raise SystemExit("Nothing to home.")
@@ -479,7 +590,7 @@ def main() -> None:
         gripper_scale = float(args.gripper_scale)
         gripper_max = None if args.gripper_max < 0 else args.gripper_max
 
-    for label, replayer, start, home in arms_plan:
+    for label, replayer, start, home, _joint_topic in arms_plan:
         replayer.wait_for_subscribers(args.subscriber_timeout)
         if args.grippers_only:
             rospy.loginfo(
@@ -497,7 +608,7 @@ def main() -> None:
         else:
             print(f"\nAbout to home: {labels}")
         print(f"Duration: {args.duration_sec:.1f}s   Ctrl+C to abort during motion.")
-        for label, _, start, home in arms_plan:
+        for label, _, start, home, _joint_topic in arms_plan:
             if args.grippers_only:
                 print(f"  {label} gripper raw={start[6]:.3f} -> stroke={home[6]:.3f}")
             else:
@@ -511,7 +622,7 @@ def main() -> None:
             return
 
     try:
-        for label, replayer, start, home in arms_plan:
+        for label, replayer, start, home, joint_topic in arms_plan:
             go_home_arm(
                 label,
                 replayer,
@@ -523,7 +634,11 @@ def main() -> None:
                 gripper_scale=gripper_scale,
                 gripper_max=gripper_max,
                 max_speed_rad_s=args.max_speed_rad_s,
+                max_gripper_speed=float(args.max_gripper_speed),
                 at_home_tol=args.at_home_tol,
+                joint_states_topic=joint_topic,
+                final_joint_tol_deg=float(args.final_joint_tol_deg),
+                verify_timeout_sec=float(args.verify_timeout_sec),
                 grippers_only=bool(args.grippers_only),
             )
     except rospy.ROSInterruptException:

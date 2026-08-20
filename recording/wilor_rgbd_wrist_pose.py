@@ -204,6 +204,45 @@ def _sample_depth_m(depth_frame, u: float, v: float, *, radius: int = 4):
     return float(_np.median(valid) * depth_scale)
 
 
+def _aligned_frameset_timestamp_s(frames, depth_frame=None, color_frame=None) -> float:
+    """
+    Timestamp (s) for an aligned color+depth frameset.
+
+    Prefer the depth/composite timestamp over color timestamps. Some bags pair a
+    lower-rate color stream with a higher-rate depth stream; after alignment, the
+    latest color frame can be re-used for multiple depth frames, which makes
+    `color_frame.get_timestamp()` appear duplicated.
+    """
+    for frame in (depth_frame, frames, color_frame):
+        if frame is None:
+            continue
+        try:
+            ts = float(frame.get_timestamp()) / 1000.0
+        except Exception:
+            continue
+        if np.isfinite(ts):
+            return ts
+    return float("nan")
+
+
+def _color_timestamp_s(color_frame) -> float:
+    if color_frame is None:
+        return float("nan")
+    try:
+        ts = float(color_frame.get_timestamp()) / 1000.0
+    except Exception:
+        return float("nan")
+    return ts if np.isfinite(ts) else float("nan")
+
+
+def _color_lag_s(frames, depth_frame=None, color_frame=None) -> float:
+    frame_ts = _aligned_frameset_timestamp_s(frames, depth_frame, color_frame)
+    color_ts = _color_timestamp_s(color_frame)
+    if not np.isfinite(frame_ts) or not np.isfinite(color_ts):
+        return float("nan")
+    return float(frame_ts - color_ts)
+
+
 def _scan_bag_aligned_color_timestamps(bag_path: Path) -> np.ndarray:
     """Timestamps (s) for every aligned color+depth frame in the bag."""
     import pyrealsense2 as rs
@@ -227,7 +266,9 @@ def _scan_bag_aligned_color_timestamps(bag_path: Path) -> np.ndarray:
             color_frame = frames.get_color_frame()
             if not depth_frame or not color_frame:
                 continue
-            ts.append(float(color_frame.get_timestamp()) / 1000.0)
+            ts_i = _aligned_frameset_timestamp_s(frames, depth_frame, color_frame)
+            if np.isfinite(ts_i):
+                ts.append(ts_i)
     finally:
         pipeline.stop()
     return np.asarray(ts, dtype=np.float64)
@@ -413,16 +454,13 @@ def run(
             raise RuntimeError(f"Failed to open mp4: {mp4_path}")
 
     keep_bag_indices = None
+    dynamic_bag_timeline = pose_timeline == "bag"
     if pose_timeline == "bag":
-        # Default: every aligned bag frame + bag timestamps.
-        ts = _scan_bag_aligned_color_timestamps(bag_path)
-        N = int(ts.shape[0])
-        if N == 0:
-            raise RuntimeError(f"No aligned color+depth frames in bag: {bag_path}")
-        span = float(ts[-1] - ts[0]) if N > 1 else float("nan")
-        fps_est = float((N - 1) / span) if span > 1e-6 else float("nan")
+        # Single-pass default: collect per-frameset timestamps during processing.
+        ts = None
+        N = None
         print(
-            f"[timeline=bag] using ALL bag frames N={N} span={span:.3f}s ~{fps_est:.2f} fps",
+            "[timeline=bag] using fresh aligned bag-color frames; collecting timestamps in one pass",
             flush=True,
         )
     else:
@@ -475,13 +513,30 @@ def run(
 
     torch_dtype = torch.float16 if dt in ("fp16", "float16") else torch.float32
     pipe = WiLorHandPose3dEstimationPipeline(device=torch.device(dev), dtype=torch_dtype, verbose=False)
+    if str(torch.device(dev)).startswith("cuda"):
+        cuda_index = torch.device(dev).index
+        if cuda_index is None:
+            cuda_index = torch.cuda.current_device()
+        gpu_name = torch.cuda.get_device_name(cuda_index)
+        print(f"WiLoR device={torch.device(dev)} dtype={torch_dtype} gpu={gpu_name}", flush=True)
+    else:
+        print(f"WiLoR device={torch.device(dev)} dtype={torch_dtype}", flush=True)
 
-    pose = np.full((N, 2, 10), np.nan, dtype=np.float64)
-    valid_pos = np.zeros((N, 2), dtype=bool)
-    valid_rot = np.zeros((N, 2), dtype=bool)
-    valid_open = np.zeros((N, 2), dtype=bool)
-    R_raw = np.full((N, 2, 3, 3), np.nan, dtype=np.float64)
-    open_score = np.full((N, 2), np.nan, dtype=np.float64)
+    if dynamic_bag_timeline:
+        ts_rows: list[float] = []
+        pose_rows: list[np.ndarray] = []
+        valid_pos_rows: list[np.ndarray] = []
+        valid_rot_rows: list[np.ndarray] = []
+        valid_open_rows: list[np.ndarray] = []
+        R_raw_rows: list[np.ndarray] = []
+        open_score_rows: list[np.ndarray] = []
+    else:
+        pose = np.full((N, 2, 10), np.nan, dtype=np.float64)
+        valid_pos = np.zeros((N, 2), dtype=bool)
+        valid_rot = np.zeros((N, 2), dtype=bool)
+        valid_open = np.zeros((N, 2), dtype=bool)
+        R_raw = np.full((N, 2, 3, 3), np.nan, dtype=np.float64)
+        open_score = np.full((N, 2), np.nan, dtype=np.float64)
 
     # Iterate bag frames (all of them, or the npy-aligned subset).
     i = 0
@@ -517,11 +572,24 @@ def run(
             if not take:
                 continue
 
-            if i >= N:
+            if N is not None and i >= N:
                 break
 
+            frame_ts_s = _aligned_frameset_timestamp_s(frames, depth_frame, color_frame)
+
             if use_bag_color:
+                # Some bag playbacks emit an intermediate frameset that reuses the
+                # previous color image with the current depth frame. Skip those
+                # stale-color copies so the saved timeline matches the actual RGB
+                # frames WiLoR saw, instead of producing duplicated timestamps.
+                if dynamic_bag_timeline:
+                    lag_s = _color_lag_s(frames, depth_frame, color_frame)
+                    if np.isfinite(lag_s) and lag_s > 0.020:
+                        continue
                 frame_bgr = np.asanyarray(color_frame.get_data())
+                color_ts_s = _color_timestamp_s(color_frame)
+                if dynamic_bag_timeline and np.isfinite(color_ts_s):
+                    frame_ts_s = color_ts_s
             else:
                 ok, frame_bgr = cap.read()
                 if not ok:
@@ -534,7 +602,7 @@ def run(
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                 # Mean fps over the full timeline (avoids median-dt rounding that
                 # stretches bag timelines when bags are ~2x denser than mp4).
-                if ts is not None and ts.shape[0] > 2:
+                if (not dynamic_bag_timeline) and ts is not None and ts.shape[0] > 2:
                     span = float(ts[-1] - ts[0])
                     fps_est = float((ts.shape[0] - 1) / span) if span > 1e-6 else float(color_profile.fps())
                     fps_out = float(round(fps_est)) if fps_est > 1e-6 else float(color_profile.fps())
@@ -558,6 +626,12 @@ def run(
                 slot_mode=str(slot_mode),
             )
 
+            pose_row = np.full((2, 10), np.nan, dtype=np.float64)
+            valid_pos_row = np.zeros((2,), dtype=bool)
+            valid_rot_row = np.zeros((2,), dtype=bool)
+            valid_open_row = np.zeros((2,), dtype=bool)
+            R_raw_row = np.full((2, 3, 3), np.nan, dtype=np.float64)
+            open_score_row = np.full((2,), np.nan, dtype=np.float64)
             frame_dbg = frame_bgr.copy() if dbg_writer is not None and i < int(debug_max_frames) else None
 
             for hand in (0, 1):
@@ -660,8 +734,8 @@ def run(
                     xyz = np.asarray(xyz, dtype=np.float64)
                     if xyz.shape == (3,) and np.all(np.isfinite(xyz)):
                         xyz_np = xyz
-                        pose[i, hand, 0:3] = xyz
-                        valid_pos[i, hand] = True
+                        pose_row[hand, 0:3] = xyz
+                        valid_pos_row[hand] = True
 
                 if frame_dbg is not None:
                     color = (255, 0, 0) if hand == 0 else (0, 0, 255)
@@ -698,15 +772,15 @@ def run(
                         j = k3d[0]  # (21,3)
                         R = _palm_frame_R_from_openpose_joints(j)
                         if np.all(np.isfinite(R)):
-                            R_raw[i, hand] = R
-                            valid_rot[i, hand] = True
-                            pose[i, hand, 3:6] = R[:, 0]
-                            pose[i, hand, 6:9] = R[:, 1]
+                            R_raw_row[hand] = R
+                            valid_rot_row[hand] = True
+                            pose_row[hand, 3:6] = R[:, 0]
+                            pose_row[hand, 6:9] = R[:, 1]
 
                         s = _open_score_from_openpose_joints(j)
                         if np.isfinite(s):
-                            open_score[i, hand] = float(s)
-                            valid_open[i, hand] = True
+                            open_score_row[hand] = float(s)
+                            valid_open_row[hand] = True
 
                             if frame_dbg is not None:
                                 # show raw score and current threshold
@@ -724,6 +798,21 @@ def run(
             if frame_dbg is not None and dbg_writer is not None and i < int(debug_max_frames):
                 dbg_writer.write(frame_dbg)
 
+            if dynamic_bag_timeline:
+                ts_rows.append(frame_ts_s)
+                pose_rows.append(pose_row)
+                valid_pos_rows.append(valid_pos_row)
+                valid_rot_rows.append(valid_rot_row)
+                valid_open_rows.append(valid_open_row)
+                R_raw_rows.append(R_raw_row)
+                open_score_rows.append(open_score_row)
+            else:
+                pose[i] = pose_row
+                valid_pos[i] = valid_pos_row
+                valid_rot[i] = valid_rot_row
+                valid_open[i] = valid_open_row
+                R_raw[i] = R_raw_row
+                open_score[i] = open_score_row
             i += 1
 
     finally:
@@ -734,18 +823,41 @@ def run(
             dbg_writer.release()
 
     processed = int(i)
-    ts = np.asarray(ts, dtype=np.float64)[:N]
-    if processed < N:
-        # Keep trailing frames invalid so indices still match bag timestamps.
-        pass
-    if processed == N:
-        pose = pose[:processed]
-        valid_pos = valid_pos[:processed]
-        valid_rot = valid_rot[:processed]
-        valid_open = valid_open[:processed]
-        R_raw = R_raw[:processed]
-        open_score = open_score[:processed]
-        ts = ts[:processed]
+    if dynamic_bag_timeline:
+        ts = np.asarray(ts_rows, dtype=np.float64)
+        if pose_rows:
+            pose = np.stack(pose_rows, axis=0)
+            valid_pos = np.stack(valid_pos_rows, axis=0)
+            valid_rot = np.stack(valid_rot_rows, axis=0)
+            valid_open = np.stack(valid_open_rows, axis=0)
+            R_raw = np.stack(R_raw_rows, axis=0)
+            open_score = np.stack(open_score_rows, axis=0)
+        else:
+            pose = np.full((0, 2, 10), np.nan, dtype=np.float64)
+            valid_pos = np.zeros((0, 2), dtype=bool)
+            valid_rot = np.zeros((0, 2), dtype=bool)
+            valid_open = np.zeros((0, 2), dtype=bool)
+            R_raw = np.full((0, 2, 3, 3), np.nan, dtype=np.float64)
+            open_score = np.full((0, 2), np.nan, dtype=np.float64)
+        N = int(ts.shape[0])
+        if N == 0:
+            raise RuntimeError(f"No aligned color+depth frames in bag: {bag_path}")
+        span = float(ts[-1] - ts[0]) if N > 1 else float("nan")
+        fps_est = float((N - 1) / span) if span > 1e-6 else float("nan")
+        print(f"[timeline=bag] processed N={N} span={span:.3f}s ~{fps_est:.2f} fps", flush=True)
+    else:
+        ts = np.asarray(ts, dtype=np.float64)[:N]
+        if processed < N:
+            # Keep trailing frames invalid so indices still match bag timestamps.
+            pass
+        if processed == N:
+            pose = pose[:processed]
+            valid_pos = valid_pos[:processed]
+            valid_rot = valid_rot[:processed]
+            valid_open = valid_open[:processed]
+            R_raw = R_raw[:processed]
+            open_score = open_score[:processed]
+            ts = ts[:processed]
 
     # -------------------------------------------------------------------------
     # Phase 2 — postprocess the FULL arrays only (never during the frame loop).

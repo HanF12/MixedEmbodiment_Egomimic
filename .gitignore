@@ -14,6 +14,7 @@ recording/.recording/
 m-synced-csvs/
 ros_data/
 wandb/
+recording/data_analysis/outputs/
 
 # Model artifacts
 weights/
@@ -21,6 +22,7 @@ ALOHA-mimic/weights*/
 *.pth
 *.npz
 *.png
+recording/sessions.zip
 
 # Joint dump helpers
 joint_timestamp_*.npy

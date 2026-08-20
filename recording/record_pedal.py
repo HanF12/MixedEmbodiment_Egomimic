@@ -32,7 +32,7 @@ from recording_sync import (
 )
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_BOOT_SECONDS = 3.0
+DEFAULT_BOOT_SECONDS = 1.0
 
 active_procs: list[subprocess.Popen] = []
 shutting_down = False
@@ -143,6 +143,15 @@ def parse_args() -> argparse.Namespace:
         "--no-hand-pose",
         action="store_true",
         help="Disable RGBD hand pose on bird RealSense (video only).",
+    )
+    parser.add_argument(
+        "--save-bag",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Save a RealSense .bag from the bird camera (default: true). "
+            "Use --no-save-bag to avoid storing bag files."
+        ),
     )
     parser.add_argument(
         "--pedal-key",
@@ -471,6 +480,7 @@ def start_recorders(
     bird_realsense_serial: str | None = None,
     bird_display: bool = True,
     front_realsense: bool = False,
+    save_bag: bool = True,
 ) -> tuple[list[subprocess.Popen], dict[str, subprocess.Popen], subprocess.Popen | None]:
     """Spawn one process per stream (joints, each wrist camera, bird)."""
     python = sys.executable
@@ -555,7 +565,7 @@ def start_recorders(
                 mode.track_hand,
                 bird_display,
                 stream_fps,
-                save_bag=True,
+                save_bag=bool(save_bag),
                 bag_depth=bag_depth,
             ),
             env=data_env,
@@ -721,6 +731,7 @@ def main() -> int:
             bird_realsense_serial=bird_serial_now,
             bird_display=not args.no_display,
             front_realsense=bool(args.front_realsense and front_serial),
+            save_bag=bool(args.save_bag),
         )
 
         need_bird = bool(mode.bird_realsense and bird_serial_now)
