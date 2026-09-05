@@ -652,7 +652,7 @@ def main() -> None:
     if human_pose_dir is not None:
         print(f"Human pose NPZ dir (default {HUMAN_POSE_RELDIR}): {human_pose_dir}")
 
-    weights_root = Path(cli.output_dir).expanduser().resolve() if cli.output_dir else (pkg / "weights")
+    weights_root = Path(cli.output_dir).expanduser().resolve() if cli.output_dir else Path(f"/data/hfang09/{pkg.name}/weights")
     run_name = cli.run_name or default_run_name()
     if cli.smoke and cli.run_name is None:
         run_name = f"{run_name}_smoke"

@@ -166,6 +166,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_sync_rows", type=int, default=None)
     p.add_argument("--cpu", action="store_true")
     p.add_argument("--save_every_epochs", type=int, default=1000)
+    p.add_argument(
+        "--save_after_epochs",
+        type=int,
+        default=4000,
+        help="Only start saving checkpoints (best + periodic) after this many epochs.",
+    )
     p.add_argument("--pose_loss_weight", type=float, default=1.0)
     p.add_argument("--joint_loss_weight", type=float, default=1.0)
     p.add_argument("--kl_weight", type=float, default=DEFAULT_KL_WEIGHT)
@@ -645,7 +651,7 @@ def main() -> None:
     if human_pose_dir is not None:
         print(f"Human pose NPZ dir (default {HUMAN_POSE_RELDIR}): {human_pose_dir}")
 
-    weights_root = Path(cli.output_dir).expanduser().resolve() if cli.output_dir else (pkg / "weights")
+    weights_root = Path(cli.output_dir).expanduser().resolve() if cli.output_dir else Path(f"/data/hfang09/{pkg.name}/weights")
     run_name = cli.run_name or default_run_name()
     if cli.smoke and cli.run_name is None:
         run_name = f"{run_name}_smoke"
@@ -917,12 +923,13 @@ def main() -> None:
                 step=step,
             )
 
-        if avg < best:
-            best = avg
-            torch.save(model.state_dict(), output_dir / "combined_act_best.pth")
-            print(f"Saved new best -> {output_dir / 'combined_act_best.pth'}")
-        if cli.save_every_epochs > 0 and (epoch + 1) % cli.save_every_epochs == 0:
-            torch.save(model.state_dict(), output_dir / f"combined_act_epoch_{epoch+1}.pth")
+        if (epoch + 1) >= cli.save_after_epochs:
+            if avg < best:
+                best = avg
+                torch.save(model.state_dict(), output_dir / "combined_act_best.pth")
+                print(f"Saved new best -> {output_dir / 'combined_act_best.pth'}")
+            if cli.save_every_epochs > 0 and (epoch + 1) % cli.save_every_epochs == 0:
+                torch.save(model.state_dict(), output_dir / f"combined_act_epoch_{epoch+1}.pth")
 
     if wandb_run is not None:
         wandb.finish()

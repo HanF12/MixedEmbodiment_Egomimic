@@ -1,0 +1,4 @@
+]633;E;echo "python: $(.venv/bin/python -V)";b0d9dff3-5e95-4572-97e3-83c1078e9916]633;Cpython: Python 3.11.15
+uv: uv 0.11.12 (x86_64-unknown-linux-gnu)
+torch: 2.12.1+cu126 12.6
+platform: x86_64 Ubuntu 24.04.1 LTS

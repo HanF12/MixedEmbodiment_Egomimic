@@ -51,12 +51,15 @@ DEFAULT_NUM_QUERIES = 45  # keep Combined horizon (EgoMimic uses 100)
 DEFAULT_NUM_EPOCHS = 10000
 # One epoch = one full pass over the longest active-modality loader
 # (max over whichever of robot/human/mixed are active); shorter ones are recycled.
-DEFAULT_BATCH_SIZE = 8
-DEFAULT_LR = 1e-5
+DEFAULT_BATCH_SIZE = 16
+DEFAULT_LR = 2e-5  # linear scale from 1e-5 @ batch 8 → 2e-5 @ batch 16
 DEFAULT_WEIGHT_DECAY = 1e-4
 DEFAULT_KL_WEIGHT = 10.0
 DEFAULT_HAND_LAMBDA = 1.0
-# Tunable mixed modality loss scale (also exposed as --mixed_lambda).
+# Fallback mixed modality loss scale when --mixed_lambda is given explicitly or
+# mixed is inactive. Training default is auto: mixed_batches / steps_per_epoch
+# (see training_combined.resolve_mixed_lambda) so recycled mixed demos contribute
+# the same total weight per epoch as seeing each mixed batch once.
 # L_mixed = mixed_lambda * (pose + joint + KL) before equal mean over modalities.
 DEFAULT_MIXED_LAMBDA = 1.0
 DEFAULT_RECON_LOSS = "l1"

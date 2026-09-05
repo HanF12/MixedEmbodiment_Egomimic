@@ -143,7 +143,7 @@ def main() -> None:
 
     default_sync_dir = Path(__file__).resolve().parent / "m-synced-csvs" / f"{data_root.name}_bimanual_front"
     sync_dir = Path(cli.sync_dir).expanduser().resolve() if cli.sync_dir else default_sync_dir
-    weights_root = Path(cli.output_dir).expanduser().resolve() if cli.output_dir else (Path(__file__).resolve().parent / "weights")
+    weights_root = Path(cli.output_dir).expanduser().resolve() if cli.output_dir else Path(f"/data/hfang09/{Path(__file__).resolve().parent.name}/weights")
     run_name = cli.run_name or default_run_name()
     output_dir = weights_root / run_name
     normalization_path = (

@@ -14,6 +14,8 @@ DEFAULT_BATCH_SIZE = 8
 DEFAULT_LR = 1e-5
 DEFAULT_WEIGHT_DECAY = 1e-4  # AdamW L2 regularization strength
 DEFAULT_SAVE_EVERY_EPOCHS = 10000
+# Do not write best / periodic epoch checkpoints until this epoch (1-indexed).
+DEFAULT_SAVE_AFTER_EPOCHS = 30000
 
 JOINT_DIM_PER_ARM = 7
 STATE_DIM = 14

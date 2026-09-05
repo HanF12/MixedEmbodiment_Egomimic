@@ -27,6 +27,7 @@ from config import (  # noqa: E402
     DEFAULT_BATCH_SIZE,
     DEFAULT_NUM_EPOCHS,
     DEFAULT_NUM_QUERIES,
+    DEFAULT_SAVE_AFTER_EPOCHS,
     DEFAULT_SAVE_EVERY_EPOCHS,
     DEFAULT_WEIGHT_DECAY,
     MODEL_CAMERA_NAMES,
@@ -72,6 +73,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_SAVE_EVERY_EPOCHS,
         help="Save (and wandb-upload, if enabled) a checkpoint every N epochs.",
+    )
+    parser.add_argument(
+        "--save_after_epochs",
+        type=int,
+        default=DEFAULT_SAVE_AFTER_EPOCHS,
+        help=(
+            "Only start saving checkpoints (best + every --save_every_epochs) after this many "
+            f"epochs (default {DEFAULT_SAVE_AFTER_EPOCHS})."
+        ),
     )
     parser.add_argument(
         "--save_periodic_checkpoints",
@@ -156,7 +166,7 @@ def main() -> None:
 
     default_sync_dir = Path(__file__).resolve().parent / "m-synced-csvs" / f"{data_root.name}_bimanual_3cam"
     sync_dir = Path(cli.sync_dir).expanduser().resolve() if cli.sync_dir else default_sync_dir
-    weights_root = Path(cli.output_dir).expanduser().resolve() if cli.output_dir else (Path(__file__).resolve().parent / "weights")
+    weights_root = Path(cli.output_dir).expanduser().resolve() if cli.output_dir else Path(f"/data/hfang09/{Path(__file__).resolve().parent.name}/weights")
     run_name = cli.run_name or default_run_name()
     output_dir = weights_root / run_name
     normalization_path = (
@@ -388,7 +398,9 @@ def main() -> None:
                 step=batch_counter,
             )
 
-        if avg_val < best_val:
+        save_after = int(getattr(cli, "save_after_epochs", 0) or 0)
+        can_save = (epoch + 1) >= save_after
+        if can_save and avg_val < best_val:
             best_val = avg_val
             best_path = output_dir / "bimanual_act_best.pth"
             torch.save(model.state_dict(), best_path)
@@ -396,13 +408,13 @@ def main() -> None:
             if wandb_run is not None:
                 wandb.save(str(best_path.resolve()))
         save_every_epochs = int(getattr(cli, "save_every_epochs", 0) or 0)
-        if save_every_epochs > 0 and (epoch + 1) % save_every_epochs == 0:
+        if can_save and save_every_epochs > 0 and (epoch + 1) % save_every_epochs == 0:
             epoch_ckpt_path = output_dir / f"bimanual_act_epoch_{epoch + 1}.pth"
             torch.save(model.state_dict(), epoch_ckpt_path)
             print(f"Checkpoint saved: {epoch_ckpt_path}")
             if wandb_run is not None:
                 wandb.save(str(epoch_ckpt_path.resolve()))
-        if cli.save_periodic_checkpoints and (epoch + 1) % cli.save_every == 0:
+        if can_save and cli.save_periodic_checkpoints and (epoch + 1) % cli.save_every == 0:
             periodic_path = output_dir / f"bimanual_act_epoch_{epoch + 1}.pth"
             torch.save(model.state_dict(), periodic_path)
             print(f"Saved periodic checkpoint to {periodic_path}")

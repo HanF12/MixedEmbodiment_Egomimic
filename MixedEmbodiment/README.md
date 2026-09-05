@@ -154,7 +154,8 @@ Checkpoints and `run_metadata.json` land in `MixedEmbodiment/weights/<run_name>/
 ### Logging / misc
 | Flag | Default | Notes |
 |---|---|---|
-| `--output_dir` | `MixedEmbodiment/weights` | |
+| `--output_dir` | `/data/hfang09/MixedEmbodiment/weights` | Explicit root overrides the default. |
+| `--weights_on_home` | off | Save under `MixedEmbodiment/weights_home/` on `/home` (real dir, not the `weights/` → `/data` symlink). |
 | `--run_name` | timestamp | |
 | `--wandb` | off | |
 | `--wandb_project` | `mixed-embodiment-3cam-act` | |

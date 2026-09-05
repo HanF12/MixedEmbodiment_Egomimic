@@ -426,13 +426,15 @@ def build_human_sync_csvs(
 
 
 def make_loader(dataset, batch_size: int, num_workers: int, shuffle: bool) -> DataLoader:
+    # persistent_workers keeps workers alive across iter() restarts (short loaders
+    # recycle often). pin_memory + non_blocking .to() overlap H2D with compute.
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=False,
-        persistent_workers=False,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=(num_workers > 0),
         collate_fn=collate_homogeneous,
     )
 
@@ -497,13 +499,13 @@ def compute_batch_losses(
       human: hand_lambda * (pose_recon + kl)
       robot: pose_recon (aux shared head) + joint_recon + kl
     """
-    pose_state = batch["pose_state"].to(device)
-    joint_state = batch["joint_state"].to(device)
-    images = batch["images"].to(device)
-    pose_actions = batch["pose_actions"].to(device)
-    joint_actions = batch["joint_actions"].to(device)
-    is_pad = batch["is_pad"].to(device)
-    camera_mask = batch["camera_mask"].to(device)
+    pose_state = batch["pose_state"].to(device, non_blocking=True)
+    joint_state = batch["joint_state"].to(device, non_blocking=True)
+    images = batch["images"].to(device, non_blocking=True)
+    pose_actions = batch["pose_actions"].to(device, non_blocking=True)
+    joint_actions = batch["joint_actions"].to(device, non_blocking=True)
+    is_pad = batch["is_pad"].to(device, non_blocking=True)
+    camera_mask = batch["camera_mask"].to(device, non_blocking=True)
     embodiment = int(batch["embodiment"])
     has_joint = bool(batch["has_joint_target"])
 
@@ -668,7 +670,7 @@ def main() -> None:
     if human_pose_dir is not None:
         print(f"Human pose NPZ dir (default {HUMAN_POSE_RELDIR}): {human_pose_dir}")
 
-    weights_root = Path(cli.output_dir).expanduser().resolve() if cli.output_dir else (pkg / "weights")
+    weights_root = Path(cli.output_dir).expanduser().resolve() if cli.output_dir else Path(f"/data/hfang09/{pkg.name}/weights")
     run_name = cli.run_name or default_run_name()
     if cli.smoke and cli.run_name is None:
         run_name = f"{run_name}_smoke"

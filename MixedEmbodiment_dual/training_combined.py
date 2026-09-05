@@ -1003,7 +1003,7 @@ def main() -> None:
             "or pass explicit --robot_data_root / --human_data_root / --mixed_data_root."
         )
 
-    weights_root = Path(cli.output_dir).expanduser().resolve() if cli.output_dir else (pkg / "weights")
+    weights_root = Path(cli.output_dir).expanduser().resolve() if cli.output_dir else Path(f"/data/hfang09/{pkg.name}/weights")
     run_name = cli.run_name or default_run_name()
     if cli.smoke and cli.run_name is None:
         run_name = f"{run_name}_smoke"
